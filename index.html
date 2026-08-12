@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https:; object-src 'none'; base-uri 'none'; form-action 'none'" />
+  <title>AI股票观察助手</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="hero">
+      <div>
+        <h1>AI股票观察助手</h1>
+        <p>A股行业与产业链：需求命令 → 产业链分区 → 重点关注池 → 标签管理 → 刷新行情</p>
+        <small id="lastUpdated"></small>
+      </div>
+      <button id="refreshAll" class="primary">刷新实际行情</button>
+    </header>
+
+    <section class="command-box card">
+      <label>需求命令</label>
+      <div class="command-row">
+        <textarea id="commandInput">查找A股AI整个行业从下游到上游整个产业链相关股票，按照产业类型分区，列出龙头、待突破、已突破、重点关注、待回调、当前价格、最新情况和原因</textarea>
+        <button id="generateBtn" class="primary">生成/更新股票池</button>
+      </div>
+    </section>
+    <div id="statusNotice" class="status-notice hidden"></div>
+
+    <main class="layout">
+      <aside id="marketPanel" class="market card">
+        <div class="market-head">
+          <div><h2>大盘分析</h2><small id="marketUpdated">正在加载...</small></div>
+          <button id="refreshMarketOverview" class="small" title="刷新大盘数据">刷新</button>
+        </div>
+        <div id="marketAnalysis" class="market-analysis">正在获取实时市场数据...</div>
+        <div id="marketIndices" class="market-indices"></div>
+        <div class="market-stat-grid">
+          <div><b id="marketUp">--</b><span>上涨</span></div>
+          <div><b id="marketDown">--</b><span>下跌</span></div>
+          <div><b id="marketFlat">--</b><span>平盘</span></div>
+          <div><b id="marketTurnover">--</b><span>两市成交额</span></div>
+        </div>
+        <section class="market-section"><h3>板块轮动</h3><div id="marketSectors"></div></section>
+        <section class="market-section"><h3>资金活跃度（成交额）</h3><div id="marketFunds"></div><div id="marketActiveStocks" class="market-stocks"></div></section>
+        <section class="market-section"><h3>涨跌停</h3><div id="marketLimits"></div></section>
+        <section class="market-section"><h3>即将突破观察</h3><div id="marketRecommendationCoverage" class="market-coverage"></div><div id="marketRecommendations"></div></section>
+        <section class="market-section"><h3>市场消息</h3><div id="marketNews"></div></section>
+        <div id="marketError" class="note inline-note hidden"></div>
+      </aside>
+
+      <section class="left">
+        <div class="toolbar">
+          <div class="toolbar-left">
+            <input id="searchInput" placeholder="搜索名称 / 代码 / 产业 / 状态" />
+            <button id="cardView">卡牌</button>
+            <button id="tableView">列表</button>
+          </div>
+          <div class="toolbar-right">
+            <button id="openAddPanel" class="primary hidden">一键添加到关注</button>
+            <button id="simulationView">模拟持仓</button>
+          </div>
+        </div>
+
+        <div id="addPanel" class="add-panel hidden">
+          <div class="add-panel-head">
+            <div>
+              <b>添加到关注标签：已选择 <span id="selectedCount">0</span> 只股票</b>
+              <p>先在下方股票列表中选择，输入标签名称后确认添加。</p>
+            </div>
+            <button id="closeAddPanel">关闭</button>
+          </div>
+          <div class="add-panel-actions">
+            <input id="tagName" value="AI产业链关注池" />
+            <button id="modalSelectAll" class="small">全选/反选</button>
+            <button id="confirmAdd" class="primary">确认添加</button>
+          </div>
+        </div>
+
+        <div id="stockLabelPanel" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="stockLabelTitle">
+          <div class="label-modal">
+            <div class="add-panel-head">
+              <div>
+                <b id="stockLabelTitle">编辑股票标签</b>
+                <p>可同时添加到多个标签；已有标签会保留。移除请在关注列表右键操作。</p>
+              </div>
+              <button id="closeStockLabelPanel">关闭</button>
+            </div>
+            <div id="stockLabelChoices" class="label-choice-list"></div>
+            <div class="label-modal-actions">
+              <input id="newStockLabelName" placeholder="新增标签名称，可不填" />
+              <button id="saveStockLabels" class="primary">保存标签</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="detailPanel" class="detail-panel hidden"></div>
+        <div id="stockContainer"></div>
+      </section>
+
+      <aside class="right card">
+        <div class="label-head">
+          <h2>关注标签</h2>
+          <button id="refreshLabel" class="primary small">刷新</button>
+        </div>
+        <div id="labelList" class="label-list"></div>
+
+        <div class="label-detail">
+          <div class="label-detail-head">
+            <h3 id="activeLabelTitle">暂无标签</h3>
+            <div class="label-edit-controls">
+              <button id="editLabelStocks" class="small">编辑</button>
+              <button id="deleteSelectedFromLabel" class="danger small hidden">删除选中</button>
+            </div>
+          </div>
+          <div class="label-actions">
+            <button id="selectLabelAll" class="small hidden">全选/反选</button>
+          </div>
+          <div id="labelStocks" class="label-stocks"></div>
+        </div>
+
+        <div class="note">提示：行情使用腾讯、东方财富、新浪多源刷新；交易日盘中显示当日数据，非交易时间通常显示上一交易日收盘数据。缓存行情会明确标注。</div>
+      </aside>
+    </main>
+  </div>
+  <div id="labelStockMenu" class="context-menu hidden" role="menu">
+    <button id="pinLabelStock" role="menuitem">置顶</button>
+    <button id="removeLabelStock" class="danger-text" role="menuitem">从当前标签删除</button>
+  </div>
+  <script src="renderer.js"></script>
+</body>
+</html>

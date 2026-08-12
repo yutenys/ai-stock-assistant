@@ -1,0 +1,14 @@
+node_modules/
+release/
+logs/
+cache/
+
+.env
+.env.*
+*.log
+*.tmp
+
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
