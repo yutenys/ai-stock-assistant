@@ -12,6 +12,7 @@ const stockHistoryCache = new Map();
 const stockChartCache = new Map();
 const stockFundFlowCache = new Map();
 const marketNewsCache = new Map();
+const marketHistoryCache = new Map();
 let marketOverviewCache = null;
 let stockDirectoryCache = null;
 let stockDirectoryFetchedAt = 0;
@@ -272,7 +273,7 @@ function appendLogLine(entry) {
   return file;
 }
 
-function requestText(url, timeout = 12000, extraHeaders = {}, encoding = 'utf8') {
+function requestText(url, timeout = 12000, extraHeaders = {}, encoding = 'utf8', redirectsLeft = 3) {
   return new Promise((resolve, reject) => {
     const client = url.startsWith('http://') ? http : https;
     const req = client.get(url, {
@@ -284,6 +285,12 @@ function requestText(url, timeout = 12000, extraHeaders = {}, encoding = 'utf8')
       }
     }, (res) => {
       const chunks = [];
+      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location && redirectsLeft > 0) {
+        const redirectedUrl = new URL(res.headers.location, url).toString();
+        res.resume();
+        requestText(redirectedUrl, timeout, extraHeaders, encoding, redirectsLeft - 1).then(resolve, reject);
+        return;
+      }
       if (res.statusCode < 200 || res.statusCode >= 300) {
         res.resume();
         reject(new Error(`行情接口 HTTP ${res.statusCode}`));
@@ -644,8 +651,12 @@ function parseTencentMarketQuote(body) {
     volume: finiteNumber(cols[36]),
     amount: finiteNumber(cols[37]) == null ? 0 : Number(cols[37]) * 10000,
     turnoverRate: finiteNumber(cols[38]),
+    peRatio: finiteNumber(cols[39]),
+    amplitude: finiteNumber(cols[43]),
     totalMarketCap: finiteNumber(cols[45]) == null ? null : Number(cols[45]) * 1e8,
     floatMarketCap: finiteNumber(cols[44]) == null ? null : Number(cols[44]) * 1e8,
+    pbRatio: finiteNumber(cols[46]),
+    snapshotVolumeRatio: finiteNumber(cols[49]),
     upperLimit: finiteNumber(cols[47]),
     lowerLimit: finiteNumber(cols[48])
   };
@@ -741,18 +752,25 @@ async function fetchTencentMarketSectors(marketQuotes) {
   };
 }
 
-function summarizeNews(news) {
-  const items = sortNewsNewestFirst(news || []).slice(0, 6);
+function newsTimestamp(value) {
+  const text = String(value || '').trim().replace(/^(\d{4}-\d{2}-\d{2})\s+/, '$1T');
+  const parsed = Date.parse(text);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function summarizeNews(news, sinceDate = '') {
+  const since = newsTimestamp(sinceDate);
+  const items = sortNewsNewestFirst(news || []).filter(item => !since || newsTimestamp(item.publishedAt) >= since).slice(0, 6);
   const text = items.map(item => `${item.title} ${item.summary || ''}`).join(' ');
-  const positiveWords = ['增长', '预增', '回购', '增持', '中标', '签约', '获批', '创新高', '突破', '盈利', '复苏', '利好'];
-  const negativeWords = ['减持', '立案', '处罚', '亏损', '下滑', '风险', '终止', '诉讼', '退市', '质押', '利空'];
+  const positiveWords = ['增长', '预增', '扭亏', '回购', '增持', '中标', '签约', '获批', '创新高', '突破', '盈利', '复苏', '利好', '订单', '补贴'];
+  const negativeWords = ['减持', '立案', '处罚', '亏损', '下滑', '风险', '终止', '诉讼', '退市', '质押', '利空', '问询', '警示'];
   const positive = positiveWords.filter(word => text.includes(word));
   const negative = negativeWords.filter(word => text.includes(word));
   const signal = negative.length > positive.length ? '偏谨慎' : positive.length > negative.length ? '偏积极' : '中性';
   const summary = items.length
-    ? `近期开源资讯共 ${items.length} 条，关键词判断为${signal}${positive.length ? `；积极词：${positive.slice(0, 3).join('、')}` : ''}${negative.length ? `；风险词：${negative.slice(0, 3).join('、')}` : ''}。新闻仅作风险提示，不能单独作为交易依据。`
-    : '未获取到可核验的近期消息，消息面按中性处理。';
-  return { signal, summary, positive, negative, items };
+    ? `${sinceDate ? `${sinceDate}以来` : '近期'}开源资讯共 ${items.length} 条，关键词判断为${signal}${positive.length ? `；积极词：${positive.slice(0, 3).join('、')}` : ''}${negative.length ? `；风险词：${negative.slice(0, 3).join('、')}` : ''}。新闻只用于修正技术信号，不单独构成推荐。`
+    : `${sinceDate ? `${sinceDate}以来` : '近期'}未获取到可核验消息，消息面按中性处理。`;
+  return { signal, summary, positive, negative, items, sinceDate, scoreAdjustment: signal === '偏积极' ? 8 : signal === '偏谨慎' ? -16 : 0 };
 }
 
 async function fetchBingNews(keyword, cacheKey = keyword, maxAgeMs = 10 * 60 * 1000) {
@@ -762,73 +780,194 @@ async function fetchBingNews(keyword, cacheKey = keyword, maxAgeMs = 10 * 60 * 1
   return writeTimedCache(marketNewsCache, cacheKey, parseRssItems(rss));
 }
 
-async function buildBreakoutRecommendations(marketQuotes, force = false) {
+function assessReboundQuality(item) {
+  const reasons = [];
+  let score = 100;
+  const pe = Number(item.peRatio);
+  const pb = Number(item.pbRatio);
+  if (item.price < 3) { score -= 60; reasons.push('股价低于3元'); }
+  else if (item.price < 5) { score -= 12; reasons.push('低价股波动风险'); }
+  if ((item.amount || 0) < 8e7) { score -= 18; reasons.push('成交活跃度不足'); }
+  if ((item.totalMarketCap || 0) > 0 && item.totalMarketCap < 2e9) { score -= 18; reasons.push('市值偏小'); }
+  if (Number.isFinite(pe) && (pe <= 0 || pe > 150)) { score -= 45; reasons.push(pe <= 0 ? '静态估值为负' : '静态估值过高'); }
+  else if (Number.isFinite(pe) && pe > 100) { score -= 22; reasons.push('静态估值偏高'); }
+  if (Number.isFinite(pb) && pb > 15) { score -= 18; reasons.push('市净率过高'); }
+  if ((item.turnoverRate || 0) > 18) { score -= 15; reasons.push('换手率过高'); }
+  if (item.analysis.return20 < -12) { score -= 20; reasons.push('20日趋势仍明显下行'); }
+  if (item.analysis.volume5Ratio < .6) { score -= 12; reasons.push('近5日量能不足'); }
+  if (item.analysis.reboundSignal === '底部待反弹' && item.analysis.bottomDrawdown > -22) {
+    score -= 35;
+    reasons.push('回撤深度不足以确认底部反弹结构');
+  }
+  if (item.analysis.reboundScore < 65) { score -= 20; reasons.push('反弹综合评分不足'); }
+  return { score: Math.max(0, Math.min(100, Math.round(score))), passed: score >= 65, reasons };
+}
+
+function assessBreakoutQuality(item) {
+  const reasons = [];
+  let score = 100;
+  const pe = Number(item.peRatio);
+  const pb = Number(item.pbRatio);
+  if (item.price < 3) { score -= 60; reasons.push('股价低于3元'); }
+  else if (item.price < 5) { score -= 10; reasons.push('低价股波动风险'); }
+  if ((item.amount || 0) < 8e7) { score -= 18; reasons.push('成交活跃度不足'); }
+  if ((item.totalMarketCap || 0) > 0 && item.totalMarketCap < 2e9) { score -= 18; reasons.push('市值偏小'); }
+  if (Number.isFinite(pe) && (pe <= 0 || pe > 180)) { score -= 35; reasons.push(pe <= 0 ? '静态估值为负' : '静态估值过高'); }
+  else if (Number.isFinite(pe) && pe > 120) { score -= 18; reasons.push('静态估值偏高'); }
+  if (Number.isFinite(pb) && pb > 18) { score -= 18; reasons.push('市净率过高'); }
+  if ((item.turnoverRate || 0) > 18) { score -= 15; reasons.push('换手率过高'); }
+  if (item.analysis.return20 < -8) { score -= 20; reasons.push('20日趋势仍偏弱'); }
+  if (item.analysis.volume5Ratio < .6) { score -= 12; reasons.push('近5日量能不足'); }
+  if (item.analysis.score < 55) { score -= 25; reasons.push('突破技术评分不足'); }
+  return { score: Math.max(0, Math.min(100, Math.round(score))), passed: score >= 65, reasons };
+}
+
+async function fetchEastmoneyNews(keyword, cacheKey = keyword, maxAgeMs = 10 * 60 * 1000) {
+  const cached = readTimedCache(marketNewsCache, `eastmoney-${cacheKey}`, maxAgeMs);
+  if (cached) return cached;
+  const param = {
+    uid: '', keyword, type: ['cmsArticleWebOld'], client: 'web', clientType: 'web', clientVersion: 'curr',
+    param: { cmsArticleWebOld: { searchScope: 'default', sort: 'default', pageIndex: 1, pageSize: 8, preTag: '', postTag: '' } }
+  };
+  const text = await getText(`https://search-api-web.eastmoney.com/search/jsonp?cb=cb&param=${encodeURIComponent(JSON.stringify(param))}`, { Referer: 'https://so.eastmoney.com/' });
+  const json = JSON.parse(text.replace(/^cb\(/, '').replace(/\);?$/, ''));
+  const rows = json?.result?.cmsArticleWebOld || json?.Data?.cmsArticleWebOld || [];
+  const news = sortNewsNewestFirst(rows.map(row => ({
+    title: cleanStockName(row.title || row.Title), link: row.url || row.Url,
+    summary: String(row.content || row.Content || '').replace(/<[^>]+>/g, '').slice(0, 160),
+    publishedAt: row.showTime || row.ShowTime || row.date || '', source: '东方财富资讯'
+  })).filter(item => item.title && item.link)).slice(0, 8);
+  return writeTimedCache(marketNewsCache, `eastmoney-${cacheKey}`, news);
+}
+
+async function fetchMarketNews(force = false) {
+  const maxAgeMs = force ? 0 : 45 * 1000;
+  const keyword = 'A股 大盘 板块 资金 今日 最新消息';
+  try {
+    const news = await fetchEastmoneyNews(keyword, 'market-overview-news', maxAgeMs);
+    if (news.length) return news;
+  } catch {}
+  try {
+    return await fetchBingNews(keyword, 'market-overview-news-bing', maxAgeMs);
+  } catch {}
+  return [];
+}
+
+async function buildMarketRecommendations(marketQuotes, force = false) {
   let directory = [];
   try {
     directory = await fetchStockDirectory();
   } catch {}
   const directoryByCode = new Map(directory.map(item => [item.code, item]));
-  const screened = (marketQuotes || []).map(item => {
+  const scored = (marketQuotes || []).map(item => {
     const industry = directoryByCode.get(item.code)?.industry || '';
     const nearHigh = item.high > 0 ? item.price / item.high : 0;
     const turnoverFit = item.turnoverRate >= .5 && item.turnoverRate <= 12 ? 8 : 0;
     const preliminaryScore = nearHigh * 40 + Math.max(0, Math.min(10, (item.changePct || 0) + 1)) * 4
       + Math.log10(Math.max(item.amount || 0, 1)) * 2 + turnoverFit;
-    return { ...item, industry, preliminaryScore };
-  }).filter(item => !/ST|退/.test(item.name) && item.price > 0 && item.high > 0 && item.amount >= 5e7
+    const dayRange = item.high > item.low ? (item.price - item.low) / (item.high - item.low) : .5;
+    const reboundPreliminaryScore = Math.log10(Math.max(item.amount || 0, 1)) * 3 + turnoverFit
+      + Math.max(0, Math.min(1, dayRange)) * 12
+      + ((item.changePct || 0) >= -.5 && (item.changePct || 0) <= 6 ? 16 : (item.changePct || 0) > 6 ? 10 : 6);
+    return { ...item, industry, preliminaryScore, reboundPreliminaryScore };
+  }).filter(item => !/ST|退/.test(item.name) && item.price > 0 && item.high > 0);
+  const breakoutScreened = scored.filter(item => item.amount >= 5e7
     && item.changePct >= -1 && item.changePct < 9.5 && item.price / item.high >= .96)
     .sort((a, b) => b.preliminaryScore - a.preliminaryScore);
+  const reboundScreened = scored.filter(item => item.amount >= 3e7 && item.changePct >= -5 && item.changePct < 9.5
+    && (item.turnoverRate == null || item.turnoverRate <= 20) && item.price / item.high >= .9)
+    .sort((a, b) => b.reboundPreliminaryScore - a.reboundPreliminaryScore);
+  const selectCandidates = (source, limit, perIndustry) => {
+    const output = [];
+    const industryCounts = new Map();
+    for (const item of source) {
+      const group = item.industry || `未分类-${item.code}`;
+      if ((industryCounts.get(group) || 0) >= perIndustry) continue;
+      industryCounts.set(group, (industryCounts.get(group) || 0) + 1);
+      output.push(item);
+      if (output.length >= limit) break;
+    }
+    return output;
+  };
   const candidates = [];
-  const industryCounts = new Map();
-  for (const item of screened) {
+  const candidateCodes = new Set();
+  for (const item of [...selectCandidates(breakoutScreened, 40, 2), ...selectCandidates(reboundScreened, 70, 3)]) {
+    if (candidateCodes.has(item.code)) continue;
+    candidateCodes.add(item.code);
     const group = item.industry || `未分类-${item.code}`;
-    if ((industryCounts.get(group) || 0) >= 2) continue;
-    industryCounts.set(group, (industryCounts.get(group) || 0) + 1);
-    candidates.push(item);
-    if (candidates.length >= 60) break;
+    candidates.push({ ...item, recommendationGroup: group });
+    if (candidates.length >= 90) break;
   }
   const analyzed = [];
+  const historyErrors = [];
   for (let index = 0; index < candidates.length; index += 6) {
     const group = await Promise.allSettled(candidates.slice(index, index + 6).map(async quote => {
-      const history = await fetchTencentHistory(quote.code, 120);
+      let history = readTimedCache(marketHistoryCache, quote.code, 10 * 60 * 1000);
+      if (!history) {
+        try {
+          history = await fetchTencentHistory(quote.code, 120);
+        } catch (tencentError) {
+          history = await fetchSinaHistory(quote.code);
+        }
+        if (history.length >= 60) writeTimedCache(marketHistoryCache, quote.code, history);
+      }
       if (history.length < 60) return null;
       const analysis = analyzeHistory(history);
-      return { ...quote, analysis };
+      const item = { ...quote, analysis };
+      return { ...item, reboundQuality: assessReboundQuality(item), breakoutQuality: assessBreakoutQuality(item) };
     }));
     group.forEach(result => {
       if (result.status === 'fulfilled' && result.value) analyzed.push(result.value);
+      else if (result.status === 'rejected') historyErrors.push(result.reason?.message || String(result.reason));
     });
   }
-  const qualifying = analyzed
+  const breakoutQualifying = analyzed
     .filter(item => item.analysis.distanceToBreakout >= -2.5 && item.analysis.distanceToBreakout <= 5 && item.analysis.rsi14 < 80
       && item.price >= item.analysis.ma30 * .98)
     .sort((a, b) => b.analysis.score - a.analysis.score);
-  const ranked = [];
+  const bottomWaiting = analyzed.filter(item => item.analysis.reboundSignal === '底部待反弹' && item.reboundQuality.passed)
+    .sort((a, b) => b.analysis.reboundScore + b.reboundQuality.score * .35 - (a.analysis.reboundScore + a.reboundQuality.score * .35));
+  const rebounded = analyzed.filter(item => item.analysis.reboundSignal === '已反弹' && item.reboundQuality.passed)
+    .sort((a, b) => b.analysis.reboundScore + b.reboundQuality.score * .35 - (a.analysis.reboundScore + a.reboundQuality.score * .35));
   const selectedCodes = new Set();
-  const selectedIndustries = new Set();
-  qualifying.forEach(item => {
-    if (ranked.length >= 10 || (item.industry && selectedIndustries.has(item.industry))) return;
-    ranked.push(item);
+  const ranked = [];
+  const appendSignal = (items, signal) => items.forEach(item => {
+    if (selectedCodes.has(item.code)) return;
     selectedCodes.add(item.code);
-    if (item.industry) selectedIndustries.add(item.industry);
+    ranked.push({ ...item, signal, quality: signal === '待突破' ? item.breakoutQuality : item.reboundQuality });
   });
-  qualifying.forEach(item => {
-    if (ranked.length < 10 && !selectedCodes.has(item.code)) ranked.push(item);
-  });
+  appendSignal(breakoutQualifying, '待突破');
+  appendSignal(rebounded, '已反弹');
+  appendSignal(bottomWaiting, '底部待反弹');
   const recommendations = await Promise.all(ranked.map(async item => {
     let newsContext = summarizeNews([]);
     try {
-      newsContext = summarizeNews(await fetchBingNews(`${item.name} 股票 最新消息`, `breakout-${item.code}`, force ? 0 : 45 * 1000));
+      const newsResult = await fetchStockNews({ code: item.code, name: item.name, force });
+      const windowStart = item.signal === '待突破'
+        ? new Date(Date.now() - 21 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+        : item.analysis.bottomDate;
+      newsContext = summarizeNews(newsResult.news, windowStart);
     } catch {}
     let verdict = item.analysis.verdict;
     if (newsContext.signal === '偏谨慎' && verdict === '可关注') verdict = '等待确认';
     const distance = item.analysis.distanceToBreakout;
     const ma30Position = item.price >= item.analysis.ma30 ? '站上' : '接近';
-    const reason = `${verdict}；${item.analysis.maAlignment}，现价${ma30Position}MA30（${item.analysis.ma30.toFixed(2)}元）；距20日突破位${distance >= 0 ? '约' + distance.toFixed(2) + '%' : '已突破约' + Math.abs(distance).toFixed(2) + '%'}；近5日量比${item.analysis.volumeRatio.toFixed(2)}；${newsContext.signal === '偏谨慎' ? '消息面存在风险词，需等待确认' : '消息面暂无明显风险冲突'}。`;
+    const technicalReason = item.signal === '待突破'
+      ? `${item.analysis.maAlignment}，现价${ma30Position}MA30（${item.analysis.ma30.toFixed(2)}元）；距20日突破位${distance >= 0 ? '约' + distance.toFixed(2) + '%' : '已突破约' + Math.abs(distance).toFixed(2) + '%'}；近5日量比${item.analysis.volumeRatio.toFixed(2)}`
+      : item.analysis.reboundReason;
+    const newsLabel = newsContext.signal === '偏积极' ? '消息确认' : newsContext.signal === '偏谨慎' ? '消息谨慎' : '消息中性';
+    const reason = `${item.signal}；${technicalReason}；${newsContext.signal === '偏积极' ? '阶段低点以来存在正向消息催化' : newsContext.signal === '偏谨慎' ? '阶段低点以来存在风险消息，信号降级等待确认' : '阶段低点以来消息面中性'}。`;
+    const signalScore = Math.max(0, Math.min(100, (item.signal === '待突破' ? item.analysis.score : item.analysis.reboundScore) + newsContext.scoreAdjustment));
     return {
       ...item,
       verdict,
-      score: item.analysis.score,
+      signal: item.signal,
+      technicalScore: item.analysis.score,
+      score: signalScore,
+      signalScore,
+      qualityScore: item.quality?.score ?? 100,
+      qualityRisks: item.quality?.reasons || [],
+      newsLabel,
       breakoutPrice: item.analysis.breakoutPrice,
       supportPrice: item.analysis.supportPrice,
       ma30: item.analysis.ma30,
@@ -838,14 +977,40 @@ async function buildBreakoutRecommendations(marketQuotes, force = false) {
       newsContext
     };
   }));
+  const qualityRecommendations = recommendations.filter(item => item.qualityScore >= 65 && !(item.newsLabel === '消息谨慎' && item.signalScore < 65));
+  const recommendationGroups = Object.fromEntries(['待突破', '已反弹', '底部待反弹'].map(signal => [
+    signal, qualityRecommendations.filter(item => item.signal === signal).sort((a, b) => b.signalScore - a.signalScore)
+  ]));
+  const balancedRecommendations = [];
+  while (Object.values(recommendationGroups).some(group => group.length)) {
+    ['待突破', '已反弹', '底部待反弹'].forEach(signal => {
+      const item = recommendationGroups[signal].shift();
+      if (item) balancedRecommendations.push(item);
+    });
+  }
+  const finalSignals = balancedRecommendations.reduce((counts, item) => {
+    if (item.signal === '底部待反弹') counts.bottomWaiting += 1;
+    else if (item.signal === '已反弹') counts.rebounded += 1;
+    else if (item.signal === '待突破') counts.breakout += 1;
+    return counts;
+  }, { bottomWaiting: 0, rebounded: 0, breakout: 0 });
   return {
-    recommendations,
+    recommendations: balancedRecommendations,
     coverage: {
       scanned: marketQuotes?.length || 0,
-      prefiltered: screened.length,
+      prefiltered: new Set([...breakoutScreened, ...reboundScreened].map(item => item.code)).size,
       analyzed: analyzed.length,
       industries: new Set(analyzed.map(item => item.industry).filter(Boolean)).size,
-      directoryAvailable: directory.length > 0
+      directoryAvailable: directory.length > 0,
+      historyFailures: historyErrors.length,
+      signals: finalSignals,
+      signalCandidates: {
+        bottomWaiting: bottomWaiting.length,
+        rebounded: rebounded.length,
+        breakout: breakoutQualifying.length
+      },
+      qualityRejected: analyzed.filter(item => item.analysis.reboundSignal && !item.reboundQuality.passed).length,
+      qualified: balancedRecommendations.length
     }
   };
 }
@@ -858,8 +1023,11 @@ function marketAnalysis(result) {
   const leaders = (result.sectors || []).slice(0, 3).map(item => `${item.name}${item.changePct >= 0 ? '+' : ''}${item.changePct.toFixed(2)}%`).join('、');
   const funds = (result.fundSectors || []).slice(0, 3).map(item => item.name).join('、');
   const news = result.newsContext?.signal ? `消息面关键词判断${result.newsContext.signal}。` : '';
-  const candidates = (result.recommendations || []).slice(0, 3).map(item => item.name).join('、');
-  return `市场情绪${sentiment}${up || down ? `，上涨${up}家、下跌${down}家` : ''}。${leaders ? `轮动靠前：${leaders}。` : ''}${funds ? `成交资金活跃板块：${funds}。` : ''}涨停${result.limits?.upCount ?? 0}只、跌停${result.limits?.downCount ?? 0}只。${news}${candidates ? `技术面接近突破的观察候选：${candidates}；仍需等待价格和成交量条件确认。` : '当前未筛出满足条件的突破候选。'}`;
+  const signalGroups = Object.entries((result.recommendations || []).reduce((groups, item) => {
+    (groups[item.signal || '待突破'] ||= []).push(item.name);
+    return groups;
+  }, {})).map(([signal, names]) => `${signal}：${names.slice(0, 3).join('、')}`).join('；');
+  return `市场情绪${sentiment}${up || down ? `，上涨${up}家、下跌${down}家` : ''}。${leaders ? `轮动靠前：${leaders}。` : ''}${funds ? `成交资金活跃板块：${funds}。` : ''}涨停${result.limits?.upCount ?? 0}只、跌停${result.limits?.downCount ?? 0}只。${news}${signalGroups ? `技术形态观察候选——${signalGroups}；仍需等待价格和成交量条件确认。` : '当前未筛出满足条件的技术形态候选。'}`;
 }
 
 async function fetchMarketOverview(force = false) {
@@ -878,8 +1046,8 @@ async function fetchMarketOverview(force = false) {
     result.errors.push(...snapshotResult.value.errors.map(error => `全市场行情部分失败：${error}`));
     const [sectorsResult, recommendationsResult, newsResult] = await Promise.allSettled([
       fetchTencentMarketSectors(snapshotResult.value.quotes),
-      buildBreakoutRecommendations(snapshotResult.value.quotes, force),
-      fetchBingNews('A股 大盘 板块 资金 今日 最新消息', 'market-overview-news', force ? 0 : 45 * 1000)
+      buildMarketRecommendations(snapshotResult.value.quotes, force),
+      fetchMarketNews(force)
     ]);
     if (sectorsResult.status === 'fulfilled') Object.assign(result, sectorsResult.value);
     else result.errors.push(`板块轮动失败：${sectorsResult.reason?.message || sectorsResult.reason}`);
@@ -887,7 +1055,7 @@ async function fetchMarketOverview(force = false) {
       result.recommendations = recommendationsResult.value.recommendations;
       result.recommendationCoverage = recommendationsResult.value.coverage;
     }
-    else result.errors.push(`突破候选分析失败：${recommendationsResult.reason?.message || recommendationsResult.reason}`);
+    else result.errors.push(`技术形态候选分析失败：${recommendationsResult.reason?.message || recommendationsResult.reason}`);
     if (newsResult.status === 'fulfilled') result.newsContext = summarizeNews(newsResult.value);
     else result.errors.push(`大盘消息获取失败：${newsResult.reason?.message || newsResult.reason}`);
   } else {
@@ -1056,6 +1224,11 @@ async function searchStocksInternal(keyword) {
   const input = String(keyword || '').trim();
   if (!input) return { results: [], errors: [], source: '' };
   const errors = [];
+  const entities = extractCommandEntities(input);
+  if (['高铁', '铁路'].includes(entities.facility) && entities.locationParts.length >= 2) {
+    const results = entityFallbackForCommand(input);
+    if (results.length) return { results, errors, source: '线路与铁路产业链关系图谱' };
+  }
   try {
     const results = (await fetchTencentSmartbox(input))
       .filter(item => /GP-A|A股/i.test(item.securityType || '') || allowsFundResults(input) && isTradableCandidate(item, true))
@@ -1157,8 +1330,107 @@ const industryAliases = {
   纳指: ['纳斯达克', '纳斯达克100', '纳指100'],
   军工: ['国防军工', '航空', '航天', '船舶'],
   机器人: ['工业机器人', '自动化设备', '减速器'],
-  电力: ['电网', '发电', '核电', '水电', '绿电']
+  电力: ['电网', '发电', '核电', '水电', '绿电'],
+  高铁: ['铁路', '高速铁路', '铁路基建', '轨道交通', '动车组', '列车控制', '铁路信号', '铁路供电', '铁路运维'],
+  铁路: ['高铁', '铁路基建', '轨道交通', '铁路装备', '铁路信号', '铁路运维'],
+  机场: ['民航机场', '机场运营', '机场建设', '机场设备', '空港', '临空经济', '航空物流', '航站楼', '飞行区']
 };
+
+const entityRelationFallbacks = {
+  机场: [
+    { code: '000089', name: '深圳机场', sector: '机场运营 / 粤港澳大湾区', relation: '机场运营与区域机场群' },
+    { code: '600004', name: '白云机场', sector: '机场运营 / 广东机场集团', relation: '机场运营与广东区域机场体系' },
+    { code: '600009', name: '上海机场', sector: '机场运营', relation: '机场运营龙头' },
+    { code: '600515', name: '海南机场', sector: '机场运营 / 临空产业', relation: '机场设施与临空产业运营' },
+    { code: '002542', name: '中化岩土', sector: '机场建设 / 低空通航', relation: '机场场道施工与通用机场全生命周期' }
+  ],
+  高铁: [
+    { code: '601390', name: '中国中铁', sector: '高铁产业链 / 线路土建', relation: '铁路勘察设计、施工和基础设施建设通用产业链' },
+    { code: '601186', name: '中国铁建', sector: '高铁产业链 / 线路土建', relation: '铁路工程承包和基础设施建设通用产业链' },
+    { code: '601766', name: '中国中车', sector: '高铁产业链 / 动车组', relation: '动车组及轨道交通装备通用产业链' },
+    { code: '688187', name: '时代电气', sector: '高铁产业链 / 牵引系统', relation: '轨道交通牵引变流和控制系统通用产业链' },
+    { code: '688569', name: '铁科轨道', sector: '高铁产业链 / 轨道部件', relation: '高速铁路扣件等轨道结构产品通用产业链' },
+    { code: '603508', name: '思维列控', sector: '高铁产业链 / 列车控制', relation: '铁路列车运行控制及安全监测通用产业链' },
+    { code: '002296', name: '辉煌科技', sector: '高铁产业链 / 信号监测', relation: '铁路信号和通信监测通用产业链' },
+    { code: '300011', name: '鼎汉技术', sector: '高铁产业链 / 供电设备', relation: '轨道交通电源和车辆电气装备通用产业链' },
+    { code: '000008', name: '神州高铁', sector: '高铁产业链 / 运营维护', relation: '轨道交通运营检修和智能运维通用产业链' }
+  ],
+  铁路: [
+    { code: '601390', name: '中国中铁', sector: '铁路产业链 / 线路土建', relation: '铁路勘察设计、施工和基础设施建设通用产业链' },
+    { code: '601186', name: '中国铁建', sector: '铁路产业链 / 线路土建', relation: '铁路工程承包和基础设施建设通用产业链' },
+    { code: '601766', name: '中国中车', sector: '铁路产业链 / 车辆装备', relation: '铁路车辆及轨道交通装备通用产业链' },
+    { code: '000008', name: '神州高铁', sector: '铁路产业链 / 运营维护', relation: '轨道交通运营检修和智能运维通用产业链' }
+  ],
+  惠州: [
+    { code: '000089', name: '深圳机场', sector: '区域关联 / 深圳第二机场', relation: '惠州机场定位服务深圳及大湾区机场群' },
+    { code: '002542', name: '中化岩土', sector: '机场建设 / 通航', relation: '机场建设与通航业务关联' },
+    { code: '000592', name: '平潭发展', sector: '间接关联 / 名称实体待核验', relation: '名称含平潭但地域并非惠州平潭镇，仅作为用户指定的间接关联并明确提示核验' }
+  ],
+  大连: [
+    { code: '605598', name: '上海港湾', sector: '大连金州湾机场 / 地基处理', relation: '联合体中标大连金州湾国际机场航站区深层地基处理工程' },
+    { code: '601800', name: '中国交建', sector: '大连金州湾机场 / 基础设施', relation: '公开年报披露中标大连新机场通道及深层地基处理工程' },
+    { code: '601668', name: '中国建筑', sector: '大连金州湾机场 / 航站楼建设', relation: '旗下中建八局等联合体中标航站楼、楼前高架桥及附属设施工程' },
+    { code: '601186', name: '中国铁建', sector: '大连金州湾机场 / 进场交通', relation: '旗下单位参与机场进场路高架桥、下穿通道及附属设施工程' }
+  ]
+};
+
+const specificIndustryRelations = {
+  算力租赁: [
+    { code:'603629', name:'利通电子', sector:'算力租赁 / 智算中心', relation:'算力租赁和智算中心业务关联' },
+    { code:'603881', name:'数据港', sector:'算力租赁 / IDC', relation:'数据中心运营与算力基础设施' },
+    { code:'300442', name:'润泽科技', sector:'智算中心 / 数据中心', relation:'智算中心和数据中心运营' },
+    { code:'603887', name:'城地香江', sector:'算力租赁 / 数据中心', relation:'数据中心与算力服务关联' }
+  ],
+  智算中心: [
+    { code:'300442', name:'润泽科技', sector:'智算中心 / 数据中心', relation:'智算中心和数据中心运营' },
+    { code:'603629', name:'利通电子', sector:'算力租赁 / 智算中心', relation:'算力租赁和智算中心业务关联' }
+  ]
+};
+
+function specificIndustryFallbackForCommand(command) {
+  const input = String(command || '');
+  return uniqueStocks(Object.entries(specificIndustryRelations).flatMap(([term, rows]) => input.includes(term) ? rows.map(item => ({
+    ...item, securityType:'A股', source:'细分产业关系图谱补充', relevanceScore:110, relationEvidence:item.relation
+  })) : []));
+}
+
+function extractCommandEntities(command) {
+  const input = String(command || '').trim();
+  const facility = ['机场', '港口', '医院', '园区', '电站', '水库', '铁路', '高铁', '地铁', '大桥', '矿山']
+    .find(type => input.includes(type)) || '';
+  const facilityIndex = facility ? input.indexOf(facility) : -1;
+  const prefix = (facilityIndex >= 0 ? input.slice(0, facilityIndex) : '')
+    .replace(/查找|寻找|搜索|生成|推荐|分析|股票|相关|A股/g, '');
+  const locationParts = (prefix.match(/[\u4e00-\u9fa5]{2,8}/g) || []).flatMap(part => {
+    if (part.length === 4) return [part.slice(0, 2), part.slice(2)];
+    if (part.length <= 3) return [part];
+    return [part.slice(0, 2), part.slice(-2)];
+  });
+  const relationTerms = facility === '机场'
+    ? ['机场运营', '机场建设', '飞行区', '航站楼', '空港交通', '航空物流', '临空经济', '低空通航']
+    : facility === '高铁' || facility === '铁路'
+      ? ['铁路基建', '线路土建', '动车组', '轨道部件', '牵引系统', '列车控制', '铁路信号', '供电设备', '运营维护']
+      : [];
+  return { facility, locationParts:[...new Set(locationParts)], relationTerms };
+}
+
+function entityFallbackForCommand(command) {
+  const entities = extractCommandEntities(command);
+  if (!entities.facility) return [];
+  const locationRows = entities.locationParts.flatMap(location => entityRelationFallbacks[location] || []);
+  const rows = locationRows.length ? [...locationRows] : [...(entityRelationFallbacks[entities.facility] || [])];
+  const routeLabel = !locationRows.length && ['高铁', '铁路'].includes(entities.facility) && entities.locationParts.length >= 2
+    ? `${entities.locationParts[0]}—${entities.locationParts[1]}${entities.facility}` : '';
+  return uniqueStocks(rows.map(item => ({
+    ...item,
+    sector: routeLabel ? `${routeLabel} / ${item.sector.split('/').slice(-1)[0].trim()}` : item.sector,
+    securityType:'A股', source:'实体关系图谱补充',
+    relevanceScore: item.sector.includes('间接关联') ? 55 : 95,
+    relationEvidence: routeLabel
+      ? `${routeLabel}按高铁通用产业链关联；${item.relation}，不代表已确认参与或中标该线路项目`
+      : item.relation
+  })));
+}
 
 function cleanCommandSubject(text) {
   return String(text || '')
@@ -1201,6 +1473,7 @@ function buildIndustryTerms(command) {
   const subject = extractCommandSubject(input);
   const industryKeys = detectIndustryKeys(input);
   const explicitCodes = input.match(/\b\d{6}\b/g) || [];
+  const entities = extractCommandEntities(input);
 
   if (subject) terms.add(subject);
   const expansionKeys = industryKeys.includes('AI') && industryKeys.length > 1
@@ -1216,6 +1489,9 @@ function buildIndustryTerms(command) {
     .forEach(term => terms.add(term));
 
   explicitCodes.forEach(code => terms.add(code));
+  if(entities.facility) terms.add(entities.facility);
+  entities.locationParts.forEach(location => terms.add(location));
+  entities.relationTerms.forEach(term => terms.add(term));
 
   if (!industryKeys.length) {
     const stopWords = /查找|寻找|搜索|生成|更新|股票|A股|整个|行业|产业链|产业|相关|按照|类型|分区|列出|龙头|待突破|已突破|重点关注|待回调|当前价格|最新情况|原因|上游|中游|下游|全部|所有/g;
@@ -1226,7 +1502,7 @@ function buildIndustryTerms(command) {
       .forEach(term => terms.add(term));
   }
 
-  return { terms: [...terms].slice(0, 16), explicitCodes, industryKeys, subject };
+  return { terms: [...terms].slice(0, 20), explicitCodes, industryKeys, subject, entities };
 }
 
 function subjectVariants(subject) {
@@ -1289,12 +1565,25 @@ function resultMatchesCommand(item, command, industryKeys) {
   const subject = extractCommandSubject(command);
   const name = cleanStockName(item.name);
   const text = `${name} ${item.sector || ''}`;
+  const entities = extractCommandEntities(command);
+  if (entities.facility) {
+    const mapped = entityFallbackForCommand(command);
+    if (mapped.some(stock => stock.code === item.code || stock.name === name)) return true;
+    const relationText = `${text} ${item.relationEvidence || ''}`;
+    const locationMatched = !entities.locationParts.length || entities.locationParts.some(location => relationText.includes(location));
+    const hasSpecificEvidence = Boolean(item.relationEvidence)
+      || /公开资讯交叉识别|线上板块/.test(item.source || '')
+      || /机场|空港/.test(name);
+    return locationMatched && hasSpecificEvidence
+      && [entities.facility, ...entities.relationTerms].some(term => relationText.includes(term))
+      && !/航空公司|航线运营|航空运输|支线航空/.test(relationText);
+  }
   if (!industryKeys.length) {
     if (/线上板块|A股目录行业匹配|行业词库/.test(item.source || '')) return true;
     return scoreSubjectText(subject, text, subjectVariants(subject)) >= 16;
   }
   if ((industryKeys || []).some(key => text.includes(key) || (industryAliases[key] || []).some(alias => text.includes(alias)))) return true;
-  return fallbackForCommand(command).some(stock => stock.code === item.code || stock.name === name);
+  return [...fallbackForCommand(command), ...entityFallbackForCommand(command), ...specificIndustryFallbackForCommand(command)].some(stock => stock.code === item.code || stock.name === name);
 }
 
 function scoreBoard(board, subject, terms) {
@@ -1540,7 +1829,7 @@ function industryStockFromCandidate(item, command) {
     relevanceScore: relevance,
     price: null,
     changePct: null,
-    reason: `${sector}；行情表现待刷新；入选依据：${item.source || '通用行业查找脚本'}，命令相关性 ${Math.round(relevance)}。刷新后再按实时行情、均线、量能和评分分类。`,
+    reason: `${sector}；行情表现待刷新；入选依据：${item.source || '通用行业查找脚本'}${item.relationEvidence ? `；关系证据：${item.relationEvidence}` : ''}，命令相关性 ${Math.round(relevance)}。刷新后再按实时行情、均线、量能和评分分类。`,
     news: '等待刷新实际行情；交易日盘中显示当日行情，非交易时间通常显示上一交易日数据。',
     source: item.source || '通用行业查找脚本'
   };
@@ -1695,7 +1984,7 @@ function normalizeHistoryRows(rows) {
 
 async function fetchTencentHistory(code, count = 120) {
   const symbol = `${marketPrefixOf(code)}${code}`;
-  const json = await getJsonWithRetry(`https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=${symbol},day,,,${count},qfq&_=${Date.now()}`, 1);
+  const json = await getJsonWithRetry(`https://ifzq.gtimg.cn/appstock/app/fqkline/get?param=${symbol},day,,,${count},qfq&_=${Date.now()}`, 1);
   const data = json?.data?.[symbol] || {};
   return normalizeHistoryRows(data.qfqday || data.day || []);
 }
@@ -1766,6 +2055,7 @@ function analyzeHistory(history) {
   const macdDif = difSeries.at(-1);
   const macdDea = deaSeries.at(-1);
   const macdHistogram = (macdDif - macdDea) * 2;
+  const macdHistogramThreeDaysAgo = (difSeries.at(-4) - deaSeries.at(-4)) * 2;
   const std20 = standardDeviation(closes.slice(-20)) || 0;
   const bollUpper = ma20 + std20 * 2;
   const bollLower = ma20 - std20 * 2;
@@ -1783,6 +2073,50 @@ function analyzeHistory(history) {
     maxDrawdown = Math.min(maxDrawdown, (close / peak - 1) * 100);
   });
   const distanceToBreakout = resistance ? (resistance / latest.close - 1) * 100 : 0;
+  const recent60 = rows.slice(-60);
+  const recent60High = Math.max(...recent60.map(row => row.high));
+  const bottomSearchStart = Math.max(0, recent60.length - 20);
+  const bottomIndex = recent60.slice(bottomSearchStart)
+    .reduce((lowestIndex, row, index, values) => row.low < values[lowestIndex].low ? index : lowestIndex, 0) + bottomSearchStart;
+  const bottomRow = recent60[bottomIndex];
+  const peakBeforeBottom = Math.max(...recent60.slice(0, bottomIndex + 1).map(row => row.high));
+  const bottomDrawdown = peakBeforeBottom ? (bottomRow.low / peakBeforeBottom - 1) * 100 : 0;
+  const reboundFromBottom = bottomRow.low ? (latest.close / bottomRow.low - 1) * 100 : 0;
+  const bottomRangePosition = recent60High > bottomRow.low ? (latest.close - bottomRow.low) / (recent60High - bottomRow.low) * 100 : 50;
+  const daysSinceBottom = recent60.length - 1 - bottomIndex;
+  const ma5ThreeDaysAgo = average(closes.slice(-8, -3));
+  const ma10ThreeDaysAgo = average(closes.slice(-13, -3));
+  const shortAverageImproving = ma5 >= ma5ThreeDaysAgo && ma10 >= ma10ThreeDaysAgo;
+  const macdImproving = macdHistogram > macdHistogramThreeDaysAgo;
+  const return5 = percentageReturn(rows, 5);
+  const return20 = percentageReturn(rows, 20);
+  let reboundScore = 0;
+  if (bottomDrawdown <= -18) reboundScore += 18;
+  if (bottomDrawdown <= -30) reboundScore += 8;
+  if (daysSinceBottom <= 20) reboundScore += 8;
+  if (bottomRangePosition <= 35) reboundScore += 12;
+  else if (bottomRangePosition <= 55) reboundScore += 7;
+  if (shortAverageImproving) reboundScore += 12;
+  if (macdImproving) reboundScore += 10;
+  if (macdHistogram > 0) reboundScore += 8;
+  if (latest.close >= ma20) reboundScore += 10;
+  if (ma5 > ma10) reboundScore += 8;
+  if (volume5Ratio >= .8 && volume5Ratio <= 2.5) reboundScore += 6;
+  if (rsi14 >= 35 && rsi14 <= 72) reboundScore += 6;
+  if (rsi14 > 80 || reboundFromBottom > 80 || bottomDrawdown > -12) reboundScore -= 18;
+  reboundScore = Math.max(0, Math.min(100, Math.round(reboundScore)));
+  const waitingForRebound = bottomDrawdown <= -18 && daysSinceBottom <= 20 && reboundFromBottom <= 12
+    && bottomRangePosition <= 40 && latest.close <= ma20 * 1.04 && return5 >= -4
+    && (shortAverageImproving || macdImproving) && rsi14 >= 30 && rsi14 <= 62;
+  const reboundConfirmed = bottomDrawdown <= -18 && daysSinceBottom <= 35 && reboundFromBottom >= 6 && reboundFromBottom <= 80
+    && latest.close >= ma20 && ma5 > ma10 && return5 >= -3 && rsi14 < 80
+    && (macdHistogram > 0 || macdImproving && return5 >= 3);
+  const reboundSignal = reboundConfirmed ? '已反弹' : waitingForRebound ? '底部待反弹' : '';
+  const reboundReason = reboundSignal === '已反弹'
+    ? `近60日从前高回撤${Math.abs(bottomDrawdown).toFixed(1)}%，${bottomRow.date}见阶段低点后反弹${reboundFromBottom.toFixed(1)}%；现价站上MA20，MA5高于MA10，MACD${macdHistogram > 0 ? '处于零轴上方' : '持续改善'}`
+    : reboundSignal === '底部待反弹'
+      ? `近60日从前高回撤${Math.abs(bottomDrawdown).toFixed(1)}%，距${bottomRow.date}阶段低点仅${reboundFromBottom.toFixed(1)}%；短均线或MACD开始改善，尚待站稳MA20和放量确认`
+      : '';
   const supportCandidates = [ma5, ma10, ma20, ma30, ma60, support].filter(value => Number.isFinite(value) && value <= latest.close);
   const supportPrice = supportCandidates.length ? Math.max(...supportCandidates) : support;
   const bullishAlignment = ma5 > ma10 && ma10 > ma20 && ma20 > ma30 && ma30 > ma60;
@@ -1833,13 +2167,17 @@ function analyzeHistory(history) {
   return {
     summary, ma5: roundMetric(ma5), ma10: roundMetric(ma10), ma20: roundMetric(ma20), ma30: roundMetric(ma30), ma60: roundMetric(ma60), maAlignment,
     rsi14: roundMetric(rsi14, 1), rangeLow: roundMetric(rangeLow), rangeHigh: roundMetric(rangeHigh),
-    return5: roundMetric(percentageReturn(rows, 5)), return20: roundMetric(percentageReturn(rows, 20)), return60: roundMetric(percentageReturn(rows, 60)),
+    return5: roundMetric(return5), return20: roundMetric(return20), return60: roundMetric(percentageReturn(rows, 60)),
     volume, volumeRatio: roundMetric(volumeRatio), volume5Ratio: roundMetric(volume5Ratio),
     macdDif: roundMetric(macdDif, 3), macdDea: roundMetric(macdDea, 3), macdHistogram: roundMetric(macdHistogram, 3),
     bollUpper: roundMetric(bollUpper), bollMiddle: roundMetric(ma20), bollLower: roundMetric(bollLower),
     atr14: roundMetric(atr14), volatility20: roundMetric(volatility20, 1), maxDrawdown: roundMetric(maxDrawdown, 1),
     breakoutPrice: roundMetric(resistance), supportPrice: roundMetric(supportPrice), distanceToBreakout: roundMetric(distanceToBreakout),
     score, verdict, buyCondition, risk, entry, exit,
+    reboundSignal, reboundScore, reboundReason, bottomDate: bottomRow.date,
+    bottomPrice: roundMetric(bottomRow.low), bottomDrawdown: roundMetric(bottomDrawdown, 1),
+    reboundFromBottom: roundMetric(reboundFromBottom, 1), bottomRangePosition: roundMetric(bottomRangePosition, 1),
+    daysSinceBottom, macdImproving, shortAverageImproving,
     entryWindow: falling ? '等待趋势条件触发，通常至少观察5-15个交易日。' : '未来3-10个交易日，条件未触发则继续等待。',
     exitWindow: '入场后1-4周持续观察，价格与成交量条件优先于固定日期。'
   };
@@ -1934,10 +2272,16 @@ async function fetchStockChart({ code, period, force = false }) {
   } else {
     const frequency = safePeriod;
     const count = safePeriod === 'day' ? 160 : 120;
-    const json = await getJsonWithRetry(`https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=${symbol},${frequency},,,${count},qfq&_=${Date.now()}`, 1);
-    const data = json?.data?.[symbol] || {};
-    rows = normalizeHistoryRows(data[`qfq${frequency}`] || data[frequency] || []).map(row => ({ ...row, time: row.date }));
-    source = `腾讯前复权${safePeriod === 'day' ? '日K' : safePeriod === 'week' ? '周K' : '月K'}`;
+    try {
+      const json = await getJsonWithRetry(`https://ifzq.gtimg.cn/appstock/app/fqkline/get?param=${symbol},${frequency},,,${count},qfq&_=${Date.now()}`, 1);
+      const data = json?.data?.[symbol] || {};
+      rows = normalizeHistoryRows(data[`qfq${frequency}`] || data[frequency] || []).map(row => ({ ...row, time: row.date }));
+      source = `腾讯前复权${safePeriod === 'day' ? '日K' : safePeriod === 'week' ? '周K' : '月K'}`;
+    } catch (tencentError) {
+      if (safePeriod !== 'day') throw tencentError;
+      rows = (await fetchSinaHistory(code)).map(row => ({ ...row, time: row.date }));
+      source = '新浪日K（腾讯接口异常后备用）';
+    }
   }
   if (rows.length < 10) throw new Error(`${source || safePeriod}返回数据不足`);
   return writeTimedCache(stockChartCache, cacheKey, { period: safePeriod, rows, previousClose, source, fetchedAt: new Date().toISOString() });
@@ -2013,7 +2357,7 @@ async function fetchStockNews({ code, name, force = false }) {
 async function runIndustryWorkflow(command) {
   const input = String(command || '').trim();
   if (!input) throw new Error('命令为空');
-  const { terms, explicitCodes, industryKeys, subject } = buildIndustryTerms(input);
+  const { terms, explicitCodes, industryKeys, subject, entities } = buildIndustryTerms(input);
   const allowFund = allowsFundResults(input);
   const errors = [];
   const candidates = new Map();
@@ -2026,6 +2370,8 @@ async function runIndustryWorkflow(command) {
   };
 
   explicitCodes.forEach(code => addCandidate({ code, name: code, sector: '命令指定代码', securityType: 'A股', source: '命令指定代码', relevanceScore: 200 }));
+  entityFallbackForCommand(input).filter(item => item.relevanceScore >= 40).forEach(addCandidate);
+  specificIndustryFallbackForCommand(input).forEach(addCandidate);
 
   const matchedBoards = await findBoardsForSubject(subject, terms, errors);
   for (const board of matchedBoards) {
@@ -2069,7 +2415,7 @@ async function runIndustryWorkflow(command) {
   }
 
   if (candidates.size < 12) {
-    fallbackForCommand(input).forEach(item => {
+    [...fallbackForCommand(input), ...entityFallbackForCommand(input).filter(item => item.relevanceScore >= 40), ...specificIndustryFallbackForCommand(input)].forEach(item => {
       addCandidate({ ...item, securityType: 'A股', source: '内置行业词库补充', relevanceScore: 25 });
     });
   }
@@ -2081,7 +2427,7 @@ async function runIndustryWorkflow(command) {
   const stocks = balanceIndustryCandidates(eligible, 80)
     .map(item => industryStockFromCandidate(item, input));
   appendLogLine({ type: stocks.length ? 'success' : 'error', message: '行业查找流程完成', action: 'workflow_complete', detail: { command: input, subject, boards: matchedBoards.map(b => b.name), keywords: terms, candidates: candidates.size, eligible: eligible.length, count: stocks.length, sectors: [...new Set(stocks.map(stock => stock.sector))].length, errors } });
-  return { stocks, errors, terms, subject, boards: matchedBoards, source: '通用行业查找脚本' };
+  return { stocks, errors, terms, subject, entities, boards: matchedBoards, source: '通用行业查找脚本' };
 }
 
 ipcMain.handle('fetch-a-share-quotes', async (_event, codes) => {

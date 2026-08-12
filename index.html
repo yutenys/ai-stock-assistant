@@ -44,7 +44,7 @@
         <section class="market-section"><h3>板块轮动</h3><div id="marketSectors"></div></section>
         <section class="market-section"><h3>资金活跃度（成交额）</h3><div id="marketFunds"></div><div id="marketActiveStocks" class="market-stocks"></div></section>
         <section class="market-section"><h3>涨跌停</h3><div id="marketLimits"></div></section>
-        <section class="market-section"><h3>即将突破观察</h3><div id="marketRecommendationCoverage" class="market-coverage"></div><div id="marketRecommendations"></div></section>
+        <section class="market-section"><div class="market-section-title"><h3>技术形态推荐</h3><button id="addMarketRecommendations" class="small">查看更多</button></div><div id="marketRecommendationCoverage" class="market-coverage"></div><div id="marketRecommendations"></div></section>
         <section class="market-section"><h3>市场消息</h3><div id="marketNews"></div></section>
         <div id="marketError" class="note inline-note hidden"></div>
       </aside>
@@ -91,6 +91,25 @@
               <input id="newStockLabelName" placeholder="新增标签名称，可不填" />
               <button id="saveStockLabels" class="primary">保存标签</button>
             </div>
+          </div>
+        </div>
+
+        <div id="marketLabelPanel" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="marketLabelTitle">
+          <div class="label-modal market-label-modal">
+            <div class="add-panel-head">
+              <div><b id="marketLabelTitle">全部推荐与一键保存</b><p>先选择或新建标签，再勾选需要保存的推荐股。</p></div>
+              <button id="closeMarketLabelPanel">关闭</button>
+            </div>
+            <div class="market-save-targets">
+              <div class="market-label-toolbar"><b>保存到标签</b></div>
+              <div id="marketLabelChoices" class="label-choice-list"></div>
+              <div class="label-modal-actions market-new-label">
+                <input id="newMarketLabelName" placeholder="新标签名称，可不填" />
+                <button id="saveMarketRecommendations" class="primary">一键保存</button>
+              </div>
+            </div>
+            <div class="market-label-toolbar"><b id="marketRecommendationListTitle">推荐股票</b><button id="toggleMarketStocks" class="small">取消全选</button></div>
+            <div id="marketStockChoices" class="market-stock-choices"></div>
           </div>
         </div>
 

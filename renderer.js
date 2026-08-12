@@ -23,6 +23,7 @@ let searchSeq = 0;
 let logs = [];
 let currentViewSource = 'empty';
 let marketOverviewRefreshing = false;
+let latestMarketRecommendations = [];
 const detailProfileCache = new Map();
 const detailNewsCache = new Map();
 const detailHistoryCache = new Map();
@@ -73,7 +74,9 @@ function loadState(){
       stocks: (label.stocks || []).map(ls => ({
         ...ls,
         name: cleanDisplayName(ls.name),
-        status: ls.status === '已突破' ? '待分析' : ls.status
+        type: ls.marketSignal || ls.type,
+        status: ls.marketSignal ? (ls.newsLabel || ls.focus || '消息中性') : (ls.status === '已突破' ? '待分析' : ls.status),
+        focus: ls.marketSignal && ls.newsLabel ? ls.newsLabel : ls.focus
       })).filter(ls => /^\d{6}$/.test(String(ls.code || '')) && ls.name)
     }));
     if(!labels.some(label => label.name === activeLabel)) activeLabel = labels[0]?.name || '';
@@ -141,21 +144,30 @@ function renderMarketOverview(result){
     ${upStocks ? `<div class="market-stocks"><b>涨停代表：</b>${escapeHtml(upStocks)}</div>` : ''}
     ${downStocks ? `<div class="market-stocks"><b>跌停代表：</b>${escapeHtml(downStocks)}</div>` : ''}`;
   const recommendations = result.recommendations || [];
+  latestMarketRecommendations = recommendations;
   const coverage = result.recommendationCoverage || {};
+  const signals = recommendations.reduce((counts, item) => {
+    if(item.signal === '底部待反弹') counts.bottomWaiting += 1;
+    else if(item.signal === '已反弹') counts.rebounded += 1;
+    else if(item.signal === '待突破') counts.breakout += 1;
+    return counts;
+  }, {bottomWaiting:0, rebounded:0, breakout:0});
   $('marketRecommendationCoverage').textContent = coverage.scanned
-    ? `全市场扫描 ${coverage.scanned} 只，初筛 ${coverage.prefiltered || 0} 只，历史精筛 ${coverage.analyzed || 0} 只，覆盖 ${coverage.industries || 0} 个行业`
+    ? `全市场扫描 ${coverage.scanned} 只，初筛 ${coverage.prefiltered || 0} 只，历史精筛 ${coverage.analyzed || 0} 只，覆盖 ${coverage.industries || 0} 个行业；实际推荐 ${recommendations.length} 只（待反弹 ${signals.bottomWaiting}，已反弹 ${signals.rebounded}，待突破 ${signals.breakout}）`
     : '等待全市场扫描';
-  $('marketRecommendations').innerHTML = recommendations.length ? recommendations.slice(0, 10).map(item => `<button class="market-recommendation" data-market-recommendation="${escapeHtml(item.code)}">
-    <b>${escapeHtml(item.name)} <span class="code">${escapeHtml(item.code)}</span></b>
-    <span>${escapeHtml(item.industry || '行业待确认')} · ${escapeHtml(item.verdict)} · 评分 ${escapeHtml(item.score)} · MA30 ${yuan(item.ma30)} · 突破价 ${yuan(item.breakoutPrice)}</span>
+  const visibleRecommendations = recommendations.slice(0, 10);
+  $('marketRecommendations').innerHTML = visibleRecommendations.length ? visibleRecommendations.map(item => `<button class="market-recommendation" data-market-recommendation="${escapeHtml(item.code)}">
+    <b>${escapeHtml(item.name)} <span class="code">${escapeHtml(item.code)}</span><span class="market-signal ${badgeClass(item.signal)}">${escapeHtml(item.signal || '待突破')}</span><span class="market-signal ${badgeClass(item.newsLabel)}">${escapeHtml(item.newsLabel || '消息中性')}</span></b>
+    <span>${escapeHtml(item.industry || '行业待确认')} · ${escapeHtml(item.verdict)} · 推荐评分 ${escapeHtml(item.signalScore ?? item.score)} · MA30 ${yuan(item.ma30)} · 突破价 ${yuan(item.breakoutPrice)}</span>
     <small>${escapeHtml(item.reason)}</small>
   </button>`).join('') : '<div class="market-row"><span>当前未筛出满足条件的候选</span></div>';
+  $('addMarketRecommendations').textContent = `查看更多（${recommendations.length}）`;
   const marketNews = result.newsContext?.items || [];
   $('marketNews').innerHTML = `<div class="market-stocks">${escapeHtml(result.newsContext?.summary || '消息面暂不可用')}</div>${marketNews.slice(0, 5).map(item => `<a class="market-news-row" href="#" data-market-news-link="${escapeHtml(safeHttpUrl(item.link))}">${escapeHtml(item.title)}<span>${escapeHtml(item.source || '')} · ${escapeHtml(item.publishedAt || '')}</span></a>`).join('')}`;
   document.querySelectorAll('[data-market-recommendation]').forEach(button => button.onclick = () => {
     const item = recommendations.find(candidate => candidate.code === button.dataset.marketRecommendation);
     if(!item) return;
-    const stock = {...defaultStockFromSearch(item), ...item, type:'趋势关注', status:'待分析', focus:'市场候选', reason:item.reason, news:item.newsContext?.summary || ''};
+    const stock = normalizedMarketRecommendation(item);
     stocks = [stock];
     currentViewSource = 'market';
     activeDetailCode = stock.code;
@@ -208,12 +220,90 @@ function describeClickTarget(target){
 }
 
 function badgeClass(v){
-  if(['龙头','已突破','重点关注'].includes(v)) return 'b-red';
-  if(['趋势关注','突破后运行'].includes(v)) return 'b-green';
-  if(['待突破','等待确认','观察关注','中线关注'].includes(v)) return 'b-amber';
+  if(['龙头','已突破','重点关注','消息确认'].includes(v)) return 'b-red';
+  if(['趋势关注','突破后运行','已反弹'].includes(v)) return 'b-green';
+  if(['待突破','等待确认','观察关注','中线关注','底部待反弹'].includes(v)) return 'b-amber';
   if(['待观察','待分析','待刷新','核心候选','产业链候选'].includes(v)) return 'b-blue';
-  if(['待回调','高弹性关注'].includes(v)) return 'b-purple';
+  if(['待回调','高弹性关注','消息谨慎'].includes(v)) return 'b-purple';
   return 'b-gray';
+}
+
+function stockTagValues(stock){
+  const values = stock.marketSignal
+    ? [stock.marketSignal, stock.newsLabel || stock.focus]
+    : [stock.type, stock.status, stock.focus];
+  return [...new Set(values.filter(Boolean))];
+}
+
+function stockTagsHtml(stock, className='badge'){
+  return stockTagValues(stock).map(value => `<span class="${className} ${badgeClass(value)}">${escapeHtml(value)}</span>`).join('');
+}
+
+function closeMarketLabelPanel(){
+  $('marketLabelPanel')?.classList.add('hidden');
+}
+
+function updateMarketStockToggleText(){
+  const choices = [...document.querySelectorAll('[data-market-stock-choice]')];
+  const allSelected = choices.length > 0 && choices.every(choice => choice.checked);
+  $('toggleMarketStocks').textContent = allSelected ? '取消全选' : '全选';
+}
+
+function normalizedMarketRecommendation(item){
+  const hasSignalScore = item.signalScore !== null && item.signalScore !== '' && Number.isFinite(Number(item.signalScore));
+  const recommendationScore = hasSignalScore ? Number(item.signalScore) : Number(item.score);
+  return {
+    ...defaultStockFromSearch(item),
+    ...item,
+    technicalScore: Number.isFinite(Number(item.technicalScore)) ? Number(item.technicalScore) : Number(item.score),
+    score: Number.isFinite(recommendationScore) ? recommendationScore : item.score,
+    type:item.signal || '市场推荐', status:item.newsLabel || '消息中性', focus:item.newsLabel || '消息中性',
+    marketSignal:item.signal, reason:item.reason, news:item.newsContext?.summary || ''
+  };
+}
+
+function openMarketLabelPanel(){
+  if(!latestMarketRecommendations.length){ notify('当前没有可添加的推荐股', 'warn'); return; }
+  $('marketLabelPanel').classList.remove('hidden');
+  $('newMarketLabelName').value = '';
+  $('marketRecommendationListTitle').innerHTML = `推荐股票 <em>${latestMarketRecommendations.length} 只</em>`;
+  $('marketStockChoices').innerHTML = latestMarketRecommendations.map(item => `<label class="market-recommendation market-stock-choice">
+    <input type="checkbox" data-market-stock-choice="${escapeHtml(item.code)}" checked />
+    <span class="market-stock-content"><b>${escapeHtml(item.name)} <span class="code">${escapeHtml(item.code)}</span><span class="market-signal ${badgeClass(item.signal)}">${escapeHtml(item.signal || '待突破')}</span><span class="market-signal ${badgeClass(item.newsLabel)}">${escapeHtml(item.newsLabel || '消息中性')}</span></b>
+      <span>${escapeHtml(item.industry || '行业待确认')} · ${escapeHtml(item.verdict || '等待确认')} · 推荐评分 ${escapeHtml(item.signalScore ?? item.score)} · MA30 ${yuan(item.ma30)} · 突破价 ${yuan(item.breakoutPrice)}</span>
+      <small>${escapeHtml(item.reason || '')}</small></span>
+  </label>`).join('');
+  $('marketLabelChoices').innerHTML = labels.length ? labels.map(label => `<label class="label-choice">
+    <input type="checkbox" data-market-target-label="${escapeHtml(label.name)}" />
+    <span>${escapeHtml(label.name)}<small class="market-label-count">${label.stocks.length}只</small></span>
+  </label>`).join('') : '<div class="note">暂无标签，请在下方创建新标签。</div>';
+  document.querySelectorAll('[data-market-stock-choice]').forEach(choice => choice.onchange = updateMarketStockToggleText);
+  updateMarketStockToggleText();
+  setTimeout(() => document.querySelector('[data-market-stock-choice]')?.focus({preventScroll:true}), 0);
+}
+
+function saveMarketRecommendations(){
+  const selectedCodes = new Set([...document.querySelectorAll('[data-market-stock-choice]:checked')].map(item => item.dataset.marketStockChoice));
+  const targetLabels = new Set([...document.querySelectorAll('[data-market-target-label]:checked')].map(item => item.dataset.marketTargetLabel));
+  const newName = $('newMarketLabelName').value.trim();
+  if(newName) targetLabels.add(newName);
+  if(!selectedCodes.size){ notify('请至少选择一只推荐股', 'warn'); return; }
+  if(!targetLabels.size){ notify('请选择标签或输入新标签名称', 'warn'); return; }
+  targetLabels.forEach(name => {
+    if(!labels.some(label => label.name === name)) labels.push({name, stocks:[]});
+  });
+  const selectedStocks = latestMarketRecommendations.filter(item => selectedCodes.has(item.code)).map(normalizedMarketRecommendation);
+  labels = labels.map(label => {
+    if(!targetLabels.has(label.name)) return label;
+    const byCode = new Map(label.stocks.map(stock => [stock.code, stock]));
+    selectedStocks.forEach(stock => byCode.set(stock.code, {...byCode.get(stock.code), ...stock, pinned:Boolean(byCode.get(stock.code)?.pinned)}));
+    return {...label, stocks:[...byCode.values()]};
+  });
+  activeLabel ||= [...targetLabels][0];
+  saveState();
+  renderLabels();
+  closeMarketLabelPanel();
+  notify(`已将 ${selectedStocks.length} 只推荐股添加到 ${targetLabels.size} 个标签`, 'success');
 }
 function pctClass(v){ return Number(v) >= 0 ? 'up' : 'down'; }
 function checked(code){ return selected.has(code) ? 'checked' : ''; }
@@ -288,31 +378,37 @@ function simulatedTradePanel(s){
     </div>
     <div class="simulation-order">
       <label>成交价格<input data-sim-price="${s.code}" type="number" min="0.01" step="0.01" value="${Number(s.price || metrics.currentPrice || 0).toFixed(2)}" /></label>
-      <label>交易金额<input data-sim-amount="${s.code}" type="number" min="0" step="100" value="10000" /></label>
+      <label>买入金额<input data-sim-amount="${s.code}" type="number" min="0" step="100" value="10000" /></label>
+      <label>卖出数量<input data-sim-sell-quantity="${s.code}" type="number" min="0" step="100" value="${metrics.quantity}" /></label>
       <button class="sim-buy" data-sim-trade="buy" data-sim-code="${s.code}">模拟买入</button>
       <button class="sim-sell" data-sim-trade="sell" data-sim-code="${s.code}" ${metrics.quantity ? '' : 'disabled'}>模拟卖出</button>
     </div>
+    <div class="simulation-quick-sell"><span>快速卖出</span>${[['1/4',.25],['1/3',1/3],['1/2',.5],['全部',1]].map(([label, ratio]) => `<button class="small" data-sim-sell-ratio="${ratio}" data-sim-code="${s.code}" ${metrics.quantity ? '' : 'disabled'}>${label}</button>`).join('')}</div>
     <div class="simulation-history table-wrap"><table><thead><tr><th>时间</th><th>方向</th><th>数量</th><th>价格</th><th>金额</th><th>实现收益</th></tr></thead><tbody>${tradeRows}</tbody></table></div>
   </section>`;
 }
 
-function executeSimulatedTrade(code, side){
+function executeSimulatedTrade(code, side, options={}){
   const stock = findStockByCode(code);
-  const price = Number(document.querySelector(`[data-sim-price="${code}"]`)?.value);
-  const requestedAmount = Number(document.querySelector(`[data-sim-amount="${code}"]`)?.value);
-  if(!stock || !Number.isFinite(price) || price <= 0 || !Number.isFinite(requestedAmount) || requestedAmount <= 0){
-    notify('模拟交易失败：请输入有效成交价格和交易金额', 'error');
-    return;
+  const price = Number(options.price ?? document.querySelector(`[data-sim-price="${code}"]`)?.value ?? stock?.price);
+  const requestedAmount = Number(options.amount ?? document.querySelector(`[data-sim-amount="${code}"]`)?.value);
+  const requestedQuantity = Number(options.quantity ?? document.querySelector(`[data-sim-sell-quantity="${code}"]`)?.value);
+  if(!stock || !Number.isFinite(price) || price <= 0){
+    if(!options.quiet) notify('模拟交易失败：请输入有效成交价格', 'error');
+    return false;
   }
-  let quantity = Math.floor(requestedAmount / price / 100) * 100;
   let position = portfolioPosition(code);
+  let quantity = 0;
   if(side === 'sell'){
     const held = Math.max(0, Number(position?.quantity) || 0);
-    if(!held){ notify('模拟卖出失败：当前没有持仓', 'error'); return; }
-    if(requestedAmount >= held * price) quantity = held;
-    else quantity = Math.min(quantity, held);
+    if(!held){ if(!options.quiet) notify('模拟卖出失败：当前没有持仓', 'error'); return false; }
+    if(!Number.isFinite(requestedQuantity) || requestedQuantity <= 0){ if(!options.quiet) notify('模拟卖出失败：请输入有效卖出数量', 'error'); return false; }
+    quantity = requestedQuantity >= held ? held : Math.min(Math.floor(requestedQuantity / 100) * 100, held);
+  }else{
+    if(!Number.isFinite(requestedAmount) || requestedAmount <= 0){ if(!options.quiet) notify('模拟买入失败：请输入有效买入金额', 'error'); return false; }
+    quantity = Math.floor(requestedAmount / price / 100) * 100;
   }
-  if(quantity < 100){ notify('模拟交易失败：交易金额不足100股', 'error'); return; }
+  if(quantity < 100){ if(!options.quiet) notify('模拟交易失败：数量不足100股', 'error'); return false; }
 
   if(!position){
     position = {code, name:stock.name, sector:stock.sector, quantity:0, costPrice:0, realizedPnl:0, lastPrice:Number(stock.price) || price, changePct:stock.changePct, source:stock.source, stock:{...stock}};
@@ -341,10 +437,12 @@ function executeSimulatedTrade(code, side){
   simulatedTrades = simulatedTrades.slice(0, 500);
   saveState();
   addLog('action', `模拟${side === 'buy' ? '买入' : '卖出'}成交`, {code, name:stock.name, price, quantity, amount, realizedPnl});
-  notify(`模拟${side === 'buy' ? '买入' : '卖出'}成功：${stock.name} ${quantity}股，成交金额${money(amount)}`, 'success');
-  renderStocks();
+  if(!options.quiet) notify(`模拟${side === 'buy' ? '买入' : '卖出'}成功：${stock.name} ${quantity}股，成交金额${money(amount)}`, 'success');
+  if(options.render !== false) renderStocks();
+  return true;
 }
 function updateStatusByQuote(s){
+  if(s.marketSignal) return s.newsLabel || s.focus || '消息中性';
   const historyResult = detailHistoryCache.get(s.code);
   const analysis = historyResult?.analysis;
   if(!analysis) return s.status === '已突破' ? '待分析' : (s.status || '待分析');
@@ -371,9 +469,10 @@ function applyAnalysisClassification(code){
   if(!analysis) return;
   const update = stock => stock.code === code ? {
     ...stock,
-    score: analysis.score,
+    technicalScore: analysis.score,
+    score: Number.isFinite(Number(stock.signalScore)) ? Number(stock.signalScore) : analysis.score,
     status: updateStatusByQuote(stock),
-    focus: analysis.score >= 72 ? '重点关注' : analysis.score >= 55 ? '趋势关注' : '观察关注'
+    focus: stock.marketSignal && stock.newsLabel ? stock.newsLabel : analysis.score >= 72 ? '重点关注' : analysis.score >= 55 ? '趋势关注' : '观察关注'
   } : stock;
   stocks = stocks.map(update);
   labels = labels.map(label => ({...label, stocks:label.stocks.map(update)}));
@@ -404,16 +503,20 @@ function filteredStocks(){
 }
 
 function defaultStockFromSearch(item){
+  const relation = String(item.relationEvidence || item.relation || '').trim();
   return {
-    sector: '线上搜索',
+    ...item,
+    sector: item.sector || '线上搜索',
     name: cleanDisplayName(item.name),
     code: item.code,
-    type: '待观察',
+    type: relation ? '产业链候选' : '待观察',
     status: '待刷新',
-    focus: '搜索添加',
+    focus: relation ? '关系待核验' : '搜索添加',
     price: null,
     changePct: null,
-    reason: '通过线上股票搜索添加，需结合基本面和行情进一步确认。',
+    reason: relation
+      ? `${relation}。需结合公司公告核验具体项目关系。`
+      : '通过线上股票搜索添加，需结合基本面和行情进一步确认。',
     news: '等待刷新实际行情。'
   };
 }
@@ -434,7 +537,8 @@ function stockLabelHtml(s){
 }
 
 function stockAnalysisScore(s){
-  return detailHistoryCache.get(s.code)?.analysis?.score ?? (Number.isFinite(Number(s.score)) ? Number(s.score) : null);
+  if(s.signalScore !== null && s.signalScore !== '' && Number.isFinite(Number(s.signalScore))) return Number(s.signalScore);
+  return Number.isFinite(Number(s.score)) ? Number(s.score) : (detailHistoryCache.get(s.code)?.analysis?.score ?? null);
 }
 
 function scoreBadge(s){
@@ -454,7 +558,7 @@ function stockCard(s, compact=false, showCheck=true){
         </div>
         <div class="price">${yuan(s.price)}<div class="pct ${pctClass(s.changePct)}">${formatPct(s.changePct)}</div></div>
       </div>
-      <div class="compact-score">${s.pinned ? '<span class="compact-pinned">置顶</span>' : ''}<b>评分 ${score == null ? '待分析' : escapeHtml(score)}</b><span class="compact-state ${badgeClass(s.type)}">${escapeHtml(s.type || '待观察')}</span><span class="compact-state ${badgeClass(s.status)}">${escapeHtml(s.status || '等待确认')}</span><span class="compact-state ${badgeClass(s.focus)}">${escapeHtml(s.focus || '观察关注')}</span></div>
+      <div class="compact-score">${s.pinned ? '<span class="compact-pinned">置顶</span>' : ''}<b>评分 ${score == null ? '待分析' : escapeHtml(score)}</b>${stockTagsHtml(s, 'compact-state')}</div>
     </article>`;
   }
   return `<article class="stock-card ${compact ? 'compact-card label-stock-card' : ''}" data-detail-code="${s.code}">
@@ -468,7 +572,7 @@ function stockCard(s, compact=false, showCheck=true){
       </div>
       <div class="price">${yuan(s.price)}<div class="pct ${pctClass(s.changePct)}">${formatPct(s.changePct)}</div></div>
     </div>
-    <div class="badges"><span class="badge ${badgeClass(s.type)}">${escapeHtml(s.type)}</span><span class="badge ${badgeClass(s.status)}">${escapeHtml(s.status)}</span><span class="badge ${badgeClass(s.focus)}">${escapeHtml(s.focus)}</span>${scoreBadge(s)}</div>
+    <div class="badges">${stockTagsHtml(s)}${scoreBadge(s)}</div>
     <p><b>原因：</b>${escapeHtml(s.reason)}</p><p><b>最新情况：</b>${escapeHtml(s.news || '--')}</p>
     ${labelHtml}
   </article>`;
@@ -490,23 +594,77 @@ function renderPortfolioView(){
   const floatingPnl = holdingMetrics.reduce((sum, item) => sum + item.metrics.floatingPnl, 0);
   const realizedPnl = portfolio.reduce((sum, position) => sum + (Number(position.realizedPnl) || 0), 0);
   const totalPnl = floatingPnl + realizedPnl;
+  const allSelected = holdings.length > 0 && holdings.every(position => selected.has(position.code));
   const rows = holdingMetrics.map(({stock, metrics}) => `<tr data-detail-code="${stock.code}" data-portfolio-code="${stock.code}">
-    <td><b>${escapeHtml(stock.name)}</b><small>${stock.code}</small></td>
+    <td><input type="checkbox" data-portfolio-choice="${stock.code}" ${selected.has(stock.code) ? 'checked' : ''} /></td><td><b>${escapeHtml(stock.name)}</b><small>${stock.code}</small></td>
     <td>${metrics.quantity}股</td><td>${yuan(metrics.currentPrice)} / ${yuan(metrics.costPrice)}</td>
     <td>${money(metrics.marketValue)}</td><td class="${pctClass(metrics.floatingPnl)}"><b>${money(metrics.floatingPnl)}</b><small>${formatPct(metrics.floatingPct)}</small></td>
     <td class="${pctClass(metrics.realizedPnl)}">${money(metrics.realizedPnl)}</td><td class="${pctClass(metrics.totalPnl)}"><b>${money(metrics.totalPnl)}</b></td>
   </tr>`).join('');
   const trades = simulatedTrades.slice(0, 20).map(trade => `<tr><td>${escapeHtml(trade.time)}</td><td>${escapeHtml(trade.name)}<small>${trade.code}</small></td><td class="${trade.side === '买入' ? 'up' : 'down'}">${trade.side}</td><td>${trade.quantity}股</td><td>${yuan(trade.price)}</td><td>${money(trade.amount)}</td><td class="${pctClass(trade.realizedPnl)}">${trade.side === '卖出' ? money(trade.realizedPnl) : '--'}</td></tr>`).join('');
   return `<section class="portfolio-view">
-    <div class="portfolio-head"><div><h2>模拟持仓</h2><p>行情刷新后，持仓市值和浮动盈亏会按最新价格更新</p></div><span>${holdings.length} 只持仓</span></div>
+    <div class="portfolio-head"><div><h2>模拟持仓</h2><p>行情刷新后，持仓市值和浮动盈亏会按最新价格更新</p></div><div class="portfolio-head-actions"><button class="small" data-portfolio-refresh>刷新</button><span>${holdings.length} 只持仓</span></div></div>
     <div class="portfolio-summary">
       <div><span>持仓成本</span><b>${money(costValue)}</b></div><div><span>当前市值</span><b>${money(marketValue)}</b></div>
       <div><span>持仓盈亏</span><b class="${pctClass(floatingPnl)}">${money(floatingPnl)}</b></div><div><span>已实现收益</span><b class="${pctClass(realizedPnl)}">${money(realizedPnl)}</b></div>
       <div><span>累计收益</span><b class="${pctClass(totalPnl)}">${money(totalPnl)}</b></div>
     </div>
-    ${rows ? `<div class="table-wrap"><table class="portfolio-table"><thead><tr><th>股票</th><th>持仓数量</th><th>现价 / 成本</th><th>市值</th><th>持仓盈亏</th><th>已实现</th><th>累计收益</th></tr></thead><tbody>${rows}</tbody></table></div>` : '<div class="portfolio-empty">暂无模拟持仓，可在个股详情中设置价格和金额后模拟买入。</div>'}
+    ${rows ? `<div class="portfolio-batch-toolbar"><button class="small" data-portfolio-toggle>${allSelected ? '取消全选' : '全选'}</button><span>已选 ${holdings.filter(position => selected.has(position.code)).length} 只</span><label>每只买入金额<input data-portfolio-buy-amount type="number" min="100" step="100" value="10000" /></label><button class="sim-buy" data-portfolio-batch="buy">批量买入</button><label>卖出比例<select data-portfolio-sell-ratio><option value="0.25">1/4</option><option value="0.3333333333">1/3</option><option value="0.5">1/2</option><option value="1" selected>全部</option></select></label><button class="sim-sell" data-portfolio-batch="sell">批量卖出</button></div><div class="table-wrap"><table class="portfolio-table"><thead><tr><th>选</th><th>股票</th><th>持仓数量</th><th>现价 / 成本</th><th>市值</th><th>持仓盈亏</th><th>已实现</th><th>累计收益</th></tr></thead><tbody>${rows}</tbody></table></div>` : '<div class="portfolio-empty">暂无模拟持仓，可在个股详情中设置价格和金额后模拟买入。</div>'}
     <div class="portfolio-trades"><h3>最近模拟成交</h3>${trades ? `<div class="table-wrap"><table><thead><tr><th>时间</th><th>股票</th><th>方向</th><th>数量</th><th>价格</th><th>金额</th><th>实现收益</th></tr></thead><tbody>${trades}</tbody></table></div>` : '<div class="portfolio-empty">暂无模拟成交记录</div>'}</div>
   </section>`;
+}
+
+function bindPortfolioInteractions(root){
+  root.querySelectorAll('[data-portfolio-choice]').forEach(choice => {
+    choice.onclick = event => event.stopPropagation();
+    choice.onchange = () => {
+      choice.checked ? selected.add(choice.dataset.portfolioChoice) : selected.delete(choice.dataset.portfolioChoice);
+      renderStocks();
+    };
+  });
+  root.querySelector('[data-portfolio-toggle]')?.addEventListener('click', () => {
+    const holdings = portfolio.filter(position => Number(position.quantity) > 0);
+    const allSelected = holdings.length > 0 && holdings.every(position => selected.has(position.code));
+    holdings.forEach(position => allSelected ? selected.delete(position.code) : selected.add(position.code));
+    renderStocks();
+  });
+  root.querySelector('[data-portfolio-refresh]')?.addEventListener('click', refreshPortfolioHoldings);
+  root.querySelectorAll('[data-portfolio-batch]').forEach(button => button.onclick = () => executePortfolioBatch(button.dataset.portfolioBatch));
+}
+
+function executePortfolioBatch(side){
+  const targets = portfolio.filter(position => Number(position.quantity) > 0 && selected.has(position.code));
+  if(!targets.length){ notify(`请先选择需要批量${side === 'buy' ? '买入' : '卖出'}的持仓`, 'warn'); return; }
+  const amount = Number(document.querySelector('[data-portfolio-buy-amount]')?.value);
+  const ratio = Number(document.querySelector('[data-portfolio-sell-ratio]')?.value || 1);
+  let completed = 0;
+  targets.forEach(position => {
+    const stock = portfolioStock(position);
+    const price = Number(stock?.price || position.lastPrice || position.costPrice);
+    const quantity = ratio >= 1 ? Number(position.quantity) : Math.floor(Number(position.quantity) * ratio / 100) * 100;
+    if(executeSimulatedTrade(position.code, side, {price, amount, quantity, quiet:true, render:false})) completed += 1;
+  });
+  selected = new Set([...selected].filter(code => Number(portfolioPosition(code)?.quantity) > 0));
+  notify(`批量${side === 'buy' ? '买入' : '卖出'}完成：${completed}/${targets.length} 只`, completed ? 'success' : 'warn');
+  renderStocks();
+}
+
+async function refreshPortfolioHoldings(){
+  const codes = portfolio.filter(position => Number(position.quantity) > 0).map(position => position.code);
+  const button = document.querySelector('[data-portfolio-refresh]');
+  if(!codes.length || !window.stockApi?.fetchQuotes) return;
+  if(button){ button.disabled = true; button.textContent = '刷新中'; }
+  try{
+    const result = parseQuoteResponse(await window.stockApi.fetchQuotes(codes));
+    recordQuoteMessages(result);
+    if(result.quotes.length){ applyQuoteData(result.quotes); saveState(); notify(`持仓行情已刷新 ${result.quotes.length} 只`, 'success'); }
+    else notify('模拟持仓行情刷新失败，当前显示上次价格', 'error');
+  }catch(err){
+    addLog('error', `模拟持仓行情刷新失败：${err.message || err}`);
+    notify(`模拟持仓行情刷新失败：${err.message || err}`, 'error');
+  }finally{
+    renderStocks();
+  }
 }
 
 async function openSimulationPortfolio(){
@@ -520,20 +678,7 @@ async function openSimulationPortfolio(){
   $('addPanel')?.classList.add('hidden');
   closeStockLabelPanel();
   renderStocks();
-  const codes = portfolio.filter(position => Number(position.quantity) > 0).map(position => position.code);
-  if(!codes.length || !window.stockApi?.fetchQuotes) return;
-  try{
-    const result = parseQuoteResponse(await window.stockApi.fetchQuotes(codes));
-    recordQuoteMessages(result);
-    if(result.quotes.length){
-      applyQuoteData(result.quotes);
-      saveState();
-      renderStocks();
-    }else notify('模拟持仓行情刷新失败，当前显示上次价格', 'error');
-  }catch(err){
-    addLog('error', `模拟持仓行情刷新失败：${err.message || err}`);
-    notify(`模拟持仓行情刷新失败：${err.message || err}`, 'error');
-  }
+  await refreshPortfolioHoldings();
 }
 
 function renderStocks(){
@@ -543,6 +688,7 @@ function renderStocks(){
   if(currentViewSource === 'portfolio'){
     $('stockContainer').innerHTML = renderPortfolioView();
     bindStockInteractions($('stockContainer'));
+    bindPortfolioInteractions($('stockContainer'));
     renderAddStockList();
     renderLabels();
     return;
@@ -856,11 +1002,18 @@ function renderHistoryAnalysis(s, result){
   const capital = typeof s.mainNetInflow === 'number'
     ? `当前主力流入${metricValue(s.mainInflow, money)}、流出${metricValue(s.mainOutflow, money)}，${s.mainNetInflow >= 0 ? '净流入' : '净流出'}${money(Math.abs(s.mainNetInflow))}${typeof s.mainNetPct === 'number' ? `，净占比${formatPct(s.mainNetPct)}` : ''}。`
     : '当前主力资金接口未返回有效数据，不沿用历史资金值。';
-  analysisBox.innerHTML = `<b>股票分析：</b>${escapeHtml(`${a.combinedConclusion || a.summary}${capital}`)}`;
+  const displayedScore = stockAnalysisScore(s) ?? a.score;
+  const hasRecommendationScore = s.signalScore !== null && s.signalScore !== '' && Number.isFinite(Number(s.signalScore));
+  const scoreLabel = hasRecommendationScore ? '推荐评分 / 100' : '技术评分 / 100';
+  const conclusion = hasRecommendationScore
+    ? String(a.combinedConclusion || a.summary || '').replace(/技术评分\s*\d+(?:\.\d+)?\s*\/\s*100/g, `推荐评分${displayedScore}/100`)
+    : a.combinedConclusion || a.summary;
+  const displayedVerdict = hasRecommendationScore ? s.verdict || a.verdict : a.verdict;
+  analysisBox.innerHTML = `<b>股票分析：</b>${escapeHtml(`${conclusion}${capital}`)}`;
   box.innerHTML = `<h3>综合量价、趋势与消息分析</h3>
     <div class="analysis-verdict">
-      <div class="analysis-score"><b>${escapeHtml(a.score ?? '--')}</b><span>技术评分 / 100</span></div>
-      <div><p><b>当前判断：</b>${escapeHtml(a.verdict || '等待确认')}</p><p>${escapeHtml(a.combinedConclusion || a.summary)}</p></div>
+      <div class="analysis-score"><b>${escapeHtml(displayedScore ?? '--')}</b><span>${scoreLabel}</span></div>
+      <div><p><b>当前判断：</b>${escapeHtml(displayedVerdict || '等待确认')}</p><p>${escapeHtml(conclusion)}</p></div>
     </div>
     <div class="analysis-grid">
       <p><b>趋势：</b>${escapeHtml(a.summary)}</p>
@@ -1367,12 +1520,17 @@ async function loadStockChart(s, period = 'day', force=false){
   const canvas = document.querySelector(`[data-chart-for="${s.code}"]`);
   const meta = document.querySelector(`[data-chart-meta="${s.code}"]`);
   const legend = document.querySelector(`[data-chart-legend="${s.code}"]`);
+  const refreshButton = document.querySelector(`[data-chart-refresh="${s.code}"]`);
   document.querySelectorAll(`[data-chart-period][data-chart-code="${s.code}"]`).forEach(button => button.classList.toggle('active', button.dataset.chartPeriod === period));
   if(legend) legend.innerHTML = chartLegendHtml(period);
   if(!canvas || !meta || !window.stockApi?.fetchStockChart) return;
   const cacheKey = `${s.code}-${period}`;
   delete canvas.dataset.rendered;
   meta.textContent = '正在加载走势数据...';
+  if(refreshButton){
+    refreshButton.disabled = true;
+    refreshButton.textContent = '刷新中';
+  }
   try{
     let result = force ? null : detailChartCache.get(cacheKey);
     if(!result){
@@ -1388,6 +1546,11 @@ async function loadStockChart(s, period = 'day', force=false){
   }catch(err){
     meta.textContent = `走势加载失败：${err.message || err}`;
     addLog('error', `走势加载失败：${s.name} ${period} ${err.message || err}`);
+  }finally{
+    if(refreshButton?.isConnected){
+      refreshButton.disabled = false;
+      refreshButton.textContent = '刷新';
+    }
   }
 }
 
@@ -1492,10 +1655,10 @@ function renderDetailPanel(){
       <div><b data-quote-totalMarketCap-for="${s.code}">${marketCapValue(s.totalMarketCap)}</b><span>总市值</span></div>
       <div><b data-quote-floatMarketCap-for="${s.code}">${metricValue(s.floatMarketCap, money)}</b><span>流通市值</span></div>
     </div>
-    <div class="detail-tags"><span class="badge ${badgeClass(s.type)}">${escapeHtml(s.type)}</span><span class="badge ${badgeClass(s.status)}">${escapeHtml(s.status)}</span><span class="badge ${badgeClass(s.focus)}">${escapeHtml(s.focus)}</span></div>
+    <div class="detail-tags">${stockTagsHtml(s)}</div>
     ${simulatedTradePanel(s)}
     <div class="detail-chart">
-      <div class="chart-head"><h3>个股走势</h3><div class="chart-tabs">
+      <div class="chart-head"><div class="chart-title"><h3>个股走势</h3><button class="small chart-refresh" data-chart-refresh="${s.code}" title="重新加载当前周期走势" aria-label="刷新个股走势">刷新</button></div><div class="chart-tabs">
         ${[['minute','分时'],['five-day','五日'],['day','日K'],['week','周K'],['month','月K']].map(([key,label]) => `<button class="small ${chartPeriod === key ? 'active' : ''}" data-chart-period="${key}" data-chart-code="${s.code}">${label}</button>`).join('')}
       </div></div>
       <div class="chart-legend" data-chart-legend="${s.code}">${chartLegendHtml(chartPeriod)}</div>
@@ -1525,7 +1688,16 @@ function renderDetailPanel(){
   };
   panel.querySelectorAll('[data-detail-add-label]').forEach(button => button.onclick = () => openStockLabelPanel(s.code));
   panel.querySelectorAll('[data-sim-trade]').forEach(button => button.onclick = () => executeSimulatedTrade(button.dataset.simCode, button.dataset.simTrade));
+  panel.querySelectorAll('[data-sim-sell-ratio]').forEach(button => button.onclick = () => {
+    const position = portfolioPosition(button.dataset.simCode);
+    const held = Math.max(0, Number(position?.quantity) || 0);
+    const ratio = Number(button.dataset.simSellRatio);
+    const quantity = ratio >= 1 ? held : Math.min(held, Math.max(100, Math.floor(held * ratio / 100) * 100));
+    const input = panel.querySelector(`[data-sim-sell-quantity="${button.dataset.simCode}"]`);
+    if(input) input.value = String(quantity);
+  });
   panel.querySelectorAll('[data-chart-period]').forEach(button => button.onclick = () => loadStockChart(s, button.dataset.chartPeriod, true));
+  panel.querySelectorAll('[data-chart-refresh]').forEach(button => button.onclick = () => loadStockChart(s, activeChartPeriod.get(s.code) || chartPeriod, true));
   loadCompanyProfile(s);
   loadStockHistory(s, forceLatest);
   loadStockNews(s, forceLatest);
@@ -1860,10 +2032,22 @@ $('openAddPanel').onclick = () => { closeStockLabelPanel(); $('addPanel').classL
 $('closeAddPanel').onclick = () => $('addPanel').classList.add('hidden');
 $('closeStockLabelPanel').onclick = closeStockLabelPanel;
 $('saveStockLabels').onclick = saveStockLabels;
+$('addMarketRecommendations').onclick = openMarketLabelPanel;
+$('closeMarketLabelPanel').onclick = closeMarketLabelPanel;
+$('toggleMarketStocks').onclick = () => {
+  const choices = [...document.querySelectorAll('[data-market-stock-choice]')];
+  const selectAll = !choices.length || !choices.every(choice => choice.checked);
+  choices.forEach(choice => { choice.checked = selectAll; });
+  updateMarketStockToggleText();
+};
+$('saveMarketRecommendations').onclick = saveMarketRecommendations;
 $('pinLabelStock').onclick = togglePinnedLabelStock;
 $('removeLabelStock').onclick = removeContextLabelStock;
 $('stockLabelPanel').onclick = event => {
   if(event.target === event.currentTarget) closeStockLabelPanel();
+};
+$('marketLabelPanel').onclick = event => {
+  if(event.target === event.currentTarget) closeMarketLabelPanel();
 };
 $('modalSelectAll').onclick = toggleFilteredSelection;
 $('confirmAdd').onclick = () => {
@@ -1926,6 +2110,7 @@ document.addEventListener('keydown', event => {
   if(event.key !== 'Escape') return;
   closeLabelStockMenu();
   if(!$('stockLabelPanel')?.classList.contains('hidden')) closeStockLabelPanel();
+  if(!$('marketLabelPanel')?.classList.contains('hidden')) closeMarketLabelPanel();
 });
 window.addEventListener('scroll', closeLabelStockMenu, true);
 

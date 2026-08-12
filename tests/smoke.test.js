@@ -94,7 +94,7 @@ test('公司资料可从板块归属识别实际行业', { timeout: 30000 }, asy
   assert.equal(new Set(result.profile.tags).size, result.profile.tags.length);
 });
 
-test('大盘分析返回指数、轮动、资金和涨跌停结构', { timeout: 30000 }, async () => {
+test('大盘分析返回指数、轮动、资金和涨跌停结构', { timeout: 60000 }, async () => {
   const handler = handlers.get('fetch-market-overview');
   assert.equal(typeof handler, 'function');
   const result = await handler(null, true);
@@ -109,12 +109,80 @@ test('大盘分析返回指数、轮动、资金和涨跌停结构', { timeout: 
   assert.match(result.limits.date, /^\d{8}$/);
   assert.match(result.source, /腾讯全市场行情/);
   assert.ok(result.recommendations.length > 0);
-  assert.ok(result.recommendations.every(item => item.breakoutPrice > 0 && item.ma30 > 0 && /MA30/.test(item.reason)));
+  assert.ok(result.recommendations.every(item => item.breakoutPrice > 0 && item.ma30 > 0));
+  assert.ok(result.recommendations.every(item => ['底部待反弹', '已反弹', '待突破'].includes(item.signal)));
+  assert.ok(result.recommendations.every(item => ['消息确认', '消息中性', '消息谨慎'].includes(item.newsLabel)));
+  assert.ok(result.recommendations.every(item => Number.isFinite(item.signalScore) && item.reason.includes(item.signal)));
+  assert.equal(result.recommendations.length, result.recommendationCoverage.qualified);
+  const finalSignalCounts = result.recommendations.reduce((counts, item) => {
+    if (item.signal === '底部待反弹') counts.bottomWaiting += 1;
+    if (item.signal === '已反弹') counts.rebounded += 1;
+    if (item.signal === '待突破') counts.breakout += 1;
+    return counts;
+  }, { bottomWaiting: 0, rebounded: 0, breakout: 0 });
+  assert.deepEqual(result.recommendationCoverage.signals, finalSignalCounts);
+  assert.equal(Object.values(result.recommendationCoverage.signals).reduce((sum, count) => sum + count, 0), result.recommendations.length);
+  assert.ok(result.recommendations.every(item => item.score === item.signalScore && Number.isFinite(item.technicalScore)));
+  assert.ok((result.recommendationCoverage.signals?.breakout || 0) > 0);
+  assert.ok(result.recommendations.slice(0, 10).some(item => item.signal === '待突破'));
+  assert.ok((result.recommendationCoverage.signals?.rebounded || 0) > 0);
   assert.ok(result.recommendationCoverage.scanned > 1000);
   assert.ok(result.recommendationCoverage.analyzed > 24);
   assert.ok(result.newsContext?.summary);
   assert.ok(Array.isArray(result.newsContext?.items));
   assert.ok(result.analysis);
+});
+
+test('惠州平潭机场按地点设施和产业关系生成股票池', { timeout: 60000 }, async () => {
+  const result = await handlers.get('run-industry-workflow')(null, '搜索惠州平潭机场相关股票');
+  assert.equal(result.entities.facility, '机场');
+  assert.deepEqual(result.entities.locationParts, ['惠州', '平潭']);
+  assert.ok(result.stocks.some(stock => stock.code === '000089' && stock.name === '深圳机场'));
+  assert.ok(result.stocks.some(stock => stock.code === '002542' && /机场建设|通航/.test(stock.sector)));
+  assert.ok(result.stocks.some(stock => stock.code === '000592' && /待核验/.test(stock.sector)));
+  assert.ok(!result.stocks.some(stock => stock.code === '002928' || stock.name === '华夏航空'));
+});
+
+test('大连金州机场按本地项目关系生成不同于惠州的股票池', { timeout: 60000 }, async () => {
+  const result = await handlers.get('run-industry-workflow')(null, '搜索大连金州机场相关股票');
+  assert.equal(result.entities.facility, '机场');
+  assert.deepEqual(result.entities.locationParts, ['大连', '金州']);
+  assert.ok(result.stocks.some(stock => stock.code === '605598' && /大连金州湾机场/.test(stock.sector)));
+  assert.ok(result.stocks.some(stock => ['601800', '601668', '601186'].includes(stock.code)));
+  assert.ok(!result.stocks.some(stock => ['000089', '000592'].includes(stock.code)));
+});
+
+test('深圳南宁高铁按线路端点返回高铁通用产业链', { timeout: 60000 }, async () => {
+  const search = await handlers.get('search-a-share-stocks')(null, '深圳南宁高铁');
+  assert.ok(search.results.length >= 6);
+  assert.ok(search.results.some(stock => stock.code === '601766' && /动车组/.test(stock.sector)));
+  assert.ok(search.results.some(stock => ['601390', '601186'].includes(stock.code) && /深圳—南宁高铁/.test(stock.sector)));
+  assert.ok(search.results.every(stock => /不代表已确认参与或中标/.test(stock.relationEvidence)));
+
+  const result = await handlers.get('run-industry-workflow')(null, '搜索深圳南宁高铁相关股票');
+  assert.equal(result.entities.facility, '高铁');
+  assert.deepEqual(result.entities.locationParts, ['深圳', '南宁']);
+  assert.ok(result.stocks.length >= 6);
+  assert.ok(result.stocks.some(stock => stock.code === '601766'));
+  assert.ok(result.stocks.some(stock => stock.code === '000008'));
+});
+
+test('参考股票从2026-08-03附近底部形成已反弹信号', { timeout: 60000 }, async () => {
+  const handler = handlers.get('fetch-stock-history');
+  for (const code of ['002407', '600667', '600111', '002428', '002842']) {
+    const result = await handler(null, { code, force: true });
+    assert.equal(result.analysis.reboundSignal, '已反弹', `${code} 应识别为已反弹`);
+    assert.ok(result.analysis.bottomDate >= '2026-07-20' && result.analysis.bottomDate <= '2026-08-12');
+    assert.ok(result.analysis.bottomDrawdown <= -18);
+    assert.ok(result.analysis.reboundFromBottom >= 6);
+  }
+});
+
+test('低价高估值弱反弹股票不会进入大盘推荐', { timeout: 60000 }, async () => {
+  const result = await handlers.get('fetch-market-overview')(null, true);
+  assert.ok(!result.recommendations.some(stock => stock.code === '600157'));
+  assert.ok(result.recommendations.every(stock => stock.qualityScore >= 65));
+  assert.ok(result.recommendationCoverage.qualityRejected >= 0);
 });
 
 test('通用行业命令能生成手机产业链股票', { timeout: 90000 }, async () => {
