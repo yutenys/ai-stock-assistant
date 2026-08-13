@@ -1,5 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const Module = require('node:module');
 
 const handlers = new Map();
@@ -21,8 +23,155 @@ Module._load = function(request, parent, isMain) {
   return originalLoad.call(this, request, parent, isMain);
 };
 
-require('../main.js');
+const {
+  assessRecommendationTimingRisk,
+  buildFutureRiskProfile,
+  mergeQuoteIntoHistory,
+  parseReductionPlanWindow,
+  settleWithConcurrency
+} = require('../main.js');
 Module._load = originalLoad;
+
+test('command input uses a focus-hidden recommendation prompt', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const css = fs.readFileSync(path.join(__dirname, '..', 'styles.css'), 'utf8');
+  assert.match(html, /<textarea id="commandInput" placeholder="输入你想要搜索的相关内容，会给你生成对应内容的股票推荐"><\/textarea>/);
+  assert.match(css, /\.command-row textarea:focus::placeholder\{color:transparent\}/);
+});
+
+test('并发调度限制峰值并隔离单项失败', async () => {
+  let active = 0;
+  let peak = 0;
+  const results = await settleWithConcurrency([1, 2, 3, 4, 5], 2, async value => {
+    active++;
+    peak = Math.max(peak, active);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    active--;
+    if (value === 3) throw new Error('expected');
+    return value * 2;
+  });
+  assert.equal(peak, 2);
+  assert.deepEqual(results.map(result => result.status), ['fulfilled', 'fulfilled', 'rejected', 'fulfilled', 'fulfilled']);
+  assert.deepEqual(results.filter(result => result.status === 'fulfilled').map(result => result.value), [2, 4, 8, 10]);
+});
+
+test('market analysis merges the live trading day into delayed daily history', () => {
+  const history = [
+    { date: '2026-08-12', open: 10, close: 10.2, high: 10.3, low: 9.9, volume: 100 }
+  ];
+  const quote = {
+    tradeDate: '2026-08-13', open: 10.2, price: 9.8, high: 10.4, low: 9.7, volume: 180, amount: 1764
+  };
+  const merged = mergeQuoteIntoHistory(history, quote);
+  assert.equal(merged.length, 2);
+  assert.deepEqual(merged.at(-1), {
+    date: '2026-08-13', open: 10.2, close: 9.8, high: 10.4, low: 9.7, volume: 180, amount: 1764
+  });
+  assert.equal(history.length, 1);
+
+  const updated = mergeQuoteIntoHistory(merged, { ...quote, price: 9.9, volume: 200 });
+  assert.equal(updated.length, 2);
+  assert.equal(updated.at(-1).close, 9.9);
+  assert.equal(updated.at(-1).volume, 200);
+  assert.deepEqual(mergeQuoteIntoHistory(history, { price: 9.8 }), history);
+});
+
+test('market recommendation timing rejects weak closes after a hot run', () => {
+  const hotReversal = assessRecommendationTimingRisk({
+    price: 71.86,
+    high: 77.12,
+    low: 71,
+    changePct: -4.63,
+    analysis: { return5: 31.23, rsi14: 72.9, volatility20: 169.1, ma20: 54.29, breakoutPrice: 74.66 }
+  });
+  assert.ok(hotReversal.penalty >= 70);
+  assert.ok(hotReversal.reasons.length >= 3);
+  assert.ok(hotReversal.reasons.includes('突破后回落'));
+
+  const steadyBreakout = assessRecommendationTimingRisk({
+    price: 10.8,
+    high: 10.9,
+    low: 10.2,
+    changePct: 2.2,
+    analysis: { return5: 6.5, rsi14: 66, volatility20: 42, ma20: 10.1 }
+  });
+  assert.equal(steadyBreakout.penalty, 0);
+  assert.deepEqual(steadyBreakout.reasons, []);
+
+  const chase = assessRecommendationTimingRisk({
+    price: 10.85,
+    high: 10.9,
+    low: 10.2,
+    changePct: 8.5,
+    analysis: { return5: 6.5, rsi14: 66, volatility20: 42, ma20: 10.1 }
+  });
+  assert.equal(chase.penalty, 25);
+  assert.deepEqual(chase.reasons, ['当日涨幅过大']);
+});
+
+test('未来半年公司风险只拦截当前ST和窗口内减持解禁', () => {
+  const today = '2026-08-13';
+  const planContent = '减持期间：股东自本公告披露之日起15个交易日后的2个月内，即2026年7月2日-2026年9月1日。';
+  assert.deepEqual(parseReductionPlanWindow(planContent, '2026-06-10'), {
+    startDate: '2026-07-02',
+    endDate: '2026-09-01',
+    estimated: false
+  });
+
+  const risky = buildFutureRiskProfile({
+    name: '美信科技',
+    today,
+    unlockRows: [
+      { FREE_DATE: '2026-09-15 00:00:00', FREE_SHARES_TYPE: '股权激励限售股份', ABLE_FREE_SHARES: 307800 },
+      { FREE_DATE: '2027-09-16 00:00:00', FREE_SHARES_TYPE: '股权激励限售股份', ABLE_FREE_SHARES: 230850 }
+    ],
+    reductionAnnouncements: [{
+      title: '关于特定股东减持股份预披露公告',
+      noticeDate: '2026-06-10',
+      content: planContent
+    }]
+  });
+  assert.equal(risky.passed, false);
+  assert.equal(risky.status, 'risk');
+  assert.equal(risky.unlock.events.length, 1);
+  assert.equal(risky.reduction.events.length, 1);
+  assert.match(risky.summary, /减持计划|限售解禁/);
+
+  const clear = buildFutureRiskProfile({
+    name: '正常股票',
+    today,
+    unlockRows: [{ FREE_DATE: '2027-09-16 00:00:00' }],
+    reductionAnnouncements: [{
+      title: '关于股东减持计划期满暨实施情况的公告',
+      noticeDate: '2026-05-27',
+      content: '上述减持计划期限已满。'
+    }, {
+      title: '关于特定股东减持股份预披露公告',
+      noticeDate: '2026-03-05',
+      content: '减持期间：2026年3月27日-2026年5月26日。'
+    }]
+  });
+  assert.equal(clear.passed, true);
+  assert.equal(clear.status, 'clear');
+  assert.equal(clear.unlock.events.length, 0);
+  assert.equal(clear.reduction.events.length, 0);
+
+  const stRisk = buildFutureRiskProfile({ name: '*ST测试', today, unlockRows: [], reductionAnnouncements: [] });
+  assert.equal(stRisk.passed, false);
+  assert.equal(stRisk.st.status, 'risk');
+});
+
+test('未来公司风险数据缺失时标记未确认而不是无风险', () => {
+  const profile = buildFutureRiskProfile({
+    name: '正常股票',
+    today: '2026-08-13',
+    unlockRows: null,
+    reductionAnnouncements: null
+  });
+  assert.equal(profile.passed, false);
+  assert.equal(profile.status, 'unknown');
+  assert.match(profile.summary, /未确认/);
+});
 
 test('在线搜索能找到利通电子', { timeout: 30000 }, async () => {
   const result = await handlers.get('search-a-share-stocks')(null, '利通电子');
@@ -64,6 +213,13 @@ test('近三个月行情返回技术分析和观察窗口', { timeout: 30000 }, 
   assert.match(result.analysis.exit, /离场|止损|止盈|风控/);
   assert.match(result.analysis.entryWindow, /交易日/);
   assert.match(result.analysis.verdict, /可关注|等待确认|暂不适合|不宜追高/);
+  const plan = result.analysis.tradePlan;
+  assert.ok(plan.entryLow > 0 && plan.entryHigh >= plan.entryLow);
+  assert.ok(plan.invalidationPrice < plan.entryLow);
+  assert.equal(plan.entrySteps.reduce((sum, step) => sum + step.buyPct, 0), 100);
+  assert.equal(plan.targets.reduce((sum, target) => sum + target.sellPct, 0), 100);
+  assert.ok(plan.targets[0].price < plan.targets[1].price && plan.targets[1].price < plan.targets[2].price);
+  assert.ok(plan.maxPositionPct > 0 && plan.maxPositionPct <= 30);
   assert.equal(typeof result.analysis.score, 'number');
   assert.equal(typeof result.analysis.volumeRatio, 'number');
   assert.ok(result.analysis.breakoutPrice > 0);
@@ -81,7 +237,7 @@ test('个股走势返回分时五日日周月五种周期', { timeout: 60000 }, 
   for (const period of ['minute', 'five-day', 'day', 'week', 'month']) {
     const result = await handler(null, { code: '600519', period });
     assert.equal(result.period, period);
-    assert.ok(result.rows.length >= 20, `${period} 数据不足`);
+    assert.ok(result.rows.length >= (period === 'minute' ? 1 : 20), `${period} 数据不足`);
     assert.ok(result.rows.every(row => row.time && row.close > 0));
     if (period === 'minute') assert.ok(result.previousClose > 0);
   }

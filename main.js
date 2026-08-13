@@ -11,6 +11,7 @@ const stockNewsCache = new Map();
 const stockHistoryCache = new Map();
 const stockChartCache = new Map();
 const stockFundFlowCache = new Map();
+const stockRiskCache = new Map();
 const marketNewsCache = new Map();
 const marketHistoryCache = new Map();
 let marketOverviewCache = null;
@@ -76,6 +77,10 @@ const industryFallbacks = {
     { code: '002714', name: '牧原股份', sector: '上游 / 生猪养殖' },
     { code: '300498', name: '温氏股份', sector: '上游 / 生猪养殖' },
     { code: '002124', name: '天邦食品', sector: '上游 / 生猪养殖' },
+    { code: '605296', name: '神农集团', sector: '上游 / 生猪养殖' },
+    { code: '603477', name: '巨星农牧', sector: '上游 / 生猪养殖' },
+    { code: '600975', name: '新五丰', sector: '上游 / 生猪养殖' },
+    { code: '000048', name: '京基智农', sector: '中游 / 饲料与养殖' },
     { code: '000876', name: '新希望', sector: '中游 / 饲料与养殖' },
     { code: '002311', name: '海大集团', sector: '中游 / 饲料' },
     { code: '002567', name: '唐人神', sector: '下游 / 肉制品与养殖' }
@@ -229,7 +234,12 @@ const industryFallbacks = {
     { code: '000725', name: '京东方A', sector: '面板' },
     { code: '002241', name: '歌尔股份', sector: '声学与XR' },
     { code: '300433', name: '蓝思科技', sector: '玻璃盖板' },
-    { code: '603501', name: '韦尔股份', sector: 'CIS芯片' }
+    { code: '603501', name: '韦尔股份', sector: 'CIS芯片' },
+    { code: '300782', name: '卓胜微', sector: '射频前端' },
+    { code: '002600', name: '领益智造', sector: '精密功能件' },
+    { code: '002938', name: '鹏鼎控股', sector: '消费电子PCB' },
+    { code: '300136', name: '信维通信', sector: '天线与射频' },
+    { code: '688036', name: '传音控股', sector: '智能手机终端' }
   ]
 };
 
@@ -327,6 +337,23 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+async function settleWithConcurrency(items, limit, task) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor++;
+      try {
+        results[index] = { status: 'fulfilled', value: await task(items[index], index) };
+      } catch (reason) {
+        results[index] = { status: 'rejected', reason };
+      }
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 async function getJsonWithRetry(url, retries = 2) {
   let lastError;
   for (let i = 0; i <= retries; i++) {
@@ -338,6 +365,190 @@ async function getJsonWithRetry(url, retries = 2) {
     }
   }
   throw lastError;
+}
+
+function dateOnly(value) {
+  const match = String(value || '').match(/(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})/);
+  if (!match) return '';
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) return '';
+  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+function currentChinaDate() {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit'
+  }).formatToParts(new Date()).map(part => [part.type, part.value]));
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+function shiftDate(isoDate, { days = 0, months = 0 } = {}) {
+  const normalized = dateOnly(isoDate);
+  if (!normalized) return '';
+  const [year, month, day] = normalized.split('-').map(Number);
+  if (months) {
+    const targetMonth = month - 1 + months;
+    const targetYear = year + Math.floor(targetMonth / 12);
+    const normalizedMonth = ((targetMonth % 12) + 12) % 12;
+    const lastDay = new Date(Date.UTC(targetYear, normalizedMonth + 1, 0)).getUTCDate();
+    const date = new Date(Date.UTC(targetYear, normalizedMonth, Math.min(day, lastDay)));
+    date.setUTCDate(date.getUTCDate() + days);
+    return date.toISOString().slice(0, 10);
+  }
+  const date = new Date(`${normalized}T00:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+function parseReductionPlanWindow(content, noticeDate) {
+  const text = String(content || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
+  const markerIndex = Math.max(text.indexOf('减持期间'), text.indexOf('减持期限'));
+  const scope = markerIndex >= 0 ? text.slice(markerIndex, markerIndex + 500) : text;
+  const range = scope.match(/(\d{4})\s*[年\/-]\s*(\d{1,2})\s*[月\/-]\s*(\d{1,2})\s*日?\s*(?:至|—|–|-|~|～)\s*(?:(\d{4})\s*[年\/-]\s*)?(\d{1,2})\s*[月\/-]\s*(\d{1,2})\s*日?/);
+  if (range) {
+    const startDate = dateOnly(`${range[1]}-${range[2]}-${range[3]}`);
+    let endYear = Number(range[4] || range[1]);
+    let endDate = dateOnly(`${endYear}-${range[5]}-${range[6]}`);
+    if (startDate && endDate && endDate < startDate && !range[4]) {
+      endYear += 1;
+      endDate = dateOnly(`${endYear}-${range[5]}-${range[6]}`);
+    }
+    if (startDate && endDate) return { startDate, endDate, estimated: false };
+  }
+  const normalizedNoticeDate = dateOnly(noticeDate);
+  const duration = scope.match(/(\d+)\s*个?月内/);
+  if (!normalizedNoticeDate || !duration) return null;
+  const tradingDays = Number((scope.match(/(\d+)\s*个交易日后/) || [])[1]) || 0;
+  const startDate = shiftDate(normalizedNoticeDate, { days: Math.ceil(tradingDays * 7 / 5) });
+  return { startDate, endDate: shiftDate(startDate, { months: Number(duration[1]) }), estimated: true };
+}
+
+function isReductionPlanAnnouncement(title) {
+  const text = String(title || '');
+  return /减持/.test(text) && /(预披露|计划|进展)/.test(text) && !/(期满|届满|完成|完毕|终止|结束|实施结果)/.test(text);
+}
+
+function buildFutureRiskProfile({ name, today = currentChinaDate(), unlockRows, reductionAnnouncements }) {
+  const windowStart = dateOnly(today);
+  const windowEnd = shiftDate(windowStart, { months: 6 });
+  const stRisk = /ST|退/i.test(String(name || ''));
+  const st = { status: stRisk ? 'risk' : 'clear', reason: stRisk ? '当前股票名称含ST或退市标记' : '当前无ST或退市标记' };
+
+  const unlockEvents = Array.isArray(unlockRows) ? unlockRows.map(row => ({
+    date: dateOnly(row.FREE_DATE || row.date),
+    type: row.FREE_SHARES_TYPE || row.type || '限售股份',
+    shares: Number(row.ABLE_FREE_SHARES ?? row.FREE_SHARES ?? row.shares) || 0
+  })).filter(event => event.date >= windowStart && event.date <= windowEnd) : [];
+  const unlock = {
+    status: unlockRows == null ? 'unknown' : unlockEvents.length ? 'risk' : 'clear',
+    events: unlockEvents
+  };
+
+  let unparsedPlans = 0;
+  const reductionEvents = Array.isArray(reductionAnnouncements) ? reductionAnnouncements.filter(row => isReductionPlanAnnouncement(row.title)).map(row => {
+    const window = parseReductionPlanWindow(row.content, row.noticeDate);
+    if (!window) {
+      unparsedPlans++;
+      return null;
+    }
+    return { title: row.title, noticeDate: dateOnly(row.noticeDate), ...window };
+  }).filter(event => event && event.endDate >= windowStart && event.startDate <= windowEnd) : [];
+  const reduction = {
+    status: reductionAnnouncements == null || unparsedPlans ? (reductionEvents.length ? 'risk' : 'unknown') : reductionEvents.length ? 'risk' : 'clear',
+    events: reductionEvents,
+    unparsedPlans
+  };
+
+  const statuses = [st.status, unlock.status, reduction.status];
+  const status = statuses.includes('risk') ? 'risk' : statuses.includes('unknown') ? 'unknown' : 'clear';
+  const risks = [];
+  if (st.status === 'risk') risks.push(st.reason);
+  if (reductionEvents.length) risks.push(`未来半年存在${reductionEvents.length}项减持计划`);
+  if (unlockEvents.length) risks.push(`未来半年存在${unlockEvents.length}次限售解禁`);
+  const unknowns = [];
+  if (reduction.status === 'unknown') unknowns.push('减持计划');
+  if (unlock.status === 'unknown') unknowns.push('限售解禁');
+  const summary = status === 'risk' ? risks.join('；')
+    : status === 'unknown' ? `${unknowns.join('、')}数据未确认`
+      : '当前无ST标记，未来半年未发现减持计划或限售解禁';
+  return { status, passed: status === 'clear', windowStart, windowEnd, st, reduction, unlock, summary };
+}
+
+async function fetchAnnouncementContent(artCode) {
+  const buildUrl = page => `https://np-cnotice-stock.eastmoney.com/api/content/ann?art_code=${encodeURIComponent(artCode)}&client_source=web&page_index=${page}`;
+  const first = await getJsonWithRetry(buildUrl(1), 1);
+  const pageCount = Math.min(10, Math.max(1, Number(first?.data?.page_size) || 1));
+  const contents = [first?.data?.notice_content || ''];
+  if (pageCount > 1) {
+    const pages = await settleWithConcurrency(Array.from({ length: pageCount - 1 }, (_value, index) => index + 2), 2,
+      page => getJsonWithRetry(buildUrl(page), 0));
+    pages.forEach(result => {
+      if (result.status === 'fulfilled') contents.push(result.value?.data?.notice_content || '');
+    });
+  }
+  return contents.join(' ');
+}
+
+async function fetchReductionPlans(code, today) {
+  const beginTime = shiftDate(today, { months: -12 });
+  const params = new URLSearchParams({
+    sr: '-1', page_size: '100', page_index: '1', ann_type: 'A', client_source: 'web',
+    stock_list: code, f_node: '7', s_node: '0', begin_time: beginTime, end_time: today
+  });
+  const json = await getJsonWithRetry(`https://np-anotice-stock.eastmoney.com/api/security/ann?${params}`, 1);
+  const candidates = (json?.data?.list || []).filter(row => isReductionPlanAnnouncement(row.title));
+  const details = await settleWithConcurrency(candidates, 2, row => fetchAnnouncementContent(row.art_code));
+  return candidates.map((row, index) => ({
+    title: row.title,
+    noticeDate: row.notice_date,
+    content: details[index]?.status === 'fulfilled' ? details[index].value : ''
+  }));
+}
+
+async function fetchUnlocks(code, today) {
+  const windowEnd = shiftDate(today, { months: 6 });
+  const params = new URLSearchParams({
+    reportName: 'RPT_LIFT_STAGE', columns: 'ALL', pageNumber: '1', pageSize: '100',
+    sortColumns: 'FREE_DATE', sortTypes: '1',
+    filter: `(SECURITY_CODE="${code}")(FREE_DATE>='${today}')(FREE_DATE<='${windowEnd}')`
+  });
+  const json = await getJsonWithRetry(`https://datacenter-web.eastmoney.com/api/data/v1/get?${params}`, 1);
+  return json?.result?.data || [];
+}
+
+async function fetchFutureRiskProfile({ code, name, force = false }) {
+  const cacheKey = String(code || '');
+  const cached = force ? null : readTimedCache(stockRiskCache, cacheKey, 6 * 60 * 60 * 1000);
+  if (cached) return { ...cached, cached: true };
+  const today = currentChinaDate();
+  if (/ST|退/i.test(String(name || ''))) {
+    return writeTimedCache(stockRiskCache, cacheKey, {
+      ...buildFutureRiskProfile({ name, today, unlockRows: [], reductionAnnouncements: [] }),
+      errors: [],
+      source: '当前证券名称'
+    });
+  }
+  const [unlockResult, reductionResult] = await Promise.allSettled([
+    fetchUnlocks(cacheKey, today),
+    fetchReductionPlans(cacheKey, today)
+  ]);
+  const errors = [];
+  if (unlockResult.status === 'rejected') errors.push(`限售解禁查询失败：${unlockResult.reason?.message || unlockResult.reason}`);
+  if (reductionResult.status === 'rejected') errors.push(`减持计划查询失败：${reductionResult.reason?.message || reductionResult.reason}`);
+  const profile = buildFutureRiskProfile({
+    name,
+    today,
+    unlockRows: unlockResult.status === 'fulfilled' ? unlockResult.value : null,
+    reductionAnnouncements: reductionResult.status === 'fulfilled' ? reductionResult.value : null
+  });
+  return writeTimedCache(stockRiskCache, cacheKey, {
+    ...profile,
+    errors,
+    source: '东方财富公司公告 + 东方财富限售解禁'
+  });
 }
 
 async function fetchEastmoneyPages(buildUrl, maxPages = 60) {
@@ -658,7 +869,8 @@ function parseTencentMarketQuote(body) {
     pbRatio: finiteNumber(cols[46]),
     snapshotVolumeRatio: finiteNumber(cols[49]),
     upperLimit: finiteNumber(cols[47]),
-    lowerLimit: finiteNumber(cols[48])
+    lowerLimit: finiteNumber(cols[48]),
+    tradeDate: /^\d{8}/.test(String(cols[30] || '')) ? `${cols[30].slice(0, 4)}-${cols[30].slice(4, 6)}-${cols[30].slice(6, 8)}` : ''
   };
 }
 
@@ -686,13 +898,11 @@ async function fetchTencentMarketSnapshot() {
   for (let index = 0; index < symbols.length; index += 800) batches.push(symbols.slice(index, index + 800));
   const quotes = [];
   const errors = [];
-  for (let index = 0; index < batches.length; index += 4) {
-    const group = await Promise.allSettled(batches.slice(index, index + 4).map(fetchTencentMarketBatch));
-    group.forEach((result, offset) => {
+  const batchResults = await settleWithConcurrency(batches, 4, fetchTencentMarketBatch);
+  batchResults.forEach((result, index) => {
       if (result.status === 'fulfilled') quotes.push(...result.value);
-      else errors.push(`batch ${index + offset + 1}: ${result.reason?.message || result.reason}`);
-    });
-  }
+      else errors.push(`batch ${index + 1}: ${result.reason?.message || result.reason}`);
+  });
   if (quotes.length < 1000) throw new Error(`腾讯全市场行情仅返回 ${quotes.length} 只股票${errors.length ? `；${errors.join('；')}` : ''}`);
   if (Date.now() - marketDirectorySavedAt > 6 * 60 * 60 * 1000) {
     writeDiskCache('tencent-stock-directory', quotes.map(({ code, name }) => ({ code, name, securityType: 'A股' })));
@@ -780,9 +990,63 @@ async function fetchBingNews(keyword, cacheKey = keyword, maxAgeMs = 10 * 60 * 1
   return writeTimedCache(marketNewsCache, cacheKey, parseRssItems(rss));
 }
 
+function assessRecommendationTimingRisk(item) {
+  const reasons = [];
+  let penalty = 0;
+  const dayPosition = item.high > item.low ? (item.price - item.low) / (item.high - item.low) : .5;
+  if (dayPosition < .2 && item.changePct <= 0) {
+    penalty += 35;
+    reasons.push('收盘接近日内低点');
+  } else if (dayPosition < .35) {
+    penalty += 15;
+    reasons.push('日内冲高回落');
+  }
+  if (item.analysis.breakoutPrice > 0 && item.high >= item.analysis.breakoutPrice
+    && item.price < item.analysis.breakoutPrice && dayPosition < .4) {
+    penalty += 25;
+    reasons.push('突破后回落');
+  }
+  if (item.changePct >= 8) {
+    penalty += 25;
+    reasons.push('当日涨幅过大');
+  } else if (item.changePct >= 6) {
+    penalty += 12;
+    reasons.push('当日涨幅偏大');
+  }
+  if (item.analysis.return5 > 20) {
+    penalty += 25;
+    reasons.push('近5日涨幅过大');
+  } else if (item.analysis.return5 > 12) {
+    penalty += 10;
+    reasons.push('近5日涨幅偏快');
+  }
+  if (item.analysis.volatility20 > 120) {
+    penalty += 20;
+    reasons.push('20日波动率极高');
+  } else if (item.analysis.volatility20 > 90) {
+    penalty += 10;
+    reasons.push('20日波动率偏高');
+  }
+  if (item.analysis.rsi14 >= 78) {
+    penalty += 20;
+    reasons.push('RSI接近超买区');
+  } else if (item.analysis.rsi14 >= 74) {
+    penalty += 8;
+    reasons.push('RSI偏热');
+  }
+  if (item.analysis.ma20 > 0 && item.price > item.analysis.ma20 * 1.2) {
+    penalty += 15;
+    reasons.push('现价偏离MA20过大');
+  }
+  return { penalty, reasons };
+}
+
 function assessReboundQuality(item) {
   const reasons = [];
   let score = 100;
+  const timingRisk = assessRecommendationTimingRisk(item);
+  score -= timingRisk.penalty;
+  reasons.push(...timingRisk.reasons);
   const pe = Number(item.peRatio);
   const pb = Number(item.pbRatio);
   if (item.price < 3) { score -= 60; reasons.push('股价低于3元'); }
@@ -806,6 +1070,9 @@ function assessReboundQuality(item) {
 function assessBreakoutQuality(item) {
   const reasons = [];
   let score = 100;
+  const timingRisk = assessRecommendationTimingRisk(item);
+  score -= timingRisk.penalty;
+  reasons.push(...timingRisk.reasons);
   const pe = Number(item.peRatio);
   const pb = Number(item.pbRatio);
   if (item.price < 3) { score -= 60; reasons.push('股价低于3元'); }
@@ -896,12 +1163,11 @@ async function buildMarketRecommendations(marketQuotes, force = false) {
     candidateCodes.add(item.code);
     const group = item.industry || `未分类-${item.code}`;
     candidates.push({ ...item, recommendationGroup: group });
-    if (candidates.length >= 90) break;
+    if (candidates.length >= 60) break;
   }
   const analyzed = [];
   const historyErrors = [];
-  for (let index = 0; index < candidates.length; index += 6) {
-    const group = await Promise.allSettled(candidates.slice(index, index + 6).map(async quote => {
+  const historyResults = await settleWithConcurrency(candidates, 6, async quote => {
       let history = readTimedCache(marketHistoryCache, quote.code, 10 * 60 * 1000);
       if (!history) {
         try {
@@ -911,16 +1177,20 @@ async function buildMarketRecommendations(marketQuotes, force = false) {
         }
         if (history.length >= 60) writeTimedCache(marketHistoryCache, quote.code, history);
       }
+      history = mergeQuoteIntoHistory(history, quote);
       if (history.length < 60) return null;
-      const analysis = analyzeHistory(history);
+      const analysis = {
+        ...analyzeHistory(history),
+        latestTradeDate: history.at(-1)?.date || '',
+        latestPrice: history.at(-1)?.close || null
+      };
       const item = { ...quote, analysis };
       return { ...item, reboundQuality: assessReboundQuality(item), breakoutQuality: assessBreakoutQuality(item) };
-    }));
-    group.forEach(result => {
-      if (result.status === 'fulfilled' && result.value) analyzed.push(result.value);
-      else if (result.status === 'rejected') historyErrors.push(result.reason?.message || String(result.reason));
-    });
-  }
+  });
+  historyResults.forEach(result => {
+    if (result.status === 'fulfilled' && result.value) analyzed.push(result.value);
+    else if (result.status === 'rejected') historyErrors.push(result.reason?.message || String(result.reason));
+  });
   const breakoutQualifying = analyzed
     .filter(item => item.analysis.distanceToBreakout >= -2.5 && item.analysis.distanceToBreakout <= 5 && item.analysis.rsi14 < 80
       && item.price >= item.analysis.ma30 * .98)
@@ -939,10 +1209,10 @@ async function buildMarketRecommendations(marketQuotes, force = false) {
   appendSignal(breakoutQualifying, '待突破');
   appendSignal(rebounded, '已反弹');
   appendSignal(bottomWaiting, '底部待反弹');
-  const recommendations = await Promise.all(ranked.map(async item => {
+  const recommendationResults = await settleWithConcurrency(ranked, 4, async item => {
     let newsContext = summarizeNews([]);
     try {
-      const newsResult = await fetchStockNews({ code: item.code, name: item.name, force });
+      const newsResult = await fetchStockNews({ code: item.code, name: item.name, force: false });
       const windowStart = item.signal === '待突破'
         ? new Date(Date.now() - 21 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
         : item.analysis.bottomDate;
@@ -957,7 +1227,9 @@ async function buildMarketRecommendations(marketQuotes, force = false) {
       : item.analysis.reboundReason;
     const newsLabel = newsContext.signal === '偏积极' ? '消息确认' : newsContext.signal === '偏谨慎' ? '消息谨慎' : '消息中性';
     const reason = `${item.signal}；${technicalReason}；${newsContext.signal === '偏积极' ? '阶段低点以来存在正向消息催化' : newsContext.signal === '偏谨慎' ? '阶段低点以来存在风险消息，信号降级等待确认' : '阶段低点以来消息面中性'}。`;
-    const signalScore = Math.max(0, Math.min(100, (item.signal === '待突破' ? item.analysis.score : item.analysis.reboundScore) + newsContext.scoreAdjustment));
+    const rawSignalScore = Math.max(0, Math.min(100, (item.signal === '待突破' ? item.analysis.score : item.analysis.reboundScore) + newsContext.scoreAdjustment));
+    const qualityScore = item.quality?.score ?? 100;
+    const signalScore = Math.round(Math.min(rawSignalScore, rawSignalScore * .7 + qualityScore * .3));
     return {
       ...item,
       verdict,
@@ -965,7 +1237,7 @@ async function buildMarketRecommendations(marketQuotes, force = false) {
       technicalScore: item.analysis.score,
       score: signalScore,
       signalScore,
-      qualityScore: item.quality?.score ?? 100,
+      qualityScore,
       qualityRisks: item.quality?.reasons || [],
       newsLabel,
       breakoutPrice: item.analysis.breakoutPrice,
@@ -976,10 +1248,36 @@ async function buildMarketRecommendations(marketQuotes, force = false) {
       reason,
       newsContext
     };
-  }));
+  });
+  const recommendations = recommendationResults.filter(result => result.status === 'fulfilled').map(result => result.value);
   const qualityRecommendations = recommendations.filter(item => item.qualityScore >= 65 && !(item.newsLabel === '消息谨慎' && item.signalScore < 65));
+  const riskResults = await settleWithConcurrency(qualityRecommendations, 4, item => fetchFutureRiskProfile({
+    code: item.code,
+    name: item.name,
+    force: false
+  }));
+  let riskRejected = 0;
+  let riskUnknown = 0;
+  const riskApprovedRecommendations = [];
+  riskResults.forEach((result, index) => {
+    if (result.status === 'rejected') {
+      riskUnknown++;
+      return;
+    }
+    const riskProfile = result.value;
+    if (!riskProfile.passed) {
+      if (riskProfile.status === 'risk') riskRejected++;
+      else riskUnknown++;
+      return;
+    }
+    riskApprovedRecommendations.push({
+      ...qualityRecommendations[index],
+      riskProfile,
+      reason: `${qualityRecommendations[index].reason} ${riskProfile.summary}。`
+    });
+  });
   const recommendationGroups = Object.fromEntries(['待突破', '已反弹', '底部待反弹'].map(signal => [
-    signal, qualityRecommendations.filter(item => item.signal === signal).sort((a, b) => b.signalScore - a.signalScore)
+    signal, riskApprovedRecommendations.filter(item => item.signal === signal).sort((a, b) => b.signalScore - a.signalScore)
   ]));
   const balancedRecommendations = [];
   while (Object.values(recommendationGroups).some(group => group.length)) {
@@ -1010,6 +1308,9 @@ async function buildMarketRecommendations(marketQuotes, force = false) {
         breakout: breakoutQualifying.length
       },
       qualityRejected: analyzed.filter(item => item.analysis.reboundSignal && !item.reboundQuality.passed).length,
+      riskChecked: qualityRecommendations.length,
+      riskRejected,
+      riskUnknown,
       qualified: balancedRecommendations.length
     }
   };
@@ -1619,7 +1920,7 @@ function scoreSubjectText(subject, text, terms = []) {
   if (s.length >= 3 && hits >= Math.min(3, s.length)) score += hits * 8;
   terms.forEach(term => {
     const cleanTerm = compactSubjectText(term);
-    if (cleanTerm && t.includes(cleanTerm)) score += 12;
+    if (cleanTerm && t.includes(cleanTerm)) score += 24;
   });
   return score;
 }
@@ -1915,9 +2216,9 @@ async function fetchStockBoards(code) {
   return [...new Set(rows.map(row => cleanStockName(row.f14)).filter(Boolean))];
 }
 
-async function fetchCompanyProfile({ code, name, sector }) {
+async function fetchCompanyProfile({ code, name, sector, force = false }) {
   const cacheKey = String(code || '');
-  const cached = readTimedCache(companyProfileCache, cacheKey, 30 * 60 * 1000);
+  const cached = force ? null : readTimedCache(companyProfileCache, cacheKey, 30 * 60 * 1000);
   if (cached) return { ...cached, cached: true };
   const errors = [];
   const profile = {
@@ -1930,15 +2231,23 @@ async function fetchCompanyProfile({ code, name, sector }) {
     source: '',
     tags: []
   };
+  const requests = await settleWithConcurrency([
+    () => fetchStockBoards(code),
+    () => getJsonWithRetry(`https://emweb.securities.eastmoney.com/PC_HSF10/CompanySurvey/PageAjax?code=${encodeURIComponent(emF10Code(code))}`, 1),
+    () => getJsonWithRetry(`https://emweb.securities.eastmoney.com/PC_HSF10/OperationsRequired/PageAjax?code=${encodeURIComponent(emF10Code(code))}`, 1),
+    () => getJsonWithRetry(`https://emweb.securities.eastmoney.com/PC_HSF10/BusinessAnalysis/PageAjax?code=${encodeURIComponent(emF10Code(code))}`, 1)
+  ], 2, request => request());
   try {
-    profile.tags = await fetchStockBoards(code);
+    if (requests[0].status === 'rejected') throw requests[0].reason;
+    profile.tags = requests[0].value;
     profile.industry ||= profile.tags[0] || '';
     if (profile.tags.length) profile.source = '东方财富板块归属';
   } catch (err) {
     errors.push(`板块归属失败：${err.message || err}`);
   }
   try {
-    const survey = await getJsonWithRetry(`https://emweb.securities.eastmoney.com/PC_HSF10/CompanySurvey/PageAjax?code=${encodeURIComponent(emF10Code(code))}`, 1);
+    if (requests[1].status === 'rejected') throw requests[1].reason;
+    const survey = requests[1].value;
     const data = survey?.jbzl || survey?.data?.jbzl || survey?.CompanySurvey || {};
     profile.industry = cleanStockName(data.SSHY || data.INDUSTRY || data.HY || data.BK || profile.industry);
     profile.business = plainText(data.JYFW || data.MAINBUSIN || data.ZYFW || '');
@@ -1948,7 +2257,8 @@ async function fetchCompanyProfile({ code, name, sector }) {
     errors.push(`公司概况失败：${err.message || err}`);
   }
   try {
-    const required = await getJsonWithRetry(`https://emweb.securities.eastmoney.com/PC_HSF10/OperationsRequired/PageAjax?code=${encodeURIComponent(emF10Code(code))}`, 1);
+    if (requests[2].status === 'rejected') throw requests[2].reason;
+    const required = requests[2].value;
     profile.industry ||= findPointText(required, ['所属板块']) || findTextByKeys(required, ['SSBK', 'INDUSTRY', 'BK']);
     profile.business ||= findPointText(required, ['经营范围']) || findTextByKeys(required, ['JYFW', 'BUSINESS_SCOPE']);
     profile.summary ||= findPointText(required, ['主营业务']) || findPointText(required, ['核心题材']) || findTextByKeys(required, ['GSJJ', 'MAIN_BUSINESS', 'INTRODUCTION']);
@@ -1957,7 +2267,8 @@ async function fetchCompanyProfile({ code, name, sector }) {
     errors.push(`操盘必读失败：${err.message || err}`);
   }
   try {
-    const business = await getJsonWithRetry(`https://emweb.securities.eastmoney.com/PC_HSF10/BusinessAnalysis/PageAjax?code=${encodeURIComponent(emF10Code(code))}`, 1);
+    if (requests[3].status === 'rejected') throw requests[3].reason;
+    const business = requests[3].value;
     const rows = business?.zygcfx || business?.data?.zygcfx || business?.zygcfxList || [];
     const productRows = Array.isArray(rows) ? rows : [];
     profile.products = productRows.slice(0, 8).map(row => {
@@ -1980,6 +2291,24 @@ function normalizeHistoryRows(rows) {
     date: row.day || row.date, open: finiteNumber(row.open), close: finiteNumber(row.close),
     high: finiteNumber(row.high), low: finiteNumber(row.low), volume: finiteNumber(row.volume)
   }).filter(row => row.date && row.close != null && row.high != null && row.low != null);
+}
+
+function mergeQuoteIntoHistory(history, quote) {
+  const merged = [...(history || [])];
+  if (!quote?.tradeDate || !(quote.price > 0)) return merged;
+  const liveRow = {
+    date: quote.tradeDate,
+    open: quote.open || quote.price,
+    close: quote.price,
+    high: quote.high || quote.price,
+    low: quote.low || quote.price,
+    volume: quote.volume || 0,
+    amount: quote.amount || 0
+  };
+  const existingIndex = merged.findIndex(row => row.date === quote.tradeDate);
+  if (existingIndex >= 0) merged[existingIndex] = { ...merged[existingIndex], ...liveRow };
+  else merged.push(liveRow);
+  return merged.sort((a, b) => String(a.date).localeCompare(String(b.date)));
 }
 
 async function fetchTencentHistory(code, count = 120) {
@@ -2024,6 +2353,48 @@ function percentageReturn(rows, days) {
   const start = rows.at(-(days + 1));
   const latest = rows.at(-1);
   return start?.close ? (latest.close / start.close - 1) * 100 : null;
+}
+
+function buildTradePlan({ latestPrice, supportPrice, resistance, rangeHigh, ma5, ma10, ma20, ma30, atr14, volumeRatio, verdict }) {
+  const atr = Math.max(Number(atr14) || 0, latestPrice * 0.015);
+  const entryAnchor = Math.min(latestPrice, supportPrice);
+  const entryLow = Math.max(0.01, entryAnchor - atr * 0.35);
+  const entryHigh = Math.max(entryLow, Math.min(latestPrice, entryAnchor + atr * 0.2));
+  const entryMid = (entryLow + entryHigh) / 2;
+  const invalidationPrice = Math.max(0.01, entryAnchor - Math.max(atr * 0.8, entryAnchor * 0.025));
+  const riskPerShare = Math.max(entryMid - invalidationPrice, atr * 0.5);
+  const target1 = Math.max(resistance, latestPrice + atr, entryMid + riskPerShare);
+  const target2 = Math.max(target1 + atr * 0.8, Math.min(rangeHigh, entryMid + riskPerShare * 2));
+  const target3 = Math.max(target2 + atr, entryMid + riskPerShare * 3);
+  const stopPct = (entryMid - invalidationPrice) / entryMid * 100;
+  const maxPositionPct = Math.min(30, 100 / Math.max(stopPct, 0.1));
+  const enabled = !['不宜追高', '暂不适合介入'].includes(verdict) && latestPrice >= ma30 * 0.97;
+  return {
+    enabled,
+    entryLow: roundMetric(entryLow),
+    entryHigh: roundMetric(entryHigh),
+    entryAnchor: roundMetric(entryAnchor),
+    confirmationPrice: roundMetric(Math.max(resistance, ma20, ma10)),
+    invalidationPrice: roundMetric(invalidationPrice),
+    stopPct: roundMetric(stopPct, 1),
+    maxPositionPct: roundMetric(maxPositionPct, 1),
+    targets: [
+      { price: roundMetric(target1), sellPct: 30 },
+      { price: roundMetric(target2), sellPct: 30 },
+      { price: roundMetric(target3), sellPct: 40 }
+    ],
+    entrySteps: [
+      { buyPct: 40, condition: `进入${entryLow.toFixed(2)}-${entryHigh.toFixed(2)}元区间，日内不跌破${invalidationPrice.toFixed(2)}元且量能不高于20日均量` },
+      { buyPct: 30, condition: `回踩后重新站上MA5（${ma5.toFixed(2)}元）并保持MA5不低于MA10（${ma10.toFixed(2)}元）` },
+      { buyPct: 30, condition: `收盘突破${Math.max(resistance, ma20, ma10).toFixed(2)}元且量比达到1.2以上` }
+    ],
+    targetNotes: [
+      `到达第一目标后卖出30%，剩余仓位保护价上移到低吸区中值${entryMid.toFixed(2)}元附近`,
+      `到达第二目标后再卖出30%，剩余仓位以MA10（${ma10.toFixed(2)}元）或第一目标下方0.5倍ATR中较高者保护`,
+      `第三目标卖出剩余40%；若未到目标但放量冲高回落、收盘跌破MA5，也执行减仓`
+    ],
+    rationale: `区间依据最近支撑${supportPrice.toFixed(2)}元、MA20 ${ma20.toFixed(2)}元、MA30 ${ma30.toFixed(2)}元及ATR14 ${atr14.toFixed(2)}元计算；当前量比${volumeRatio.toFixed(2)}`
+  };
 }
 
 function analyzeHistory(history) {
@@ -2164,6 +2535,10 @@ function analyzeHistory(history) {
       ? `当前价格或指标偏热，等待回踩${supportPrice.toFixed(2)}元附近并让RSI回落至70以下，不满足前不介入。`
       : `等待收盘突破${resistance.toFixed(2)}元、站稳MA30（${ma30.toFixed(2)}元）、MA5保持高于MA10且量比不低于1.2，再从“等待”转为“可关注”。`;
   const risk = `ATR14为${atr14.toFixed(2)}元，20日年化波动约${volatility20.toFixed(1)}%，区间最大回撤${maxDrawdown.toFixed(1)}%；波动越高，观察仓位应越小。`;
+  const tradePlan = buildTradePlan({
+    latestPrice: latest.close, supportPrice, resistance, rangeHigh,
+    ma5, ma10, ma20, ma30, atr14, volumeRatio, verdict
+  });
   return {
     summary, ma5: roundMetric(ma5), ma10: roundMetric(ma10), ma20: roundMetric(ma20), ma30: roundMetric(ma30), ma60: roundMetric(ma60), maAlignment,
     rsi14: roundMetric(rsi14, 1), rangeLow: roundMetric(rangeLow), rangeHigh: roundMetric(rangeHigh),
@@ -2173,7 +2548,7 @@ function analyzeHistory(history) {
     bollUpper: roundMetric(bollUpper), bollMiddle: roundMetric(ma20), bollLower: roundMetric(bollLower),
     atr14: roundMetric(atr14), volatility20: roundMetric(volatility20, 1), maxDrawdown: roundMetric(maxDrawdown, 1),
     breakoutPrice: roundMetric(resistance), supportPrice: roundMetric(supportPrice), distanceToBreakout: roundMetric(distanceToBreakout),
-    score, verdict, buyCondition, risk, entry, exit,
+    score, verdict, buyCondition, risk, entry, exit, tradePlan,
     reboundSignal, reboundScore, reboundReason, bottomDate: bottomRow.date,
     bottomPrice: roundMetric(bottomRow.low), bottomDrawdown: roundMetric(bottomDrawdown, 1),
     reboundFromBottom: roundMetric(reboundFromBottom, 1), bottomRangePosition: roundMetric(bottomRangePosition, 1),
@@ -2187,37 +2562,35 @@ async function fetchStockHistory({ code, name, force = false }) {
   const cacheKey = String(code || '');
   const cached = force ? null : readTimedCache(stockHistoryCache, cacheKey, 5 * 60 * 1000);
   if (cached) return { ...cached, cached: true };
-  const errors = [];
-  let history = [];
-  let source = '';
+  const historyErrors = [];
+  const [historyResult, quoteResult, newsResult, riskResult] = await Promise.allSettled([
+    (async () => {
+      try {
+        const history = await fetchTencentHistory(cacheKey, 120);
+        if (history.length >= 60) return { history, source: '腾讯前复权日线' };
+      } catch (err) {
+        historyErrors.push(`腾讯历史行情失败：${err.message || err}`);
+      }
+      try {
+        return { history: await fetchSinaHistory(cacheKey), source: '新浪日线' };
+      } catch (err) {
+        historyErrors.push(`新浪历史行情失败：${err.message || err}`);
+        return { history: [], source: '' };
+      }
+    })(),
+    fetchTencentQuotes([cacheKey]),
+    fetchStockNews({ code: cacheKey, name, force }),
+    fetchFutureRiskProfile({ code: cacheKey, name, force })
+  ]);
+  const errors = [...historyErrors];
+  let history = historyResult.status === 'fulfilled' ? historyResult.value.history : [];
+  let source = historyResult.status === 'fulfilled' ? historyResult.value.source : '';
+  if (historyResult.status === 'rejected') errors.push(`历史行情失败：${historyResult.reason?.message || historyResult.reason}`);
   try {
-    history = await fetchTencentHistory(cacheKey, 120);
-    source = '腾讯前复权日线';
-  } catch (err) {
-    errors.push(`腾讯历史行情失败：${err.message || err}`);
-  }
-  if (history.length < 60) {
-    try {
-      history = await fetchSinaHistory(cacheKey);
-      source = '新浪日线';
-    } catch (err) {
-      errors.push(`新浪历史行情失败：${err.message || err}`);
-    }
-  }
-  try {
-    const liveQuote = (await fetchTencentQuotes([cacheKey]))[0];
+    if (quoteResult.status === 'rejected') throw quoteResult.reason;
+    const liveQuote = quoteResult.value[0];
     if (liveQuote?.price > 0 && liveQuote.tradeDate) {
-      const liveRow = {
-        date: liveQuote.tradeDate,
-        open: liveQuote.open || liveQuote.price,
-        close: liveQuote.price,
-        high: liveQuote.high || liveQuote.price,
-        low: liveQuote.low || liveQuote.price,
-        volume: liveQuote.volume || 0,
-        amount: liveQuote.amount || 0
-      };
-      if (history.at(-1)?.date === liveQuote.tradeDate) history[history.length - 1] = { ...history.at(-1), ...liveRow };
-      else if (!history.some(row => row.date === liveQuote.tradeDate)) history.push(liveRow);
+      history = mergeQuoteIntoHistory(history, liveQuote);
       source = `${source || '历史日线'} + 腾讯最新行情`;
     }
   } catch (err) {
@@ -2227,18 +2600,29 @@ async function fetchStockHistory({ code, name, force = false }) {
   const analysis = analyzeHistory(history);
   let newsContext = summarizeNews([]);
   try {
-    const newsResult = await fetchStockNews({ code: cacheKey, name, force });
-    newsContext = summarizeNews(newsResult.news);
-    errors.push(...(newsResult.errors || []));
+    if (newsResult.status === 'rejected') throw newsResult.reason;
+    newsContext = summarizeNews(newsResult.value.news);
+    errors.push(...(newsResult.value.errors || []));
   } catch (err) {
     errors.push(`消息面分析失败：${err.message || err}`);
   }
   if (newsContext.signal === '偏谨慎' && analysis.verdict === '可关注') analysis.verdict = '等待确认';
+  const riskProfile = riskResult.status === 'fulfilled'
+    ? riskResult.value
+    : buildFutureRiskProfile({ name, unlockRows: null, reductionAnnouncements: null });
+  if (riskResult.status === 'rejected') errors.push(`未来半年公司风险查询失败：${riskResult.reason?.message || riskResult.reason}`);
+  errors.push(...(riskProfile.errors || []));
+  if (riskProfile.status === 'risk') {
+    analysis.verdict = '暂不适合介入';
+    if (analysis.tradePlan) analysis.tradePlan.enabled = false;
+  } else if (riskProfile.status === 'unknown' && analysis.verdict === '可关注') {
+    analysis.verdict = '等待确认';
+  }
   analysis.newsImpact = newsContext.summary;
-  analysis.combinedConclusion = `${analysis.verdict}（技术评分${analysis.score}/100）。${analysis.buyCondition}${newsContext.signal === '偏谨慎' ? '消息面存在风险关键词，需降低优先级。' : '消息面暂未发现与技术条件明显冲突的风险关键词。'}`;
+  analysis.combinedConclusion = `${analysis.verdict}（技术评分${analysis.score}/100）。${analysis.buyCondition}${newsContext.signal === '偏谨慎' ? '消息面存在风险关键词，需降低优先级。' : '消息面暂未发现与技术条件明显冲突的风险关键词。'}未来半年公司风险：${riskProfile.summary}。`;
   const analyzedAt = new Date().toISOString();
   const latestTradeDate = history.at(-1)?.date || '';
-  return writeTimedCache(stockHistoryCache, cacheKey, { history, analysis: { ...analysis, source, latestTradeDate, analyzedAt }, newsContext, errors, source, latestTradeDate, analyzedAt });
+  return writeTimedCache(stockHistoryCache, cacheKey, { history, analysis: { ...analysis, source, latestTradeDate, analyzedAt }, riskProfile, newsContext, errors, source, latestTradeDate, analyzedAt });
 }
 
 async function fetchStockChart({ code, period, force = false }) {
@@ -2283,7 +2667,8 @@ async function fetchStockChart({ code, period, force = false }) {
       source = '新浪日K（腾讯接口异常后备用）';
     }
   }
-  if (rows.length < 10) throw new Error(`${source || safePeriod}返回数据不足`);
+  const minimumRows = safePeriod === 'minute' ? 1 : 10;
+  if (rows.length < minimumRows) throw new Error(`${source || safePeriod}返回数据不足`);
   return writeTimedCache(stockChartCache, cacheKey, { period: safePeriod, rows, previousClose, source, fetchedAt: new Date().toISOString() });
 }
 
@@ -2438,71 +2823,78 @@ ipcMain.handle('fetch-a-share-quotes', async (_event, codes) => {
   const warnings = [];
   let liveCount = 0;
   let cachedCount = 0;
-
-  for (let i = 0; i < uniqueCodes.length; i += 20) {
-    const batch = uniqueCodes.slice(i, i + 20);
-    let tencentRows = [];
-    let eastmoneyRows = [];
-    try {
-      tencentRows = await fetchTencentQuotes(batch);
-    } catch (err) {
-      warnings.push(`腾讯批量行情失败 ${batch.join(',')}：${err.message || err}`);
-    }
-
-    const eastmoneyTask = fetchQuoteRows(batch)
-      .then(rows => ({ rows: rows.map(normalizeQuoteRow), error: '' }))
-      .catch(err => ({ rows: [], error: err.message || String(err) }));
-    const eastmoneyResult = await Promise.race([
-      eastmoneyTask,
+  const batches = [];
+  for (let index = 0; index < uniqueCodes.length; index += 20) batches.push(uniqueCodes.slice(index, index + 20));
+  const sourceResults = await settleWithConcurrency(batches, 3, async batch => {
+    const eastmoneyTask = Promise.race([
+      fetchQuoteRows(batch)
+        .then(rows => ({ rows: rows.map(normalizeQuoteRow), error: '' }))
+        .catch(err => ({ rows: [], error: err.message || String(err) })),
       sleep(2500).then(() => ({ rows: [], error: '请求超过 2.5 秒，已跳过资金数据补充' }))
     ]);
-    eastmoneyRows = eastmoneyResult.rows;
-    if (eastmoneyResult.error) warnings.push(`东方财富补充行情失败 ${batch.join(',')}：${eastmoneyResult.error}`);
-
+    const [tencentResult, eastmoneyResult] = await Promise.allSettled([fetchTencentQuotes(batch), eastmoneyTask]);
+    return { batch, tencentResult, eastmoneyResult };
+  });
+  const liveQuotes = new Map();
+  sourceResults.forEach((result, index) => {
+    const batch = batches[index];
+    if (result.status === 'rejected') {
+      warnings.push(`批量行情失败 ${batch.join(',')}：${result.reason?.message || result.reason}`);
+      return;
+    }
+    const { tencentResult, eastmoneyResult } = result.value;
+    const tencentRows = tencentResult.status === 'fulfilled' ? tencentResult.value : [];
+    const eastmoneyValue = eastmoneyResult.status === 'fulfilled' ? eastmoneyResult.value : { rows: [], error: eastmoneyResult.reason?.message || String(eastmoneyResult.reason) };
+    if (tencentResult.status === 'rejected') warnings.push(`腾讯批量行情失败 ${batch.join(',')}：${tencentResult.reason?.message || tencentResult.reason}`);
+    if (eastmoneyValue.error) warnings.push(`东方财富补充行情失败 ${batch.join(',')}：${eastmoneyValue.error}`);
     const tencentMap = new Map(tencentRows.map(row => [row.code, row]));
-    const eastmoneyMap = new Map(eastmoneyRows.map(row => [row.code, row]));
-    for (const code of batch) {
+    const eastmoneyMap = new Map(eastmoneyValue.rows.map(row => [row.code, row]));
+    batch.forEach(code => {
       const tencentQuote = tencentMap.get(code);
       const eastmoneyQuote = eastmoneyMap.get(code);
-      let quote = null;
       if (tencentQuote) {
-        quote = {
+        liveQuotes.set(code, {
           ...tencentQuote,
           mainNetInflow: eastmoneyQuote?.mainNetInflow ?? null,
           mainNetPct: eastmoneyQuote?.mainNetPct ?? null,
           totalMarketCap: tencentQuote.totalMarketCap ?? eastmoneyQuote?.totalMarketCap ?? null,
           floatMarketCap: tencentQuote.floatMarketCap ?? eastmoneyQuote?.floatMarketCap ?? null,
           source: eastmoneyQuote ? '腾讯实时行情 + 东方财富资金' : '腾讯实时行情'
-        };
+        });
       } else if (eastmoneyQuote?.price != null) {
-        quote = { ...eastmoneyQuote, stale: false };
+        liveQuotes.set(code, { ...eastmoneyQuote, stale: false });
       }
+    });
+  });
 
-      if (!quote) {
-        try {
-          quote = await fetchSinaQuote(code);
-          if (quote) warnings.push(`${code} 已改用新浪实时行情`);
-        } catch (err) {
-          warnings.push(`${code} 新浪行情失败：${err.message || err}`);
-        }
-      }
-
-      if (quote?.price != null) {
-        quoteCache.set(code, quote);
-        quotes.push(quote);
-        liveCount++;
-        continue;
-      }
-
-      const cached = quoteCache.get(code);
-      if (cached) {
-        quotes.push({ ...cached, stale: true, source: `${cached.source || '行情'}（缓存）` });
-        cachedCount++;
-      } else {
-        errors.push(`${code} 所有实时行情源均未返回数据`);
-      }
+  const missingCodes = uniqueCodes.filter(code => !liveQuotes.has(code));
+  const fallbackResults = await settleWithConcurrency(missingCodes, 3, fetchSinaQuote);
+  fallbackResults.forEach((result, index) => {
+    const code = missingCodes[index];
+    if (result.status === 'fulfilled' && result.value) {
+      liveQuotes.set(code, result.value);
+      warnings.push(`${code} 已改用新浪实时行情`);
+    } else if (result.status === 'rejected') {
+      warnings.push(`${code} 新浪行情失败：${result.reason?.message || result.reason}`);
     }
-  }
+  });
+
+  uniqueCodes.forEach(code => {
+    const quote = liveQuotes.get(code);
+    if (quote?.price != null) {
+      quoteCache.set(code, quote);
+      quotes.push(quote);
+      liveCount++;
+      return;
+    }
+    const cached = quoteCache.get(code);
+    if (cached) {
+      quotes.push({ ...cached, stale: true, source: `${cached.source || '行情'}（缓存）` });
+      cachedCount++;
+    } else {
+      errors.push(`${code} 所有实时行情源均未返回数据`);
+    }
+  });
 
   const result = {
     quotes,
@@ -2603,7 +2995,7 @@ function createWindow() {
     minHeight: 720,
     show: false,
     backgroundColor: '#f4f6fb',
-    title: 'AI股票观察助手',
+    title: '股票观察助手',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -2631,3 +3023,11 @@ app.whenReady().then(() => {
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
+
+module.exports = {
+  assessRecommendationTimingRisk,
+  buildFutureRiskProfile,
+  mergeQuoteIntoHistory,
+  parseReductionPlanWindow,
+  settleWithConcurrency
+};

@@ -4,14 +4,14 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https:; object-src 'none'; base-uri 'none'; form-action 'none'" />
-  <title>AI股票观察助手</title>
+  <title>股票观察助手</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
   <div class="app">
     <header class="hero">
       <div>
-        <h1>AI股票观察助手</h1>
+        <h1>股票观察助手</h1>
         <p>A股行业与产业链：需求命令 → 产业链分区 → 重点关注池 → 标签管理 → 刷新行情</p>
         <small id="lastUpdated"></small>
       </div>
@@ -21,7 +21,7 @@
     <section class="command-box card">
       <label>需求命令</label>
       <div class="command-row">
-        <textarea id="commandInput">查找A股AI整个行业从下游到上游整个产业链相关股票，按照产业类型分区，列出龙头、待突破、已突破、重点关注、待回调、当前价格、最新情况和原因</textarea>
+        <textarea id="commandInput" placeholder="输入你想要搜索的相关内容，会给你生成对应内容的股票推荐"></textarea>
         <button id="generateBtn" class="primary">生成/更新股票池</button>
       </div>
     </section>
@@ -36,8 +36,8 @@
         <div id="marketAnalysis" class="market-analysis">正在获取实时市场数据...</div>
         <div id="marketIndices" class="market-indices"></div>
         <div class="market-stat-grid">
-          <div><b id="marketUp">--</b><span>上涨</span></div>
-          <div><b id="marketDown">--</b><span>下跌</span></div>
+          <div><b id="marketUp">--</b><span class="up">上涨</span></div>
+          <div><b id="marketDown">--</b><span class="down">下跌</span></div>
           <div><b id="marketFlat">--</b><span>平盘</span></div>
           <div><b id="marketTurnover">--</b><span>两市成交额</span></div>
         </div>
@@ -131,6 +131,11 @@
               <button id="editLabelStocks" class="small">编辑</button>
               <button id="deleteSelectedFromLabel" class="danger small hidden">删除选中</button>
             </div>
+          </div>
+          <div id="labelSortControls" class="label-sort-controls">
+            <label>评分<select id="labelScoreSort"><option value="none">不排序</option><option value="asc">正序</option><option value="desc">倒序</option></select></label>
+            <label>涨跌幅<select id="labelChangeSort"><option value="none">不排序</option><option value="asc">正序</option><option value="desc">倒序</option></select></label>
+            <label>价格<select id="labelPriceSort"><option value="none">不排序</option><option value="asc">正序</option><option value="desc">倒序</option></select></label>
           </div>
           <div class="label-actions">
             <button id="selectLabelAll" class="small hidden">全选/反选</button>

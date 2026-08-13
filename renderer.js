@@ -7,11 +7,13 @@ let selected = new Set();
 let view = 'card';
 let labels = [];
 let activeLabel = '';
+let labelSorts = {};
 let portfolio = [];
 let simulatedTrades = [];
 let activeDetailCode = null;
 let isRefreshing = false;
 let labelEditMode = false;
+let labelNameDraft = '';
 let stockLabelEditCode = null;
 let stockLabelReturnFocus = null;
 let contextLabelStockCode = null;
@@ -24,6 +26,7 @@ let logs = [];
 let currentViewSource = 'empty';
 let marketOverviewRefreshing = false;
 let latestMarketRecommendations = [];
+let latestMarketOverview = null;
 const detailProfileCache = new Map();
 const detailNewsCache = new Map();
 const detailHistoryCache = new Map();
@@ -32,6 +35,23 @@ const detailFundFlowCache = new Map();
 const detailChartCache = new Map();
 const activeChartPeriod = new Map();
 const STORAGE_KEY = 'ai-stock-assistant-state-v1';
+
+async function settleWithConcurrency(items, limit, task){
+  const results = new Array(items.length);
+  let cursor = 0;
+  const workers = Array.from({length:Math.min(limit, items.length)}, async () => {
+    while(cursor < items.length){
+      const index = cursor++;
+      try{
+        results[index] = {status:'fulfilled', value:await task(items[index], index)};
+      }catch(reason){
+        results[index] = {status:'rejected', reason};
+      }
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
 
 function escapeHtml(value){
   return String(value ?? '')
@@ -53,11 +73,25 @@ function safeHttpUrl(value){
 
 function saveState(){
   try{
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({labels, activeLabel, portfolio, simulatedTrades}));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({labels, activeLabel, labelSorts, portfolio, simulatedTrades}));
     addLog('info', '已保存本地数据');
   }catch(err){
     addLog('error', `保存本地数据失败：${err.message || err}`);
   }
+}
+
+function labelStockSnapshot(stock, existingStock=null){
+  const {favoriteBasePrice: ignoredBase, favoriteAddedAt: ignoredTime, ...snapshot} = stock;
+  const existingBase = Number(existingStock?.favoriteBasePrice);
+  const currentPrice = Number(stock.price);
+  return {
+    ...snapshot,
+    pinned:Boolean(existingStock?.pinned),
+    favoriteBasePrice:Number.isFinite(existingBase) && existingBase > 0
+      ? existingBase
+      : Number.isFinite(currentPrice) && currentPrice > 0 ? currentPrice : null,
+    favoriteAddedAt:existingStock?.favoriteAddedAt || new Date().toISOString()
+  };
 }
 
 function loadState(){
@@ -66,13 +100,14 @@ function loadState(){
     if(!raw) return false;
     const state = JSON.parse(raw);
     if(Array.isArray(state.labels)) labels = state.labels;
+    if(state.labelSorts && typeof state.labelSorts === 'object') labelSorts = state.labelSorts;
     if(Array.isArray(state.portfolio)) portfolio = state.portfolio.filter(item => /^\d{6}$/.test(String(item.code || '')));
     if(Array.isArray(state.simulatedTrades)) simulatedTrades = state.simulatedTrades.slice(0, 500);
     activeLabel = state.activeLabel || labels[0]?.name || '';
     labels = labels.filter(label => label.name !== '本次生成股票池').map(label => ({
       ...label,
       stocks: (label.stocks || []).map(ls => ({
-        ...ls,
+        ...labelStockSnapshot(ls, ls),
         name: cleanDisplayName(ls.name),
         type: ls.marketSignal || ls.type,
         status: ls.marketSignal ? (ls.newsLabel || ls.focus || '消息中性') : (ls.status === '已突破' ? '待分析' : ls.status),
@@ -119,6 +154,7 @@ function marketRow(item, value, detail=''){
 }
 
 function renderMarketOverview(result){
+  latestMarketOverview = result;
   $('marketAnalysis').textContent = result.analysis || '市场分析暂不可用。';
   $('marketUpdated').textContent = result.fetchedAt
     ? `${new Date(result.fetchedAt).toLocaleTimeString('zh-CN', {hour12:false})} · 自动刷新60秒`
@@ -152,8 +188,11 @@ function renderMarketOverview(result){
     else if(item.signal === '待突破') counts.breakout += 1;
     return counts;
   }, {bottomWaiting:0, rebounded:0, breakout:0});
+  const riskCoverage = Number.isFinite(Number(coverage.riskChecked))
+    ? `；未来半年风险核验 ${coverage.riskChecked} 只，排除 ${coverage.riskRejected || 0} 只，未确认 ${coverage.riskUnknown || 0} 只`
+    : '';
   $('marketRecommendationCoverage').textContent = coverage.scanned
-    ? `全市场扫描 ${coverage.scanned} 只，初筛 ${coverage.prefiltered || 0} 只，历史精筛 ${coverage.analyzed || 0} 只，覆盖 ${coverage.industries || 0} 个行业；实际推荐 ${recommendations.length} 只（待反弹 ${signals.bottomWaiting}，已反弹 ${signals.rebounded}，待突破 ${signals.breakout}）`
+    ? `全市场扫描 ${coverage.scanned} 只，初筛 ${coverage.prefiltered || 0} 只，历史精筛 ${coverage.analyzed || 0} 只，覆盖 ${coverage.industries || 0} 个行业${riskCoverage}；实际推荐 ${recommendations.length} 只（待反弹 ${signals.bottomWaiting}，已反弹 ${signals.rebounded}，待突破 ${signals.breakout}）`
     : '等待全市场扫描';
   const visibleRecommendations = recommendations.slice(0, 10);
   $('marketRecommendations').innerHTML = visibleRecommendations.length ? visibleRecommendations.map(item => `<button class="market-recommendation" data-market-recommendation="${escapeHtml(item.code)}">
@@ -184,22 +223,27 @@ function renderMarketOverview(result){
   const errors = result.errors || [];
   errorBox.classList.toggle('hidden', !errors.length);
   errorBox.textContent = errors.length ? `部分数据异常：${errors.join('；')}` : '';
+  const detailStock = findStockByCode(activeDetailCode);
+  const historyResult = detailHistoryCache.get(activeDetailCode);
+  if(detailStock && historyResult) renderHistoryAnalysis(detailStock, historyResult);
 }
 
-async function loadMarketOverview(force=false){
-  if(marketOverviewRefreshing || !window.stockApi?.fetchMarketOverview) return;
+async function loadMarketOverview(force=false, silent=false){
+  if(marketOverviewRefreshing || !window.stockApi?.fetchMarketOverview) return latestMarketOverview;
   marketOverviewRefreshing = true;
   $('refreshMarketOverview').disabled = true;
   $('refreshMarketOverview').textContent = '刷新中';
   try{
     const result = await window.stockApi.fetchMarketOverview(force);
     renderMarketOverview(result);
-    if(force) notify(result.errors?.length ? '大盘数据部分更新，异常项已标注' : '大盘数据已更新', result.errors?.length ? 'warn' : 'success');
+    if(force && !silent) notify(result.errors?.length ? '大盘数据部分更新，异常项已标注' : '大盘数据已更新', result.errors?.length ? 'warn' : 'success');
+    return result;
   }catch(err){
     $('marketError').classList.remove('hidden');
     $('marketError').textContent = `大盘数据更新失败：${err.message || err}`;
     $('marketUpdated').textContent = '更新失败，保留当前显示';
-    if(force) notify(`大盘数据更新失败：${err.message || err}`, 'error');
+    if(force && !silent) notify(`大盘数据更新失败：${err.message || err}`, 'error');
+    return null;
   }finally{
     marketOverviewRefreshing = false;
     $('refreshMarketOverview').disabled = false;
@@ -296,7 +340,7 @@ function saveMarketRecommendations(){
   labels = labels.map(label => {
     if(!targetLabels.has(label.name)) return label;
     const byCode = new Map(label.stocks.map(stock => [stock.code, stock]));
-    selectedStocks.forEach(stock => byCode.set(stock.code, {...byCode.get(stock.code), ...stock, pinned:Boolean(byCode.get(stock.code)?.pinned)}));
+    selectedStocks.forEach(stock => byCode.set(stock.code, labelStockSnapshot(stock, byCode.get(stock.code))));
     return {...label, stocks:[...byCode.values()]};
   });
   activeLabel ||= [...targetLabels][0];
@@ -546,17 +590,24 @@ function scoreBadge(s){
   return `${s.pinned ? '<span class="badge pinned-badge">置顶</span>' : ''}<span class="badge score-badge">评分 ${score == null ? '待分析' : escapeHtml(score)}</span>`;
 }
 
+function favoriteChangePct(s){
+  const base = Number(s.favoriteBasePrice);
+  const price = Number(s.price);
+  return Number.isFinite(base) && base > 0 && Number.isFinite(price) && price > 0 ? (price / base - 1) * 100 : null;
+}
+
 function stockCard(s, compact=false, showCheck=true){
   const checkHtml = showCheck ? `<input class="check stock-check" data-code="${s.code}" type="checkbox" ${checked(s.code)} />` : '';
   const labelHtml = compact ? '' : stockLabelHtml(s);
   if(compact){
     const score = stockAnalysisScore(s);
+    const cumulativeChange = favoriteChangePct(s);
     return `<article class="stock-card compact-card label-stock-card ${s.pinned ? 'pinned-stock-card' : ''}" data-detail-code="${s.code}">
       <div class="stock-top">
         <div class="compact-stock-main">
           <div class="stock-title">${checkHtml}<h3>${escapeHtml(s.name)}</h3><span class="code">${s.code}</span></div>
         </div>
-        <div class="price">${yuan(s.price)}<div class="pct ${pctClass(s.changePct)}">${formatPct(s.changePct)}</div></div>
+        <div class="price">${yuan(s.price)}<div class="compact-returns"><span class="${cumulativeChange == null ? 'neutral' : pctClass(cumulativeChange)}" title="从加入当前标签时开始计算">累 ${formatPct(cumulativeChange)}</span><span class="${pctClass(s.changePct)}">今 ${formatPct(s.changePct)}</span></div></div>
       </div>
       <div class="compact-score">${s.pinned ? '<span class="compact-pinned">置顶</span>' : ''}<b>评分 ${score == null ? '待分析' : escapeHtml(score)}</b>${stockTagsHtml(s, 'compact-state')}</div>
     </article>`;
@@ -722,6 +773,113 @@ function renderAddStockList(){
   $('openAddPanel')?.classList.toggle('hidden', !(stocks.length && currentViewSource === 'generated'));
 }
 
+function activeLabelSort(){
+  const sort = labelSorts[activeLabel];
+  return ['score','changePct','price'].includes(sort?.field) && ['asc','desc'].includes(sort?.direction)
+    ? sort : {field:'', direction:'none'};
+}
+
+function sortedLabelStocks(label){
+  const list = [...(label?.stocks || [])];
+  const pinned = list.filter(stock => stock.pinned);
+  const regular = list.filter(stock => !stock.pinned);
+  const sort = activeLabelSort();
+  if(sort.direction === 'none') return [...pinned, ...regular];
+  const valueOf = stock => {
+    const value = sort.field === 'score' ? stockAnalysisScore(stock) : stock[sort.field];
+    return value === null || value === undefined || value === '' ? null : Number(value);
+  };
+  const sorted = regular.map((stock, index) => ({stock, index})).sort((a, b) => {
+    const av = valueOf(a.stock);
+    const bv = valueOf(b.stock);
+    const aMissing = !Number.isFinite(av);
+    const bMissing = !Number.isFinite(bv);
+    if(aMissing || bMissing) return aMissing === bMissing ? a.index - b.index : (aMissing ? 1 : -1);
+    const compared = sort.direction === 'asc' ? av - bv : bv - av;
+    return compared || a.index - b.index;
+  }).map(item => item.stock);
+  return [...pinned, ...sorted];
+}
+
+function renderLabelSortControls(label){
+  const sort = activeLabelSort();
+  const controls = {
+    score:$('labelScoreSort'),
+    changePct:$('labelChangeSort'),
+    price:$('labelPriceSort')
+  };
+  Object.entries(controls).forEach(([field, select]) => {
+    if(!select) return;
+    select.value = sort.field === field ? sort.direction : 'none';
+    select.disabled = !label?.stocks?.length;
+  });
+}
+
+function updateLabelSort(field, direction){
+  if(!activeLabel) return;
+  if(direction === 'none') delete labelSorts[activeLabel];
+  else labelSorts[activeLabel] = {field, direction};
+  addLog('action', `标签排序：${activeLabel}`, {field, direction});
+  saveState();
+  renderLabels();
+}
+
+function startLabelEditing(){
+  if(!activeLabel) return;
+  labelEditMode = true;
+  labelNameDraft = activeLabel;
+  selected.clear();
+  renderStocks();
+  setTimeout(() => {
+    const input = $('activeLabelNameInput');
+    input?.focus({preventScroll:true});
+    input?.select();
+  }, 0);
+}
+
+function finishLabelEditing(){
+  const label = labels.find(item => item.name === activeLabel);
+  if(!label){
+    labelEditMode = false;
+    labelNameDraft = '';
+    renderStocks();
+    return;
+  }
+  const oldName = label.name;
+  const newName = labelNameDraft.trim();
+  if(!newName){
+    notify('标签名称不能为空', 'warn');
+    $('activeLabelNameInput')?.focus({preventScroll:true});
+    return;
+  }
+  if(newName !== oldName && labels.some(item => item.name === newName)){
+    notify(`标签「${newName}」已存在`, 'warn');
+    $('activeLabelNameInput')?.focus({preventScroll:true});
+    return;
+  }
+  if(newName !== oldName){
+    label.name = newName;
+    if(Object.prototype.hasOwnProperty.call(labelSorts, oldName)){
+      labelSorts[newName] = labelSorts[oldName];
+      delete labelSorts[oldName];
+    }
+    activeLabel = newName;
+    notify(`标签已重命名为「${newName}」`, 'success');
+  }
+  labelEditMode = false;
+  labelNameDraft = '';
+  selected.clear();
+  saveState();
+  renderStocks();
+}
+
+function cancelLabelEditing(){
+  labelEditMode = false;
+  labelNameDraft = '';
+  selected.clear();
+  renderStocks();
+}
+
 function renderLabels(){
   const label = labels.find(l => l.name === activeLabel) || labels[0];
   if(label && activeLabel !== label.name) activeLabel = label.name;
@@ -732,7 +890,18 @@ function renderLabels(){
       <button class="small danger" data-delete-label="${escapeHtml(l.name)}">删除</button>
     </div>`;
   }).join('');
-  $('activeLabelTitle').textContent = label ? label.name : '暂无标签';
+  $('activeLabelTitle').innerHTML = labelEditMode && label
+    ? `<input id="activeLabelNameInput" class="active-label-name-input" value="${escapeHtml(labelNameDraft || label.name)}" maxlength="40" aria-label="标签名称" />`
+    : escapeHtml(label ? label.name : '暂无标签');
+  const labelNameInput = $('activeLabelNameInput');
+  if(labelNameInput){
+    labelNameInput.oninput = event => { labelNameDraft = event.target.value; };
+    labelNameInput.onkeydown = event => {
+      if(event.key === 'Enter'){ event.preventDefault(); finishLabelEditing(); }
+      if(event.key === 'Escape'){ event.preventDefault(); cancelLabelEditing(); }
+    };
+  }
+  renderLabelSortControls(label);
   const activeLabelCodes = new Set(label?.stocks.map(s => s.code) || []);
   const hasSelectedInLabel = [...selected].some(code => activeLabelCodes.has(code));
   const editBtn = $('editLabelStocks');
@@ -744,10 +913,10 @@ function renderLabels(){
     deleteBtn.classList.toggle('hidden', !labelEditMode);
     deleteBtn.disabled = !hasSelectedInLabel;
   }
-  const displayedStocks = [...(label?.stocks || [])].sort((a, b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)));
+  const displayedStocks = sortedLabelStocks(label);
   $('labelStocks').innerHTML = displayedStocks.length ? displayedStocks.map(s => stockCard(s,true,labelEditMode)).join('') : '<div class="note">暂无股票，先从左侧选择并添加。</div>';
 
-  document.querySelectorAll('[data-active-label]').forEach(b => b.onclick = () => { activeLabel = b.dataset.activeLabel; selected.clear(); labelEditMode = false; addLog('info', `切换标签：${activeLabel}`); renderLabels(); });
+  document.querySelectorAll('[data-active-label]').forEach(b => b.onclick = () => { activeLabel = b.dataset.activeLabel; selected.clear(); labelEditMode = false; labelNameDraft = ''; addLog('info', `切换标签：${activeLabel}`); renderLabels(); });
   document.querySelectorAll('[data-delete-label]').forEach(b => b.onclick = (e) => {
     e.stopPropagation();
     const name = b.dataset.deleteLabel;
@@ -764,9 +933,11 @@ function renderLabels(){
       return;
     }
     labels = labels.filter(l => l.name !== name);
+    delete labelSorts[name];
     activeLabel = labels[0]?.name || '';
     selected.clear();
     labelEditMode = false;
+    labelNameDraft = '';
     notify(`已删除标签「${name}」`, 'success');
     saveState();
     renderStocks();
@@ -863,7 +1034,7 @@ function saveStockLabels(){
     const existingStock = label.stocks.find(s => s.code === stock.code);
     if(!chosen.has(label.name)) return label;
     const withoutStock = label.stocks.filter(s => s.code !== stock.code);
-    const savedStock = existingStock ? {...stock, pinned: Boolean(existingStock.pinned)} : stock;
+    const savedStock = labelStockSnapshot(stock, existingStock);
     return {...label, stocks: [...withoutStock, savedStock]};
   });
   if(!activeLabel && labels.length) activeLabel = labels[0].name;
@@ -990,6 +1161,32 @@ function renderCompanyProfile(code, result, fallbackStock){
     <p><b>资料来源：</b>${escapeHtml(profile.source || '本地分析/接口补充')}</p>`;
 }
 
+function stockMarketContext(s){
+  const market = latestMarketOverview;
+  if(!market) return '大盘实时数据正在加载，完成后将自动补充联动分析。';
+  const indices = market.indices || [];
+  const validChanges = indices.map(item => Number(item.changePct)).filter(Number.isFinite);
+  const indexAverage = validChanges.length ? validChanges.reduce((sum, value) => sum + value, 0) / validChanges.length : null;
+  const stockChange = Number(s.changePct);
+  const relative = Number.isFinite(stockChange) && indexAverage != null
+    ? stockChange >= indexAverage + 1 ? '明显强于大盘' : stockChange <= indexAverage - 1 ? '明显弱于大盘' : '与大盘表现接近'
+    : '相对强弱待行情补充';
+  const profileIndustry = reliableIndustry(detailProfileCache.get(s.code)?.profile?.industry);
+  const industry = profileIndustry || reliableIndustry(s.sector);
+  const relatedSector = [...(market.sectors || []), ...(market.weakSectors || [])].find(item => {
+    const name = String(item.name || '');
+    return industry && name && (name.includes(industry) || industry.includes(name));
+  });
+  const recommendation = (market.recommendations || []).find(item => String(item.code) === String(s.code));
+  const breadth = market.breadth || {};
+  const indexText = indices.slice(0, 3).map(item => `${item.name || item.code || '指数'}${formatPct(item.changePct)}`).join('、') || '指数数据暂缺';
+  const sectorText = relatedSector ? `${relatedSector.name}${formatPct(relatedSector.changePct)}${relatedSector.leader ? `，领涨 ${relatedSector.leader}` : ''}` : `${industry || '所属行业'}暂未进入板块轮动前列`;
+  const signalText = recommendation ? `全市场筛选信号为${recommendation.signal || '待确认'}，评分${recommendation.signalScore ?? recommendation.score ?? '--'}，${recommendation.verdict || '等待确认'}` : '当前未进入大盘技术形态推荐名单';
+  const marketNews = String(market.newsContext?.summary || '市场消息面暂未返回有效摘要').replace(/[。；;]+$/, '');
+  const updatedAt = market.fetchedAt ? new Date(market.fetchedAt).toLocaleString('zh-CN', {hour12:false}) : '--';
+  return `${indexText}；上涨${breadth.up ?? '--'}家、下跌${breadth.down ?? '--'}家。个股${relative}；板块表现：${sectorText}；${signalText}。市场消息：${marketNews}。大盘更新时间：${updatedAt}。`;
+}
+
 function renderHistoryAnalysis(s, result){
   const box = document.querySelector(`[data-history-for="${s.code}"]`);
   const analysisBox = document.querySelector(`[data-analysis-for="${s.code}"]`);
@@ -1009,8 +1206,30 @@ function renderHistoryAnalysis(s, result){
     ? String(a.combinedConclusion || a.summary || '').replace(/技术评分\s*\d+(?:\.\d+)?\s*\/\s*100/g, `推荐评分${displayedScore}/100`)
     : a.combinedConclusion || a.summary;
   const displayedVerdict = hasRecommendationScore ? s.verdict || a.verdict : a.verdict;
-  analysisBox.innerHTML = `<b>股票分析：</b>${escapeHtml(`${conclusion}${capital}`)}`;
-  box.innerHTML = `<h3>综合量价、趋势与消息分析</h3>
+  const marketContext = stockMarketContext(s);
+  const corporateRisk = result?.riskProfile;
+  const reductionText = corporateRisk?.reduction?.status === 'risk'
+    ? corporateRisk.reduction.events.map(event => `${event.startDate}至${event.endDate}${event.estimated ? '（估算）' : ''}`).join('、')
+    : corporateRisk?.reduction?.status === 'clear' ? '未发现计划' : '未确认';
+  const unlockText = corporateRisk?.unlock?.status === 'risk'
+    ? corporateRisk.unlock.events.map(event => `${event.date}${event.type ? `（${event.type}）` : ''}`).join('、')
+    : corporateRisk?.unlock?.status === 'clear' ? '未发现安排' : '未确认';
+  const corporateRiskHtml = corporateRisk ? `<p class="corporate-risk"><b>未来半年公司风险：</b>${escapeHtml(corporateRisk.summary || '未确认')}；ST：${escapeHtml(corporateRisk.st?.status === 'risk' ? '有当前标记' : '无当前标记')}；减持：${escapeHtml(reductionText)}；解禁：${escapeHtml(unlockText)}。<br><b>核验窗口：</b>${escapeHtml(corporateRisk.windowStart || '--')} 至 ${escapeHtml(corporateRisk.windowEnd || '--')}；<b>数据源：</b>${escapeHtml(corporateRisk.source || '公开公司公告与限售解禁数据')}</p>`
+    : '<p class="corporate-risk"><b>未来半年公司风险：</b>未确认。</p>';
+  const plan = a.tradePlan;
+  const tradePlanHtml = plan ? `<div class="trade-plan">
+      <h4>条件化操作参考</h4>
+      <p><b>低吸区间：</b>${yuan(plan.entryLow)}-${yuan(plan.entryHigh)}。${plan.enabled ? '仅在价格进入区间并出现缩量企稳时分批执行。' : '当前趋势条件不合格，暂不执行低吸，先等待趋势修复。'}</p>
+      <p><b>分批建仓：</b>${(plan.entrySteps || []).map((step, index) => `第${index + 1}笔${step.buyPct}%：${escapeHtml(step.condition)}`).join('；')}</p>
+      <p><b>确认价：</b>${yuan(plan.confirmationPrice)}。未满足收盘与量比条件，不执行最后一笔。</p>
+      <p><b>失效 / 止损：</b>${yuan(plan.invalidationPrice)}，按低吸区中值测算风险约${formatPct(-Number(plan.stopPct))}；收盘有效跌破时退出，不用盘中瞬时触价替代收盘确认。</p>
+      <p><b>分批止盈：</b>${(plan.targets || []).map((target, index) => `第${index + 1}档 ${yuan(target.price)} 卖出${target.sellPct}%`).join('；')}。</p>
+      <p><b>移动保护：</b>${(plan.targetNotes || []).map(escapeHtml).join('；')}。</p>
+      <p><b>仓位上限示例：</b>若账户单笔最大可承受损失限定为总资金1%，按当前止损距离反推，计划总仓位不超过${formatNumber(plan.maxPositionPct, 1)}%。</p>
+      <p><b>计算依据：</b>${escapeHtml(plan.rationale || '')}。价格均为动态参考，刷新行情后会重算。</p>
+    </div>` : '';
+  analysisBox.innerHTML = `<b>股票分析：</b>${escapeHtml(`${conclusion}${capital}${marketContext}`)}`;
+  box.innerHTML = `<h3>综合实时行情、资金、趋势、消息与大盘分析</h3>
     <div class="analysis-verdict">
       <div class="analysis-score"><b>${escapeHtml(displayedScore ?? '--')}</b><span>${scoreLabel}</span></div>
       <div><p><b>当前判断：</b>${escapeHtml(displayedVerdict || '等待确认')}</p><p>${escapeHtml(conclusion)}</p></div>
@@ -1028,10 +1247,13 @@ function renderHistoryAnalysis(s, result){
       <p><b>入场观察：</b>${escapeHtml(a.entry)}</p>
       <p><b>离场 / 风控：</b>${escapeHtml(a.exit)}</p>
       <p><b>消息面：</b>${escapeHtml(a.newsImpact || result.newsContext?.summary || '未获取到有效消息')}</p>
+      ${corporateRiskHtml}
+      <p class="market-context"><b>大盘与消息联动：</b>${escapeHtml(marketContext)}</p>
     </div>
+    ${tradePlanHtml}
     <p><b>预计观察窗口：</b>${escapeHtml(a.entryWindow)} <b>持仓观察：</b>${escapeHtml(a.exitWindow)}</p>
     <p><b>历史数据源：</b>${escapeHtml(a.source || result.source || '--')}；<b>最新交易日：</b>${escapeHtml(a.latestTradeDate || result.latestTradeDate || '--')}；<b>分析时间：</b>${a.analyzedAt ? escapeHtml(new Date(a.analyzedAt).toLocaleString('zh-CN', {hour12:false})) : '--'}</p>
-    <div class="note inline-note">技术分析基于历史价格和成交量，只用于条件观察，不构成收益保证或投资建议。</div>`;
+    <div class="note inline-note">以上价格为历史行情、均线和波动率的条件演算，不考虑个人持仓成本、资金用途与风险承受能力，不保证触发价成交或获得收益。</div>`;
 }
 
 function mergeFundFlow(code, result){
@@ -1069,9 +1291,10 @@ async function loadStockFundFlow(s, force=false){
   const source = document.querySelector(`[data-fund-source-for="${s.code}"]`);
   if(!window.stockApi?.fetchStockFundFlow || !source) return;
   if(!force && detailFundFlowCache.has(s.code)){
-    const updated = mergeFundFlow(s.code, detailFundFlowCache.get(s.code));
+    const cached = detailFundFlowCache.get(s.code);
+    const updated = mergeFundFlow(s.code, cached);
     renderFundFlow(updated);
-    return;
+    return cached;
   }
   source.innerHTML = '<b>资金数据：</b>正在汇总主力流入/流出...';
   try{
@@ -1082,9 +1305,11 @@ async function loadStockFundFlow(s, force=false){
     if(detailHistoryCache.has(s.code)) renderHistoryAnalysis(updated, detailHistoryCache.get(s.code));
     saveState();
     (result.errors || []).forEach(message => addLog('warn', `资金源切换：${message}`));
+    return result;
   }catch(err){
     source.innerHTML = `<b>资金数据：</b>获取失败：${escapeHtml(err.message || err)}`;
     addLog('error', `资金汇总失败：${s.name} ${err.message || err}`);
+    return null;
   }
 }
 
@@ -1114,10 +1339,13 @@ async function loadLatestDetailQuote(s){
     if(source) source.innerHTML = `<b>行情数据源：</b>${escapeHtml(updated.source || '--')}；<b>更新时间：</b>${updated.fetchedAt ? escapeHtml(new Date(updated.fetchedAt).toLocaleString('zh-CN', {hour12:false})) : '--'}`;
     if(detailHistoryCache.has(s.code)) renderHistoryAnalysis(updated, detailHistoryCache.get(s.code));
     saveState();
+    renderLabels();
+    return updated;
   }catch(err){
     const source = document.querySelector(`[data-quote-source-for="${s.code}"]`);
     if(source) source.innerHTML = `<b>行情更新失败：</b>${escapeHtml(err.message || err)}；当前保留原数据。`;
     notify(`个股最新行情获取失败：${err.message || err}`, 'error');
+    return null;
   }
 }
 
@@ -1142,26 +1370,28 @@ async function ensureLabelScores(labelStocks){
   const missing = (labelStocks || []).filter(stock => !detailHistoryCache.has(stock.code)
     && !detailHistoryPending.has(`${stock.code}:normal`));
   if(!missing.length) return;
-  let changed = false;
-  for(let index = 0; index < missing.length; index += 3){
-    const results = await Promise.allSettled(missing.slice(index, index + 3).map(stock => fetchStockAnalysis(stock)));
-    changed ||= results.some(result => result.status === 'fulfilled' && result.value);
-    results.filter(result => result.status === 'rejected').forEach(result => addLog('error', `收藏评分计算失败：${result.reason?.message || result.reason}`));
-  }
+  const results = await settleWithConcurrency(missing, 3, stock => fetchStockAnalysis(stock));
+  const changed = results.some(result => result.status === 'fulfilled' && result.value);
+  results.filter(result => result.status === 'rejected').forEach(result => addLog('error', `收藏评分计算失败：${result.reason?.message || result.reason}`));
   if(changed) renderLabels();
 }
 
 async function refreshAnalysisScores(codes){
   const targets = [...new Set(codes || [])].map(findStockByCode).filter(Boolean);
-  for(let index = 0; index < targets.length; index += 3){
-    const group = targets.slice(index, index + 3);
-    const results = await Promise.allSettled(group.map(stock => fetchStockAnalysis(stock, true)));
-    results.forEach((result, offset) => {
-      const stock = group[offset];
-      if(result.status === 'fulfilled' && result.value && stock.code === activeDetailCode) renderHistoryAnalysis(stock, result.value);
-      if(result.status === 'rejected') addLog('error', `刷新评分失败：${stock.name} ${result.reason?.message || result.reason}`);
-    });
-  }
+  const results = await settleWithConcurrency(targets, 3, stock => {
+    const cached = detailHistoryCache.get(stock.code);
+    const analyzedAt = Date.parse(cached?.analyzedAt || cached?.analysis?.analyzedAt || '');
+    if(cached && Number.isFinite(analyzedAt) && Date.now() - analyzedAt < 5 * 60 * 1000){
+      applyAnalysisClassification(stock.code);
+      return cached;
+    }
+    return fetchStockAnalysis(stock, Boolean(cached));
+  });
+  results.forEach((result, index) => {
+    const stock = targets[index];
+    if(result.status === 'fulfilled' && result.value && stock.code === activeDetailCode) renderHistoryAnalysis(stock, result.value);
+    if(result.status === 'rejected') addLog('error', `刷新评分失败：${stock.name} ${result.reason?.message || result.reason}`);
+  });
   renderLabels();
 }
 
@@ -1171,12 +1401,21 @@ async function refreshActiveFundFlow(codes){
   if(stock) await loadStockFundFlow(stock, true);
 }
 
+function refreshSecondaryData(codes){
+  Promise.allSettled([refreshAnalysisScores(codes), refreshActiveFundFlow(codes)])
+    .then(() => {
+      saveState();
+      renderStocks();
+    });
+}
+
 async function loadStockHistory(s, force=false){
   const box = document.querySelector(`[data-history-for="${s.code}"]`);
   if(!box || !window.stockApi?.fetchStockHistory) return;
   if(!force && detailHistoryCache.has(s.code)){
-    renderHistoryAnalysis(s, detailHistoryCache.get(s.code));
-    return;
+    const cached = detailHistoryCache.get(s.code);
+    renderHistoryAnalysis(s, cached);
+    return cached;
   }
   box.innerHTML = '<div class="note inline-note">正在分析近3个月行情...</div>';
   try{
@@ -1184,9 +1423,11 @@ async function loadStockHistory(s, force=false){
     renderHistoryAnalysis(s, result);
     renderLabels();
     (result?.errors || []).forEach(msg => addLog('error', msg));
+    return result;
   }catch(err){
     box.innerHTML = `<div class="note inline-note">近3个月行情分析失败：${escapeHtml(err.message || err)}</div>`;
     addLog('error', `近3个月行情分析失败：${s.name} ${err.message || err}`);
+    return null;
   }
 }
 
@@ -1537,15 +1778,17 @@ async function loadStockChart(s, period = 'day', force=false){
       result = await window.stockApi.fetchStockChart({code:s.code, period, force});
       detailChartCache.set(cacheKey, result);
     }
-    if(activeChartPeriod.get(s.code) !== period || !canvas.isConnected) return;
+    if(activeChartPeriod.get(s.code) !== period || !canvas.isConnected) return result;
     const referencePrice = result.previousClose ?? s.prevClose;
     drawStockChart(canvas, result.rows, period, referencePrice);
     const latestIndex = result.rows.length - 1;
     const closeSummary = period === 'minute' ? '' : ` · 收盘 ${yuan(Number(result.rows[latestIndex]?.close))} · 涨跌 ${formatPct(chartChangePct(result.rows, latestIndex, period, referencePrice))}`;
     meta.textContent = `${result.source || '行情接口'} · ${result.rows.length} 个数据点${period === 'day' || period === 'week' || period === 'month' ? ' · 均线 MA5 / MA10 / MA20 / MA30 / MA60' : ''}${closeSummary}`;
+    return result;
   }catch(err){
     meta.textContent = `走势加载失败：${err.message || err}`;
     addLog('error', `走势加载失败：${s.name} ${period} ${err.message || err}`);
+    return null;
   }finally{
     if(refreshButton?.isConnected){
       refreshButton.disabled = false;
@@ -1554,22 +1797,25 @@ async function loadStockChart(s, period = 'day', force=false){
   }
 }
 
-async function loadCompanyProfile(s){
+async function loadCompanyProfile(s, force=false){
   const box = document.querySelector(`[data-profile-for="${s.code}"]`);
   if(!box || !window.stockApi?.fetchCompanyProfile) return;
-  if(detailProfileCache.has(s.code)){
-    renderCompanyProfile(s.code, detailProfileCache.get(s.code), s);
-    return;
+  if(!force && detailProfileCache.has(s.code)){
+    const cached = detailProfileCache.get(s.code);
+    renderCompanyProfile(s.code, cached, s);
+    return cached;
   }
   box.innerHTML = '<p><b>公司产业：</b>正在加载公司资料...</p>';
   try{
-    const result = await window.stockApi.fetchCompanyProfile({code:s.code, name:s.name, sector:s.sector});
+    const result = await window.stockApi.fetchCompanyProfile({code:s.code, name:s.name, sector:s.sector, force});
     detailProfileCache.set(s.code, result);
     renderCompanyProfile(s.code, result, s);
     (result?.errors || []).forEach(msg => addLog('error', msg));
+    return result;
   }catch(err){
     renderCompanyProfile(s.code, {}, s);
     addLog('error', `公司资料加载失败：${s.name} ${err.message || err}`);
+    return null;
   }
 }
 
@@ -1609,8 +1855,9 @@ async function loadStockNews(s, force=false){
   const box = document.querySelector(`[data-news-for="${s.code}"]`);
   if(!box || !window.stockApi?.fetchStockNews) return;
   if(!force && detailNewsCache.has(s.code)){
-    renderStockNews(s.code, detailNewsCache.get(s.code));
-    return;
+    const cached = detailNewsCache.get(s.code);
+    renderStockNews(s.code, cached);
+    return cached;
   }
   box.innerHTML = '<div class="note inline-note">正在加载最新资讯...</div>';
   try{
@@ -1618,9 +1865,48 @@ async function loadStockNews(s, force=false){
     detailNewsCache.set(s.code, result);
     renderStockNews(s.code, result);
     (result?.errors || []).forEach(msg => addLog('error', msg));
+    return result;
   }catch(err){
     box.innerHTML = `<div class="note inline-note">资讯加载失败：${escapeHtml(err.message || err)}</div>`;
     addLog('error', `资讯加载失败：${s.name} ${err.message || err}`);
+    return null;
+  }
+}
+
+async function refreshStockDetail(s){
+  const button = document.querySelector(`[data-detail-refresh="${s.code}"]`);
+  if(!button || button.disabled) return;
+  button.disabled = true;
+  button.textContent = '刷新分析中';
+  detailNewsCache.delete(s.code);
+  addLog('info', `开始刷新个股综合分析：${s.name} ${s.code}`);
+  const period = activeChartPeriod.get(s.code) || 'day';
+  try{
+    const results = await Promise.all([
+      loadLatestDetailQuote(s),
+      loadStockFundFlow(s, true),
+      loadStockHistory(s, true),
+      loadCompanyProfile(s, true),
+      loadStockChart(s, period, true),
+      latestMarketOverview || loadMarketOverview(false, true)
+    ]);
+    const newsResult = await loadStockNews(findStockByCode(s.code) || s, false);
+    const updated = findStockByCode(s.code) || s;
+    const historyResult = detailHistoryCache.get(s.code) || results[2];
+    if(activeDetailCode === s.code && historyResult) renderHistoryAnalysis(updated, historyResult);
+    const failed = results.filter(result => !result).length + (newsResult ? 0 : 1);
+    const partialErrors = results.flatMap(result => result?.errors || []).length + (newsResult?.errors?.length || 0);
+    if(failed) notify(`个股综合分析部分刷新失败（${failed}项），已保留可用数据`, 'warn');
+    else notify(partialErrors ? '个股综合分析已更新，部分数据源已自动切换' : '个股综合分析已按最新行情、消息和大盘数据更新', partialErrors ? 'warn' : 'success');
+    addLog(failed ? 'warn' : 'success', `个股综合分析刷新完成：${s.name}`, {failed, partialErrors, period});
+  }catch(err){
+    notify(`个股综合分析刷新失败：${err.message || err}`, 'error');
+    addLog('error', `个股综合分析刷新失败：${s.name}`, {message:err.message || String(err)});
+  }finally{
+    if(button.isConnected){
+      button.disabled = false;
+      button.textContent = '刷新分析';
+    }
   }
 }
 
@@ -1636,7 +1922,7 @@ function renderDetailPanel(){
   if(forceLatest) forceDetailRefreshCode = null;
   panel.innerHTML = `<div class="detail-head">
       <div><h2>${escapeHtml(s.name)} <span>${s.code}</span></h2><p data-detail-sector="${s.code}">${escapeHtml(initialIndustry)}</p></div>
-      <div class="detail-head-actions"><button class="small" data-detail-add-label="${s.code}">添加到标签</button><button id="closeDetail" class="small">关闭</button></div>
+      <div class="detail-head-actions"><button class="small detail-refresh" data-detail-refresh="${s.code}">刷新分析</button><button class="small" data-detail-add-label="${s.code}">添加到标签</button><button id="closeDetail" class="small">关闭</button></div>
     </div>
     <div class="detail-metrics">
       <div><b data-quote-price-for="${s.code}">${yuan(s.price)}</b><span>当前价</span></div>
@@ -1686,6 +1972,7 @@ function renderDetailPanel(){
     }
     renderDetailPanel();
   };
+  panel.querySelectorAll('[data-detail-refresh]').forEach(button => button.onclick = () => refreshStockDetail(s));
   panel.querySelectorAll('[data-detail-add-label]').forEach(button => button.onclick = () => openStockLabelPanel(s.code));
   panel.querySelectorAll('[data-sim-trade]').forEach(button => button.onclick = () => executeSimulatedTrade(button.dataset.simCode, button.dataset.simTrade));
   panel.querySelectorAll('[data-sim-sell-ratio]').forEach(button => button.onclick = () => {
@@ -1777,7 +2064,12 @@ function applyQuoteData(quotes){
     return {...merged, status: updateStatusByQuote(merged)};
   };
   stocks = stocks.map(mergeStockQuote);
-  labels = labels.map(label => ({...label, stocks: label.stocks.map(mergeStockQuote)}));
+  labels = labels.map(label => ({...label, stocks: label.stocks.map(stock => {
+    const updated = mergeStockQuote(stock);
+    return updated.favoriteBasePrice == null && Number(updated.price) > 0
+      ? {...updated, favoriteBasePrice:Number(updated.price), favoriteAddedAt:updated.favoriteAddedAt || new Date().toISOString()}
+      : updated;
+  })}));
   portfolio = portfolio.map(position => {
     const q = map.get(position.code);
     if(!q || q.price == null) return position;
@@ -1820,8 +2112,7 @@ async function refreshMarket(){
     }
     applyQuoteData(quotes);
     saveState();
-    await refreshAnalysisScores(codes);
-    await refreshActiveFundFlow(codes);
+    refreshSecondaryData(codes);
     refreshTime(`多源行情：实时 ${result.updated} 只，缓存 ${result.cached} 只`);
     notify(quoteResultMessage('全量刷新完成', result), quoteResultType(result));
   }catch(err){
@@ -1861,8 +2152,7 @@ async function refreshActiveLabel(){
     }
     applyQuoteData(result.quotes);
     saveState();
-    await refreshAnalysisScores(codes);
-    await refreshActiveFundFlow(codes);
+    refreshSecondaryData(codes);
     refreshTime(`标签「${label.name}」实时更新 ${result.updated} 只`);
     notify(quoteResultMessage(`标签「${label.name}」刷新完成`, result), quoteResultType(result));
   }catch(err){
@@ -1885,8 +2175,7 @@ async function refreshCodes(codes){
     if(!quotes.length) return;
     applyQuoteData(quotes);
     saveState();
-    await refreshAnalysisScores(codes);
-    await refreshActiveFundFlow(codes);
+    refreshSecondaryData(codes);
     notify(quoteResultMessage('新增股票行情刷新完成', result), quoteResultType(result));
     renderStocks();
   }catch(err){
@@ -2062,11 +2351,11 @@ $('confirmAdd').onclick = () => {
     const map = new Map(existing.stocks.map(s => [s.code, s]));
     picked.forEach(s => {
       const previous = map.get(s.code);
-      map.set(s.code, previous ? {...s, pinned:Boolean(previous.pinned)} : s);
+      map.set(s.code, labelStockSnapshot(s, previous));
     });
     existing.stocks = [...map.values()];
   }else{
-    labels.push({name, stocks:picked});
+    labels.push({name, stocks:picked.map(stock => labelStockSnapshot(stock))});
   }
   notify(`已将 ${picked.length} 只股票增量添加到标签「${name}」`, 'success');
   activeLabel = name; selected.clear(); $('addPanel').classList.add('hidden'); saveState(); renderStocks(); $('searchInput').focus();
@@ -2074,7 +2363,10 @@ $('confirmAdd').onclick = () => {
 $('cardView').onclick = () => { view='card'; renderStocks(); };
 $('tableView').onclick = () => { view='table'; renderStocks(); };
 $('simulationView').onclick = openSimulationPortfolio;
-$('editLabelStocks').onclick = () => { labelEditMode = !labelEditMode; selected.clear(); renderStocks(); };
+$('editLabelStocks').onclick = () => labelEditMode ? finishLabelEditing() : startLabelEditing();
+$('labelScoreSort').onchange = event => updateLabelSort('score', event.target.value);
+$('labelChangeSort').onchange = event => updateLabelSort('changePct', event.target.value);
+$('labelPriceSort').onchange = event => updateLabelSort('price', event.target.value);
 $('selectLabelAll').onclick = toggleActiveLabelSelection;
 $('deleteSelectedFromLabel').onclick = () => {
   const l = labels.find(x => x.name === activeLabel);
