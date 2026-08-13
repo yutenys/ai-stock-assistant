@@ -1,6 +1,8 @@
 const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
+const os = require('os');
 
+app.setPath('userData', path.join(os.tmpdir(), `ai-stock-assistant-ui-smoke-${process.pid}`));
 app.disableHardwareAcceleration();
 
 app.whenReady().then(async () => {
@@ -84,6 +86,23 @@ app.whenReady().then(async () => {
       summary: '当前无ST标记，未来半年未发现减持计划或限售解禁',
       source: '东方财富公司公告 + 东方财富限售解禁'
     },
+    financialAnalysis: {
+      source:'东方财富F10主要指标', latestReport:'2026一季报', score:86, hardRisks:[],
+      quality:{available:true,score:86,evidence:'ROE18.0%，经营现金流/股1.20，流动比率2.00，资产负债率35.0%'},
+      rows:[{report:'2026一季报',eps:.62,epsGrowth:32,revenueGrowth:18,profitGrowth:30,roe:18,cashPerShare:1.2}]
+    },
+    investmentAnalysis: {
+      canslim:{score:81,rawScore:62,availableMax:75,available:5,total:7,note:'总分仅按可核验维度归一化；缺失维度不按零分处理，也不视为已通过。',dimensions:[
+        {key:'C',label:'当季盈利',max:15,available:true,score:14,evidence:'2026一季报 EPS同比32.0%，营收同比18.0%'},
+        {key:'A',label:'年度盈利',max:15,available:true,score:13,evidence:'近三年EPS持续增长，ROE18.0%'},
+        {key:'N',label:'创新变化',max:15,available:true,score:12,evidence:'近期可核验消息偏积极'},
+        {key:'S',label:'供需关系',max:15,available:true,score:12,evidence:'量比1.43，换手温和'},
+        {key:'L',label:'行业领先',max:15,available:true,score:11,evidence:'近60日涨18.42%'},
+        {key:'I',label:'机构认可',max:15,available:false,score:null,evidence:'机构持仓序列未接入'},
+        {key:'M',label:'市场方向',max:10,available:false,score:null,evidence:'大盘数据待补充'}
+      ]},
+      value:{score:80,valuationScore:74,quality:{available:true,score:86,evidence:'ROE18.0%，经营现金流/股1.20，流动比率2.00，资产负债率35.0%'},pe:28.6,pb:3.2,dcf:{available:false,evidence:'缺少可验证的自由现金流预测、净债务与增长假设，暂不计算DCF或目标价'},moat:{available:false,evidence:'护城河需要人工核验，当前不自动给高分'},source:'东方财富F10主要指标'}
+    },
     errors: []
   }));
   let chartRequestCount = 0;
@@ -121,12 +140,12 @@ app.whenReady().then(async () => {
     fundSectors: [{ name: '半导体', changePct: 1.82, mainNet: 3260000000, leader: '中芯国际' }],
     limits: { upCount: 68, downCount: 7, upStocks: [{ code: '603567', name: '珍宝岛', industry: '中药' }], downStocks: [] },
     recommendations: [
-      { code: '603567', name: '珍宝岛', signal: '底部待反弹', newsLabel: '消息确认', signalScore: 84, verdict: '等待确认', score: 76, breakoutPrice: 7.40, supportPrice: 6.20, ma30: 6.42, reason: '底部待反弹；回撤充分且短均线改善；阶段低点以来存在正向消息催化。', newsContext: { summary: '最新消息偏积极。' } },
-      { code: '600111', name: '北方稀土', signal: '已反弹', newsLabel: '消息中性', signalScore: 80, verdict: '可关注', score: 78, breakoutPrice: 44.60, supportPrice: 39.20, ma30: 40.10, reason: '已反弹；站上MA20且MA5高于MA10；阶段低点以来消息面中性。', newsContext: { summary: '消息面中性。' } },
+      { code: '603567', name: '珍宝岛', price:11.08, signal: '底部待反弹', newsLabel: '消息确认', signalScore: 84, verdict: '等待确认', score: 76, breakoutPrice: 7.40, supportPrice: 6.20, ma30: 6.42, reason: '底部待反弹；回撤充分且短均线改善；阶段低点以来存在正向消息催化。', canslim:{score:81,available:6,total:7}, factorAnalysis:{score:78,available:5,total:7,sectorProfile:{name:'中药',score:76,label:'强势板块'}}, newsContext: { summary: '最新消息偏积极。' } },
+      { code: '600111', name: '北方稀土股份', industry:'稀土', price:42.36, signal: '已反弹', newsLabel: '消息中性', signalScore: 80, verdict: '可关注', score: 78, breakoutPrice: 44.60, supportPrice: 39.20, ma30: 40.10, reason: '已反弹；站上MA20且MA5高于MA10；阶段低点以来消息面中性。', factorAnalysis:{score:70,available:4,total:7,sectorProfile:{name:'稀土',score:68,label:'活跃板块'}}, newsContext: { summary: '消息面中性。' } },
       ...Array.from({ length: 11 }, (_, index) => ({
         code: String(600200 + index), name: `测试推荐${index + 1}`, signal: '待突破', newsLabel: '消息中性',
-        signalScore: 79 - index, verdict: '等待确认', score: 70 - index, breakoutPrice: 12.40,
-        supportPrice: 10.20, ma30: 11.42, reason: '待突破；满足量价与质量闸门。', newsContext: { summary: '消息面中性。' }
+        industry:index < 7 ? '半导体' : '软件', price:11.08 + index * .1, signalScore: 79 - index, verdict: '等待确认', score: 70 - index, breakoutPrice: 12.40,
+        supportPrice: 10.20, ma30: 11.42, reason: '待突破；满足量价与质量闸门。', factorAnalysis:{score:72-index,available:4,total:7,sectorProfile:{name:index < 7 ? '半导体' : '软件',score:index < 7 ? 74 : 60,label:index < 7 ? '强势板块' : '活跃板块'}}, newsContext: { summary: '消息面中性。' }
       }))
     ],
     recommendationCoverage: { scanned: 5230, prefiltered: 428, analyzed: 60, industries: 42, directoryAvailable: true, riskChecked: 16, riskRejected: 2, riskUnknown: 1, riskUnverifiedIncluded: 1, qualified: 13, signals: { bottomWaiting: 3, rebounded: 18, breakout: 12 } },
@@ -263,6 +282,17 @@ app.whenReady().then(async () => {
     const firstChoiceText = stockChoices[0]?.closest('.market-stock-choice')?.innerText || '';
     const labelsAboveStocks = Boolean(document.getElementById('marketLabelChoices').compareDocumentPosition(document.getElementById('marketStockChoices')) & Node.DOCUMENT_POSITION_FOLLOWING);
     const recommendationTitle = document.getElementById('marketRecommendationListTitle').innerText;
+    const groupNames = [...document.querySelectorAll('#marketStockChoices [data-market-industry-group]')].map(group => group.dataset.marketIndustryGroup);
+    const groupOrders = [...document.querySelectorAll('#marketStockChoices [data-market-industry-group]')].map(group => [...group.querySelectorAll('[data-market-stock-choice]')].map(choice => choice.dataset.marketStockChoice));
+    const hasIndividualIndustryTag = Boolean(document.querySelector('#marketStockChoices .market-industry-tag'));
+    const firstPrice = document.querySelector('#marketStockChoices .market-current-price');
+    const firstHead = document.querySelector('#marketStockChoices .market-stock-head');
+    const firstPriceText = firstPrice?.textContent || '';
+    const firstHeadLayout = firstHead ? { flexWrap:getComputedStyle(firstHead).flexWrap, whiteSpace:getComputedStyle(firstHead).whiteSpace, alignItems:getComputedStyle(firstHead).alignItems, headCenter:firstHead.getBoundingClientRect().top + firstHead.getBoundingClientRect().height / 2, priceCenter:firstPrice.getBoundingClientRect().top + firstPrice.getBoundingClientRect().height / 2 } : {};
+    const stockHeads = [...document.querySelectorAll('#marketStockChoices .market-stock-head')];
+    const allHeadsFit = stockHeads.every(head => head.scrollWidth <= head.clientWidth + 1);
+    const longName = [...document.querySelectorAll('#marketStockChoices .market-stock-name')].find(node => node.textContent === '北方稀土股份');
+    const longNameFullyVisible = Boolean(longName) && longName.scrollWidth <= longName.clientWidth + 1 && getComputedStyle(longName).textOverflow !== 'ellipsis';
     const coloredCount = getComputedStyle(document.querySelector('.market-label-count')).color;
     const initialAll = stockChoices.every(choice => choice.checked);
     document.getElementById('toggleMarketStocks').click();
@@ -277,7 +307,7 @@ app.whenReady().then(async () => {
     document.querySelector('[data-market-recommendation="600200"]').click();
     const breakoutDetailTags = [...document.querySelectorAll('#detailPanel .detail-tags .badge')].map(node => node.textContent.trim());
     document.querySelector('[data-market-recommendation="603567"]').click();
-    return { choiceCount:stockChoices.length, firstChoiceText, labelsAboveStocks, recommendationTitle, coloredCount, initialAll, afterClear, savedCount:label?.stocks?.length || 0, savedScore:savedStock?.score, savedSignalScore:savedStock?.signalScore, savedBreakoutTags:stockTagValues(savedBreakout), breakoutDetailTags, closed:document.getElementById('marketLabelPanel').classList.contains('hidden') };
+    return { choiceCount:stockChoices.length, firstChoiceText, labelsAboveStocks, recommendationTitle, groupNames, groupOrders, hasIndividualIndustryTag, firstPriceText, firstHeadLayout, allHeadsFit, longNameFullyVisible, coloredCount, initialAll, afterClear, savedCount:label?.stocks?.length || 0, savedScore:savedStock?.score, savedSignalScore:savedStock?.signalScore, savedBreakoutTags:stockTagValues(savedBreakout), breakoutDetailTags, closed:document.getElementById('marketLabelPanel').classList.contains('hidden') };
   })()`);
   await win.webContents.executeJavaScript(`
     window.scrollTo(0, document.body.scrollHeight);
@@ -296,14 +326,27 @@ app.whenReady().then(async () => {
   const refreshedLabelText = await win.webContents.executeJavaScript(`document.getElementById('labelStocks').innerText`);
   const refreshedLabelMetrics = await win.webContents.executeJavaScript(`(() => {
     const card = document.querySelector('#labelStocks .label-stock-card');
-    const score = card?.querySelector('.compact-score b');
+    const returns = card?.querySelector('.compact-returns');
+    const ratings = [...(returns?.querySelectorAll('.compact-rating') || [])];
+    const ratingGroup = returns?.querySelector('.compact-rating-group');
+    const changeGroup = returns?.querySelector('.compact-change-group');
     const states = [...(card?.querySelectorAll('.compact-state') || [])];
     return {
       height: card?.getBoundingClientRect().height || 0,
       text: card?.innerText || '',
+      returnText: returns?.innerText || '',
+      ratingTexts: ratings.map(node => node.textContent.trim()),
+      scoreMovedToReturns: !card?.querySelector('.compact-score b') && ratings.length === 2,
+      returnsSingleLine: returns ? returns.scrollWidth <= returns.clientWidth && returns.getBoundingClientRect().height < 20 : false,
+      splitAlignment: ratingGroup && changeGroup ? {
+        ratingLeft:ratingGroup.getBoundingClientRect().left,
+        returnsLeft:returns.getBoundingClientRect().left,
+        changeRight:changeGroup.getBoundingClientRect().right,
+        returnsRight:returns.getBoundingClientRect().right,
+        gap:changeGroup.getBoundingClientRect().left - ratingGroup.getBoundingClientRect().right
+      } : null,
       stateTexts: states.map(node => node.textContent.trim()),
-      stateClasses: states.map(node => node.className),
-      scoreBeforeStates: Boolean(score) && states.every(node => Boolean(score.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING))
+      stateClasses: states.map(node => node.className)
     };
   })()`);
   const favoriteChangeState = await win.webContents.executeJavaScript(`(() => {
@@ -316,11 +359,11 @@ app.whenReady().then(async () => {
     stock.price = 11;
     stock.changePct = -1;
     renderLabels();
-    const before = [...document.querySelector('#labelStocks .compact-returns').children].map(node => ({text:node.textContent.trim(), className:node.className}));
+    const before = [...document.querySelectorAll('#labelStocks .compact-rating, #labelStocks .compact-change-group > span')].map(node => ({text:node.textContent.trim(), className:node.className}));
     applyQuoteData([{code:'603567', name:'珍宝岛', price:12, changePct:2, source:'累计涨跌测试', fetchedAt:'2026-08-13T02:00:00.000Z'}]);
     renderLabels();
     const updatedStock = labels.find(item => item.name === activeLabel).stocks.find(item => item.code === '603567');
-    const after = [...document.querySelector('#labelStocks .compact-returns').children].map(node => ({text:node.textContent.trim(), className:node.className}));
+    const after = [...document.querySelectorAll('#labelStocks .compact-rating, #labelStocks .compact-change-group > span')].map(node => ({text:node.textContent.trim(), className:node.className}));
     const preserved = labelStockSnapshot({...updatedStock, price:15}, updatedStock);
     const independent = labelStockSnapshot({...updatedStock, price:15});
     labels = originalLabels;
@@ -505,6 +548,7 @@ app.whenReady().then(async () => {
       detailScore:score?.querySelector('b')?.textContent || '',
       detailScoreLabel:score?.querySelector('span')?.textContent || '',
       detailText:document.querySelector('[data-history-for="603567"]')?.innerText || '',
+      canslimRows:document.querySelectorAll('[data-history-for="603567"] .framework-table tbody tr').length,
       savedScore:savedStock?.score,
       savedSignalScore:savedStock?.signalScore
     };
@@ -626,8 +670,18 @@ app.whenReady().then(async () => {
     && state.marketBatchLabelState.choiceCount === 13
     && state.marketBatchLabelState.labelsAboveStocks
     && state.marketBatchLabelState.recommendationTitle.includes('13 只')
+    && JSON.stringify(state.marketBatchLabelState.groupNames) === JSON.stringify(['中药','稀土','半导体','软件'])
+    && state.marketBatchLabelState.groupOrders.every(group => new Set(group).size === group.length)
+    && !state.marketBatchLabelState.hasIndividualIndustryTag
+    && state.marketBatchLabelState.firstPriceText === '¥11.08'
+    && state.marketBatchLabelState.firstHeadLayout.flexWrap === 'nowrap'
+    && state.marketBatchLabelState.firstHeadLayout.whiteSpace === 'nowrap'
+    && state.marketBatchLabelState.firstHeadLayout.alignItems === 'center'
+    && Math.abs(state.marketBatchLabelState.firstHeadLayout.headCenter - state.marketBatchLabelState.firstHeadLayout.priceCenter) < 1
+    && state.marketBatchLabelState.allHeadsFit
+    && state.marketBatchLabelState.longNameFullyVisible
     && state.marketBatchLabelState.coloredCount === 'rgb(37, 99, 235)'
-    && /珍宝岛[\s\S]*底部待反弹[\s\S]*消息确认[\s\S]*推荐评分 84/.test(state.marketBatchLabelState.firstChoiceText)
+    && /珍宝岛[\s\S]*底部待反弹[\s\S]*消息确认[\s\S]*¥11\.08[\s\S]*推荐评分 84[\s\S]*多因子 78/.test(state.marketBatchLabelState.firstChoiceText)
     && state.marketBatchLabelState.savedCount === 13
     && state.marketBatchLabelState.savedScore === 84 && state.marketBatchLabelState.savedSignalScore === 84
     && JSON.stringify(state.marketBatchLabelState.savedBreakoutTags) === JSON.stringify(['待突破','消息中性'])
@@ -635,9 +689,16 @@ app.whenReady().then(async () => {
     && state.marketBatchLabelState.closed
     && state.scoreConsistencyState.recommendationCount === 10
     && state.scoreConsistencyState.cardText.includes('推荐评分 84')
+    && state.scoreConsistencyState.cardText.includes('消息确认\n¥11.08')
+    && !state.scoreConsistencyState.cardText.includes('\n中药\n')
+    && state.scoreConsistencyState.cardText.includes('CANSLIM 81 · 6/7维')
     && state.scoreConsistencyState.detailScore === '84'
     && state.scoreConsistencyState.detailScoreLabel === '推荐评分 / 100'
     && state.scoreConsistencyState.detailText.includes('推荐评分84/100')
+    && state.scoreConsistencyState.detailText.includes('CANSLIM 与价值质量分析')
+    && state.scoreConsistencyState.detailText.includes('2026一季报')
+    && state.scoreConsistencyState.detailText.includes('暂不计算DCF或目标价')
+    && state.scoreConsistencyState.canslimRows >= 8
     && !state.scoreConsistencyState.detailText.includes('技术评分76/100')
     && state.scoreConsistencyState.savedScore === 84 && state.scoreConsistencyState.savedSignalScore === 84
     && state.marketColorState.up === 'rgb(220, 38, 38)'
@@ -707,10 +768,10 @@ app.whenReady().then(async () => {
     && state.labelRenameState.sort?.field === 'score'
     && state.labelRenameState.sort?.direction === 'desc'
     && state.labelRenameState.oldSortMissing;
-  const favoriteChangeUsable = JSON.stringify(state.favoriteChangeState.before.map(item => item.text)) === JSON.stringify(['累 +10.00%','今 -1.00%'])
-    && JSON.stringify(state.favoriteChangeState.after.map(item => item.text)) === JSON.stringify(['累 +20.00%','今 +2.00%'])
-    && state.favoriteChangeState.before[0].className === 'up'
-    && state.favoriteChangeState.before[1].className === 'down'
+  const favoriteChangeUsable = JSON.stringify(state.favoriteChangeState.before.map(item => item.text)) === JSON.stringify(['评分 82','CAN 81','累 +10.00%','今 -1.00%'])
+    && JSON.stringify(state.favoriteChangeState.after.map(item => item.text)) === JSON.stringify(['评分 82','CAN 81','累 +20.00%','今 +2.00%'])
+    && state.favoriteChangeState.before[2].className === 'up'
+    && state.favoriteChangeState.before[3].className === 'down'
     && state.favoriteChangeState.baseAfterRefresh === 10
     && state.favoriteChangeState.addedAtAfterRefresh === '2026-08-01T01:00:00.000Z'
     && state.favoriteChangeState.preservedBase === 10
@@ -718,9 +779,14 @@ app.whenReady().then(async () => {
   const labelListUsable = state.refreshedLabelText.includes('评分 82')
     && !state.refreshedLabelMetrics.text.includes('线上搜索')
     && state.refreshedLabelMetrics.height > 0 && state.refreshedLabelMetrics.height < 90
+    && JSON.stringify(state.refreshedLabelMetrics.ratingTexts) === JSON.stringify(['评分 82','CAN 81'])
+    && state.refreshedLabelMetrics.scoreMovedToReturns
+    && state.refreshedLabelMetrics.returnsSingleLine
+    && Math.abs(state.refreshedLabelMetrics.splitAlignment.ratingLeft - state.refreshedLabelMetrics.splitAlignment.returnsLeft) < 1
+    && Math.abs(state.refreshedLabelMetrics.splitAlignment.changeRight - state.refreshedLabelMetrics.splitAlignment.returnsRight) < 1
+    && state.refreshedLabelMetrics.splitAlignment.gap > 10
     && state.refreshedLabelMetrics.stateTexts.length === 3
     && state.refreshedLabelMetrics.stateClasses.every(value => /b-(red|amber|green|blue|purple)/.test(value))
-    && state.refreshedLabelMetrics.scoreBeforeStates
     && state.contextMenuState.visible
     && /置顶|从当前标签删除/.test(state.contextMenuState.actions)
     && state.contextMenuState.pinnedText.includes('置顶')

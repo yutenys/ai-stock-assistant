@@ -24,6 +24,13 @@ Module._load = function(request, parent, isMain) {
 };
 
 const {
+  buildFinancialAnalysis,
+  buildCanslimFromFactors,
+  buildRecommendationFactorContext,
+  evaluateRecommendationFactors,
+  resolveRecommendationIndustry,
+  groupRecommendationsByIndustry,
+  restoreCachedMarketRecommendations,
   evaluateRecommendationRisk,
   assessRecommendationTimingRisk,
   buildFutureRiskProfile,
@@ -32,6 +39,80 @@ const {
   settleWithConcurrency
 } = require('../main.js');
 Module._load = originalLoad;
+
+test('财务序列生成可追溯的CANSLIM成长与价值质量评分', () => {
+  const quarterRows = [{
+    REPORT_DATE_NAME:'2026一季报', EPSJBTZ:32, PARENTNETPROFITTZ:30, TOTALOPERATEREVETZ:18,
+    ROEJQ:18, MGJYXJJE:1.2, LD:2, ZCFZL:35, XSMLL:45, XSJLL:16
+  }];
+  const annualRows = [
+    { REPORT_YEAR:2025, EPSJB:2.4, ROEKCJQ:18, MGJYXJJE:2.1 },
+    { REPORT_YEAR:2024, EPSJB:2.0, ROEKCJQ:17, MGJYXJJE:1.8 },
+    { REPORT_YEAR:2023, EPSJB:1.6, ROEKCJQ:16, MGJYXJJE:1.5 }
+  ];
+  const financial = buildFinancialAnalysis(quarterRows, annualRows);
+  assert.ok(financial.current.score >= 85);
+  assert.ok(financial.annual.score >= 80);
+  assert.equal(financial.quality.available, true);
+  assert.equal(financial.hardRisks.length, 0);
+  const canslim = buildCanslimFromFactors({ factors:[
+    { key:'currentEarnings', available:true, score:financial.current.score, evidence:financial.current.evidence },
+    { key:'annualEarnings', available:true, score:financial.annual.score, evidence:financial.annual.evidence },
+    { key:'catalyst', available:false, score:null, evidence:'消息不足' },
+    { key:'supplyDemand', available:true, score:80, evidence:'温和放量' },
+    { key:'leadership', available:true, score:75, evidence:'相对强度靠前' },
+    { key:'institution', available:false, score:null, evidence:'机构数据不足' },
+    { key:'market', available:true, score:70, evidence:'大盘企稳' }
+  ]});
+  assert.equal(canslim.available, 5);
+  assert.equal(canslim.total, 7);
+  assert.ok(canslim.score >= 75);
+});
+
+test('财务恶化形成硬风险且不会被缺失值伪装为低估', () => {
+  const financial = buildFinancialAnalysis([{
+    REPORT_DATE_NAME:'2026一季报', EPSJBTZ:-55, PARENTNETPROFITTZ:-60, TOTALOPERATEREVETZ:-25,
+    ROEJQ:-4, MGJYXJJE:-.5, LD:null, ZCFZL:72, XSMLL:10, XSJLL:-8
+  }], [{ REPORT_YEAR:2025, EPSJB:-.4, ROEKCJQ:-5, MGJYXJJE:-.2 }, { REPORT_YEAR:2024, EPSJB:.2, ROEKCJQ:3, MGJYXJJE:.1 }]);
+  assert.ok(financial.hardRisks.length >= 3);
+  assert.ok(financial.score < 45);
+  assert.ok(financial.quality.checks.find(item => item.label === '流动比率' && !item.available));
+});
+
+test('大盘推荐多因子只使用可验证数据并按板块聚合', () => {
+  const rows = [
+    { code:'600001', industry:'半导体', price:10, changePct:3, amount:1.2e9, turnoverRate:4, peRatio:30, pbRatio:4, analysis:{ volumeRatio:1.8 } },
+    { code:'600002', industry:'半导体', price:12, changePct:1, amount:5e8, turnoverRate:3, peRatio:45, pbRatio:5, analysis:{ volumeRatio:1.2 } },
+    { code:'600003', industry:'医药', price:8, changePct:-2, amount:1e8, turnoverRate:2, peRatio:null, pbRatio:null, analysis:{ volumeRatio:.7 } }
+  ];
+  const context = buildRecommendationFactorContext(rows);
+  const factors = evaluateRecommendationFactors(rows[0], context, {
+    signal:'偏积极', summary:'近期有可核验创新订单消息。', items:[{ title:'创新订单' }]
+  });
+  assert.equal(factors.available, 5);
+  assert.equal(factors.total, 9);
+  assert.ok(Number.isFinite(factors.score));
+  assert.equal(factors.sectorProfile.name, '半导体');
+  assert.ok(factors.factors.find(item => item.key === 'currentEarnings' && !item.available));
+  assert.ok(factors.factors.find(item => item.key === 'annualEarnings' && !item.available));
+  assert.ok(factors.factors.find(item => item.key === 'institution' && !item.available));
+
+  const missingValuation = evaluateRecommendationFactors(rows[2], context, { signal:'中性', summary:'', items:[] });
+  assert.ok(missingValuation.factors.find(item => item.key === 'valuation' && !item.available));
+  assert.ok(missingValuation.factors.find(item => item.key === 'catalyst' && !item.available));
+  assert.equal(missingValuation.available, 3);
+
+  const grouped = groupRecommendationsByIndustry([
+    { code:'1', industry:'医药', signalScore:80, factorAnalysis:{ sectorProfile:{ score:50 } } },
+    { code:'2', industry:'半导体', signalScore:78, factorAnalysis:{ sectorProfile:{ score:80 } } },
+    { code:'3', signalScore:82, factorAnalysis:{ sectorProfile:{ name:'半导体', score:80 } } }
+  ]);
+  assert.deepEqual(grouped.map(item => item.code), ['3','2','1']);
+  assert.deepEqual(grouped.map(item => item.industry), ['半导体','半导体','医药']);
+  assert.equal(resolveRecommendationIndustry({ code:'4', factorAnalysis:{ sectorProfile:{ name:'电力设备' } } }), '电力设备');
+  assert.equal(resolveRecommendationIndustry({ code:'5', sector:'中药' }), '中药');
+  assert.equal(resolveRecommendationIndustry({ code:'6', industry:'行业待确认' }, new Map([['6',{industry:'白酒'}]])), '白酒');
+});
 
 test('大盘推荐仅在解禁接口网络失败时降分保留未确认候选', () => {
   const item = { code: '600001', score: 80, signalScore: 80, reason: '待突破。' };
@@ -53,6 +134,27 @@ test('大盘推荐仅在解禁接口网络失败时降分保留未确认候选',
     status: 'unknown', summary: '减持计划数据未确认',
     st: { status: 'clear' }, reduction: { status: 'unknown' }, unlock: { status: 'unknown' }, errors: []
   }).status, 'unknown');
+});
+
+test('本轮大盘推荐为空时保留最近成功推荐并刷新行情', () => {
+  const result = { recommendations: [], recommendationCoverage: { scanned: 5892 } };
+  const cached = {
+    fetchedAt: '2026-08-13T08:00:00.000Z',
+    recommendations: [{ code:'600001', name:'测试股', signal:'待突破', price:10, factorAnalysis:{sectorProfile:{name:'半导体'}} }],
+    recommendationCoverage: { scanned:5892, prefiltered:400, analyzed:60, industries:40, qualified:1 }
+  };
+  const restored = restoreCachedMarketRecommendations(result, cached, [{ code:'600001', price:10.8, changePct:2.5, amount:1e8 }]);
+  assert.equal(restored, true);
+  assert.equal(result.recommendations.length, 1);
+  assert.equal(result.recommendations[0].industry, '半导体');
+  assert.equal(result.recommendations[0].price, 10.8);
+  assert.equal(result.recommendationCoverage.cachedFallback, true);
+  assert.equal(result.recommendationCoverage.qualified, 1);
+  assert.deepEqual(result.recommendationCoverage.signals, { bottomWaiting:0, rebounded:0, breakout:1 });
+
+  const fresh = { recommendations:[{code:'600002'}] };
+  assert.equal(restoreCachedMarketRecommendations(fresh, cached, []), false);
+  assert.deepEqual(fresh.recommendations, [{code:'600002'}]);
 });
 
 test('command input uses a focus-hidden recommendation prompt', () => {
@@ -250,6 +352,10 @@ test('近三个月行情返回技术分析和观察窗口', { timeout: 30000 }, 
   assert.ok(result.analysis.latestTradeDate);
   assert.ok(result.analysis.analyzedAt);
   assert.ok(result.newsContext);
+  assert.ok(result.financialAnalysis?.latestReport);
+  assert.equal(result.investmentAnalysis?.canslim?.total, 7);
+  assert.ok(result.investmentAnalysis?.canslim?.available >= 4);
+  assert.match(result.investmentAnalysis?.value?.dcf?.evidence || '', /暂不计算DCF|缺少/);
   const stop = Number((result.analysis.exit.match(/有效跌破([\d.]+)元/) || [])[1]);
   assert.ok(stop >= result.analysis.ma20 * 0.95 && stop < result.history.at(-1).close);
 });
@@ -292,6 +398,9 @@ test('大盘分析返回指数、轮动、资金和涨跌停结构', { timeout: 
   assert.ok(result.recommendations.every(item => ['底部待反弹', '已反弹', '待突破'].includes(item.signal)));
   assert.ok(result.recommendations.every(item => ['消息确认', '消息中性', '消息谨慎'].includes(item.newsLabel)));
   assert.ok(result.recommendations.every(item => Number.isFinite(item.signalScore) && item.reason.includes(item.signal)));
+  assert.ok(result.recommendations.every(item => item.industry && item.industry !== '行业待确认'));
+  assert.ok(result.recommendations.every(item => item.canslim?.total === 7 && item.canslim.available >= 4));
+  assert.ok(result.recommendations.every(item => item.financialAnalysis?.source === '东方财富F10主要指标'));
   assert.equal(result.recommendations.length, result.recommendationCoverage.qualified);
   const finalSignalCounts = result.recommendations.reduce((counts, item) => {
     if (item.signal === '底部待反弹') counts.bottomWaiting += 1;

@@ -153,6 +153,47 @@ function marketRow(item, value, detail=''){
   return `<div class="market-row"><b>${escapeHtml(item.name || '--')}</b><span class="${pctClass(item.changePct)}">${escapeHtml(value)}${detail ? ` · ${escapeHtml(detail)}` : ''}</span></div>`;
 }
 
+function recommendationIndustry(item){
+  const candidates = [item?.industry, item?.factorAnalysis?.sectorProfile?.name, item?.sector];
+  return candidates.map(value => String(value || '').trim()).find(value => value && !['行业待确认','未分类','线上搜索','-','--'].includes(value)) || '行业待确认';
+}
+
+function recommendationFactorText(item){
+  const factors = item?.factorAnalysis;
+  if(!factors || !Number.isFinite(Number(factors.score))) return '多因子数据不足';
+  return `多因子 ${Math.round(Number(factors.score))} · ${Number(factors.available) || 0}/${Number(factors.total) || 0}项`;
+}
+
+function recommendationCanslimText(item){
+  const model = item?.canslim;
+  if(!model || !Number.isFinite(Number(model.score))) return 'CANSLIM待补充';
+  return `CANSLIM ${Math.round(Number(model.score))} · ${Number(model.available) || 0}/${Number(model.total) || 7}维`;
+}
+
+function recommendationCardHtml(item, selectable=false){
+  const industry = recommendationIndustry(item);
+  const sectorLabel = item.factorAnalysis?.sectorProfile?.label || '板块待确认';
+  const content = `<span class="market-stock-content"><b class="market-stock-head"><span class="market-stock-name">${escapeHtml(item.name)}</span><span class="code">${escapeHtml(item.code)}</span><span class="market-signal ${badgeClass(item.signal)}">${escapeHtml(item.signal || '待突破')}</span><span class="market-signal ${badgeClass(item.newsLabel)}">${escapeHtml(item.newsLabel || '消息中性')}</span><span class="market-current-price">${yuan(item.price)}</span></b>
+    <span>${escapeHtml(sectorLabel)} · ${escapeHtml(item.verdict || '等待确认')} · 推荐评分 ${escapeHtml(item.signalScore ?? item.score)} · ${escapeHtml(recommendationCanslimText(item))} · ${escapeHtml(recommendationFactorText(item))} · MA30 ${yuan(item.ma30)} · 突破价 ${yuan(item.breakoutPrice)}</span>
+    <small>${escapeHtml(item.reason || '')}</small></span>`;
+  if(selectable) return `<label class="market-recommendation market-stock-choice" data-market-industry="${escapeHtml(industry)}"><input type="checkbox" data-market-stock-choice="${escapeHtml(item.code)}" checked />${content}</label>`;
+  return `<button class="market-recommendation" data-market-recommendation="${escapeHtml(item.code)}" data-market-industry="${escapeHtml(industry)}">${content}</button>`;
+}
+
+function groupedRecommendationHtml(items, selectable=false){
+  const groups = new Map();
+  (items || []).forEach(item => {
+    const industry = recommendationIndustry(item);
+    if(!groups.has(industry)) groups.set(industry, []);
+    groups.get(industry).push(item);
+  });
+  return [...groups.entries()].map(([industry, group]) => {
+    const profile = group.find(item => item.factorAnalysis?.sectorProfile)?.factorAnalysis?.sectorProfile;
+    const meta = profile ? `${profile.label} · 板块评分 ${profile.score} · ${group.length}只` : `${group.length}只`;
+    return `<section class="market-industry-group" data-market-industry-group="${escapeHtml(industry)}"><div class="market-industry-head"><b>${escapeHtml(industry)}</b><span>${escapeHtml(meta)}</span></div>${group.map(item => recommendationCardHtml(item, selectable)).join('')}</section>`;
+  }).join('');
+}
+
 function renderMarketOverview(result){
   latestMarketOverview = result;
   $('marketAnalysis').textContent = result.analysis || '市场分析暂不可用。';
@@ -182,6 +223,7 @@ function renderMarketOverview(result){
   const recommendations = result.recommendations || [];
   latestMarketRecommendations = recommendations;
   const coverage = result.recommendationCoverage || {};
+  const fallbackNote = coverage.cachedFallback ? `；沿用${coverage.cachedAt ? new Date(coverage.cachedAt).toLocaleString('zh-CN', {hour12:false}) : '最近一次'}成功推荐` : '';
   const signals = recommendations.reduce((counts, item) => {
     if(item.signal === '底部待反弹') counts.bottomWaiting += 1;
     else if(item.signal === '已反弹') counts.rebounded += 1;
@@ -192,14 +234,10 @@ function renderMarketOverview(result){
     ? `；未来半年风险核验 ${coverage.riskChecked} 只，排除 ${coverage.riskRejected || 0} 只，未确认 ${coverage.riskUnknown || 0} 只${coverage.riskUnverifiedIncluded ? `（降分保留 ${coverage.riskUnverifiedIncluded} 只）` : ''}`
     : '';
   $('marketRecommendationCoverage').textContent = coverage.scanned
-    ? `全市场扫描 ${coverage.scanned} 只，初筛 ${coverage.prefiltered || 0} 只，历史精筛 ${coverage.analyzed || 0} 只，覆盖 ${coverage.industries || 0} 个行业${riskCoverage}；实际推荐 ${recommendations.length} 只（待反弹 ${signals.bottomWaiting}，已反弹 ${signals.rebounded}，待突破 ${signals.breakout}）`
+    ? `全市场扫描 ${coverage.scanned} 只，初筛 ${coverage.prefiltered || 0} 只，历史精筛 ${coverage.analyzed || 0} 只，覆盖 ${coverage.industries || 0} 个行业${riskCoverage}；实际推荐 ${recommendations.length} 只（待反弹 ${signals.bottomWaiting}，已反弹 ${signals.rebounded}，待突破 ${signals.breakout}）${fallbackNote}`
     : '等待全市场扫描';
   const visibleRecommendations = recommendations.slice(0, 10);
-  $('marketRecommendations').innerHTML = visibleRecommendations.length ? visibleRecommendations.map(item => `<button class="market-recommendation" data-market-recommendation="${escapeHtml(item.code)}">
-    <b>${escapeHtml(item.name)} <span class="code">${escapeHtml(item.code)}</span><span class="market-signal ${badgeClass(item.signal)}">${escapeHtml(item.signal || '待突破')}</span><span class="market-signal ${badgeClass(item.newsLabel)}">${escapeHtml(item.newsLabel || '消息中性')}</span></b>
-    <span>${escapeHtml(item.industry || '行业待确认')} · ${escapeHtml(item.verdict)} · 推荐评分 ${escapeHtml(item.signalScore ?? item.score)} · MA30 ${yuan(item.ma30)} · 突破价 ${yuan(item.breakoutPrice)}</span>
-    <small>${escapeHtml(item.reason)}</small>
-  </button>`).join('') : '<div class="market-row"><span>当前未筛出满足条件的候选</span></div>';
+  $('marketRecommendations').innerHTML = visibleRecommendations.length ? groupedRecommendationHtml(visibleRecommendations) : '<div class="market-row"><span>当前未筛出满足条件的候选</span></div>';
   $('addMarketRecommendations').textContent = `查看更多（${recommendations.length}）`;
   const marketNews = result.newsContext?.items || [];
   $('marketNews').innerHTML = `<div class="market-stocks">${escapeHtml(result.newsContext?.summary || '消息面暂不可用')}</div>${marketNews.slice(0, 5).map(item => `<a class="market-news-row" href="#" data-market-news-link="${escapeHtml(safeHttpUrl(item.link))}">${escapeHtml(item.title)}<span>${escapeHtml(item.source || '')} · ${escapeHtml(item.publishedAt || '')}</span></a>`).join('')}`;
@@ -311,12 +349,7 @@ function openMarketLabelPanel(){
   $('marketLabelPanel').classList.remove('hidden');
   $('newMarketLabelName').value = '';
   $('marketRecommendationListTitle').innerHTML = `推荐股票 <em>${latestMarketRecommendations.length} 只</em>`;
-  $('marketStockChoices').innerHTML = latestMarketRecommendations.map(item => `<label class="market-recommendation market-stock-choice">
-    <input type="checkbox" data-market-stock-choice="${escapeHtml(item.code)}" checked />
-    <span class="market-stock-content"><b>${escapeHtml(item.name)} <span class="code">${escapeHtml(item.code)}</span><span class="market-signal ${badgeClass(item.signal)}">${escapeHtml(item.signal || '待突破')}</span><span class="market-signal ${badgeClass(item.newsLabel)}">${escapeHtml(item.newsLabel || '消息中性')}</span></b>
-      <span>${escapeHtml(item.industry || '行业待确认')} · ${escapeHtml(item.verdict || '等待确认')} · 推荐评分 ${escapeHtml(item.signalScore ?? item.score)} · MA30 ${yuan(item.ma30)} · 突破价 ${yuan(item.breakoutPrice)}</span>
-      <small>${escapeHtml(item.reason || '')}</small></span>
-  </label>`).join('');
+  $('marketStockChoices').innerHTML = groupedRecommendationHtml(latestMarketRecommendations, true);
   $('marketLabelChoices').innerHTML = labels.length ? labels.map(label => `<label class="label-choice">
     <input type="checkbox" data-market-target-label="${escapeHtml(label.name)}" />
     <span>${escapeHtml(label.name)}<small class="market-label-count">${label.stocks.length}只</small></span>
@@ -515,6 +548,7 @@ function applyAnalysisClassification(code){
     ...stock,
     technicalScore: analysis.score,
     score: Number.isFinite(Number(stock.signalScore)) ? Number(stock.signalScore) : analysis.score,
+    canslim: historyResult?.investmentAnalysis?.canslim || stock.canslim,
     status: updateStatusByQuote(stock),
     focus: stock.marketSignal && stock.newsLabel ? stock.newsLabel : analysis.score >= 72 ? '重点关注' : analysis.score >= 55 ? '趋势关注' : '观察关注'
   } : stock;
@@ -585,6 +619,13 @@ function stockAnalysisScore(s){
   return Number.isFinite(Number(s.score)) ? Number(s.score) : (detailHistoryCache.get(s.code)?.analysis?.score ?? null);
 }
 
+function stockCanslimScore(s){
+  const saved = s?.canslim?.score;
+  if(saved !== null && saved !== '' && Number.isFinite(Number(saved))) return Math.round(Number(saved));
+  const analyzed = detailHistoryCache.get(s.code)?.investmentAnalysis?.canslim?.score;
+  return analyzed !== null && analyzed !== '' && Number.isFinite(Number(analyzed)) ? Math.round(Number(analyzed)) : null;
+}
+
 function scoreBadge(s){
   const score = stockAnalysisScore(s);
   return `${s.pinned ? '<span class="badge pinned-badge">置顶</span>' : ''}<span class="badge score-badge">评分 ${score == null ? '待分析' : escapeHtml(score)}</span>`;
@@ -601,15 +642,17 @@ function stockCard(s, compact=false, showCheck=true){
   const labelHtml = compact ? '' : stockLabelHtml(s);
   if(compact){
     const score = stockAnalysisScore(s);
+    const canslimScore = stockCanslimScore(s);
     const cumulativeChange = favoriteChangePct(s);
     return `<article class="stock-card compact-card label-stock-card ${s.pinned ? 'pinned-stock-card' : ''}" data-detail-code="${s.code}">
       <div class="stock-top">
         <div class="compact-stock-main">
           <div class="stock-title">${checkHtml}<h3>${escapeHtml(s.name)}</h3><span class="code">${s.code}</span></div>
         </div>
-        <div class="price">${yuan(s.price)}<div class="compact-returns"><span class="${cumulativeChange == null ? 'neutral' : pctClass(cumulativeChange)}" title="从加入当前标签时开始计算">累 ${formatPct(cumulativeChange)}</span><span class="${pctClass(s.changePct)}">今 ${formatPct(s.changePct)}</span></div></div>
+        <div class="price">${yuan(s.price)}</div>
       </div>
-      <div class="compact-score">${s.pinned ? '<span class="compact-pinned">置顶</span>' : ''}<b>评分 ${score == null ? '待分析' : escapeHtml(score)}</b>${stockTagsHtml(s, 'compact-state')}</div>
+      <div class="compact-returns"><span class="compact-rating-group"><span class="compact-rating">评分 ${score == null ? '--' : escapeHtml(score)}</span><span class="compact-rating">CAN ${canslimScore == null ? '--' : escapeHtml(canslimScore)}</span></span><span class="compact-change-group"><span class="${cumulativeChange == null ? 'neutral' : pctClass(cumulativeChange)}" title="从加入当前标签时开始计算">累 ${formatPct(cumulativeChange)}</span><span class="${pctClass(s.changePct)}">今 ${formatPct(s.changePct)}</span></span></div>
+      <div class="compact-score">${s.pinned ? '<span class="compact-pinned">置顶</span>' : ''}${stockTagsHtml(s, 'compact-state')}</div>
     </article>`;
   }
   return `<article class="stock-card ${compact ? 'compact-card label-stock-card' : ''}" data-detail-code="${s.code}">
@@ -1187,6 +1230,30 @@ function stockMarketContext(s){
   return `${indexText}；上涨${breadth.up ?? '--'}家、下跌${breadth.down ?? '--'}家。个股${relative}；板块表现：${sectorText}；${signalText}。市场消息：${marketNews}。大盘更新时间：${updatedAt}。`;
 }
 
+function investmentAnalysisHtml(result){
+  const investment = result?.investmentAnalysis;
+  const financial = result?.financialAnalysis;
+  if(!investment && !financial) return '<div class="note inline-note">财务与 CANSLIM 数据源不可用，本次仅展示技术分析，不补造财务评分。</div>';
+  const canslim = investment?.canslim;
+  const dimensions = canslim?.dimensions || [];
+  const dimensionRows = dimensions.map(item => `<tr><td><b>${escapeHtml(item.key)} · ${escapeHtml(item.label)}</b></td><td>${item.available ? `${escapeHtml(item.score)}/${escapeHtml(item.max)}` : '数据不足'}</td><td>${escapeHtml(item.evidence || '--')}</td></tr>`).join('');
+  const value = investment?.value || {};
+  const quality = value.quality || financial?.quality || {};
+  const financialRows = (financial?.rows || []).map(row => `<tr><td>${escapeHtml(row.report || '--')}</td><td>${row.eps == null ? '--' : formatNumber(row.eps,2)}</td><td>${row.epsGrowth == null ? '--' : formatPct(row.epsGrowth)}</td><td>${row.revenueGrowth == null ? '--' : formatPct(row.revenueGrowth)}</td><td>${row.profitGrowth == null ? '--' : formatPct(row.profitGrowth)}</td><td>${row.roe == null ? '--' : formatPct(row.roe)}</td><td>${row.cashPerShare == null ? '--' : formatNumber(row.cashPerShare,2)}</td></tr>`).join('');
+  const risks = financial?.hardRisks || [];
+  return `<section class="investment-framework">
+    <h3>CANSLIM 与价值质量分析</h3>
+    <div class="analysis-verdict"><div class="analysis-score"><b>${escapeHtml(canslim?.score ?? '--')}</b><span>CANSLIM / 100</span></div><div><p><b>可验证覆盖：</b>${escapeHtml(canslim?.available ?? 0)}/${escapeHtml(canslim?.total ?? 7)}维，原始得分 ${escapeHtml(canslim?.rawScore ?? '--')}/${escapeHtml(canslim?.availableMax ?? '--')}。</p><p>${escapeHtml(canslim?.note || '缺失项不推测。')}</p></div></div>
+    <div class="framework-table-wrap"><table class="framework-table"><thead><tr><th>维度</th><th>得分</th><th>真实数据依据</th></tr></thead><tbody>${dimensionRows || '<tr><td colspan="3">CANSLIM数据不足</td></tr>'}</tbody></table></div>
+    <div class="value-summary"><p><b>价值综合分：</b>${escapeHtml(value.score ?? '--')}/100；<b>财务质量：</b>${escapeHtml(quality.score ?? '--')}/100；<b>估值分：</b>${escapeHtml(value.valuationScore ?? '--')}/100。</p>
+      <p><b>PE / PB：</b>${value.pe == null ? '--' : formatNumber(value.pe,1)} / ${value.pb == null ? '--' : formatNumber(value.pb,1)}；<b>质量依据：</b>${escapeHtml(quality.evidence || '数据不可用')}。</p>
+      <p><b>DCF：</b>${escapeHtml(value.dcf?.evidence || '数据不可用')}。</p><p><b>护城河：</b>${escapeHtml(value.moat?.evidence || '数据不可用')}。</p>
+      ${risks.length ? `<p class="financial-risk"><b>财务红旗：</b>${risks.map(escapeHtml).join('；')}。</p>` : '<p><b>财务红旗：</b>当前已获取指标未触发硬性恶化条件；仍不等于财务无风险。</p>'}
+      <p><b>数据源：</b>${escapeHtml(financial?.source || value.source || '--')}；<b>最新报告期：</b>${escapeHtml(financial?.latestReport || '--')}。</p></div>
+    <div class="framework-table-wrap"><table class="framework-table financial-table"><thead><tr><th>报告期</th><th>EPS</th><th>EPS同比</th><th>营收同比</th><th>净利同比</th><th>ROE</th><th>经营现金流/股</th></tr></thead><tbody>${financialRows || '<tr><td colspan="7">季度财务序列不可用</td></tr>'}</tbody></table></div>
+  </section>`;
+}
+
 function renderHistoryAnalysis(s, result){
   const box = document.querySelector(`[data-history-for="${s.code}"]`);
   const analysisBox = document.querySelector(`[data-analysis-for="${s.code}"]`);
@@ -1250,6 +1317,7 @@ function renderHistoryAnalysis(s, result){
       ${corporateRiskHtml}
       <p class="market-context"><b>大盘与消息联动：</b>${escapeHtml(marketContext)}</p>
     </div>
+    ${investmentAnalysisHtml(result)}
     ${tradePlanHtml}
     <p><b>预计观察窗口：</b>${escapeHtml(a.entryWindow)} <b>持仓观察：</b>${escapeHtml(a.exitWindow)}</p>
     <p><b>历史数据源：</b>${escapeHtml(a.source || result.source || '--')}；<b>最新交易日：</b>${escapeHtml(a.latestTradeDate || result.latestTradeDate || '--')}；<b>分析时间：</b>${a.analyzedAt ? escapeHtml(new Date(a.analyzedAt).toLocaleString('zh-CN', {hour12:false})) : '--'}</p>
