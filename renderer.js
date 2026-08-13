@@ -189,7 +189,7 @@ function renderMarketOverview(result){
     return counts;
   }, {bottomWaiting:0, rebounded:0, breakout:0});
   const riskCoverage = Number.isFinite(Number(coverage.riskChecked))
-    ? `；未来半年风险核验 ${coverage.riskChecked} 只，排除 ${coverage.riskRejected || 0} 只，未确认 ${coverage.riskUnknown || 0} 只`
+    ? `；未来半年风险核验 ${coverage.riskChecked} 只，排除 ${coverage.riskRejected || 0} 只，未确认 ${coverage.riskUnknown || 0} 只${coverage.riskUnverifiedIncluded ? `（降分保留 ${coverage.riskUnverifiedIncluded} 只）` : ''}`
     : '';
   $('marketRecommendationCoverage').textContent = coverage.scanned
     ? `全市场扫描 ${coverage.scanned} 只，初筛 ${coverage.prefiltered || 0} 只，历史精筛 ${coverage.analyzed || 0} 只，覆盖 ${coverage.industries || 0} 个行业${riskCoverage}；实际推荐 ${recommendations.length} 只（待反弹 ${signals.bottomWaiting}，已反弹 ${signals.rebounded}，待突破 ${signals.breakout}）`

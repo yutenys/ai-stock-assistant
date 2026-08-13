@@ -1089,6 +1089,33 @@ function assessBreakoutQuality(item) {
   return { score: Math.max(0, Math.min(100, Math.round(score))), passed: score >= 65, reasons };
 }
 
+function evaluateRecommendationRisk(item, riskProfile) {
+  if (riskProfile.status === 'risk') return { status: 'rejected', item: null };
+  if (riskProfile.status === 'clear') {
+    return {
+      status: 'approved',
+      item: { ...item, riskProfile, reason: `${item.reason} ${riskProfile.summary}。` }
+    };
+  }
+  const unlockQueryFailed = riskProfile.st?.status === 'clear'
+    && riskProfile.reduction?.status === 'clear'
+    && riskProfile.unlock?.status === 'unknown'
+    && (riskProfile.errors || []).some(error => String(error).startsWith('限售解禁查询失败'));
+  if (!unlockQueryFailed) return { status: 'unknown', item: null };
+  const signalScore = Math.max(0, Number(item.signalScore || item.score || 0) - 8);
+  return {
+    status: 'unverified',
+    item: {
+      ...item,
+      score: signalScore,
+      signalScore,
+      riskProfile,
+      riskUnverified: true,
+      reason: `${item.reason} ${riskProfile.summary}（查询接口暂不可用，已降分保留）。`
+    }
+  };
+}
+
 async function fetchEastmoneyNews(keyword, cacheKey = keyword, maxAgeMs = 10 * 60 * 1000) {
   const cached = readTimedCache(marketNewsCache, `eastmoney-${cacheKey}`, maxAgeMs);
   if (cached) return cached;
@@ -1258,6 +1285,7 @@ async function buildMarketRecommendations(marketQuotes, force = false) {
   }));
   let riskRejected = 0;
   let riskUnknown = 0;
+  let riskUnverifiedIncluded = 0;
   const riskApprovedRecommendations = [];
   riskResults.forEach((result, index) => {
     if (result.status === 'rejected') {
@@ -1265,16 +1293,11 @@ async function buildMarketRecommendations(marketQuotes, force = false) {
       return;
     }
     const riskProfile = result.value;
-    if (!riskProfile.passed) {
-      if (riskProfile.status === 'risk') riskRejected++;
-      else riskUnknown++;
-      return;
-    }
-    riskApprovedRecommendations.push({
-      ...qualityRecommendations[index],
-      riskProfile,
-      reason: `${qualityRecommendations[index].reason} ${riskProfile.summary}。`
-    });
+    const decision = evaluateRecommendationRisk(qualityRecommendations[index], riskProfile);
+    if (decision.status === 'rejected') riskRejected++;
+    if (decision.status === 'unknown' || decision.status === 'unverified') riskUnknown++;
+    if (decision.status === 'unverified') riskUnverifiedIncluded++;
+    if (decision.item) riskApprovedRecommendations.push(decision.item);
   });
   const recommendationGroups = Object.fromEntries(['待突破', '已反弹', '底部待反弹'].map(signal => [
     signal, riskApprovedRecommendations.filter(item => item.signal === signal).sort((a, b) => b.signalScore - a.signalScore)
@@ -1311,6 +1334,7 @@ async function buildMarketRecommendations(marketQuotes, force = false) {
       riskChecked: qualityRecommendations.length,
       riskRejected,
       riskUnknown,
+      riskUnverifiedIncluded,
       qualified: balancedRecommendations.length
     }
   };
@@ -3025,6 +3049,7 @@ app.on('window-all-closed', () => {
 });
 
 module.exports = {
+  evaluateRecommendationRisk,
   assessRecommendationTimingRisk,
   buildFutureRiskProfile,
   mergeQuoteIntoHistory,

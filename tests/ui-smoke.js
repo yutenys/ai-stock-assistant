@@ -129,7 +129,7 @@ app.whenReady().then(async () => {
         supportPrice: 10.20, ma30: 11.42, reason: '待突破；满足量价与质量闸门。', newsContext: { summary: '消息面中性。' }
       }))
     ],
-    recommendationCoverage: { scanned: 5230, prefiltered: 428, analyzed: 60, industries: 42, directoryAvailable: true, riskChecked: 16, riskRejected: 2, riskUnknown: 1, qualified: 13, signals: { bottomWaiting: 3, rebounded: 18, breakout: 12 } },
+    recommendationCoverage: { scanned: 5230, prefiltered: 428, analyzed: 60, industries: 42, directoryAvailable: true, riskChecked: 16, riskRejected: 2, riskUnknown: 1, riskUnverifiedIncluded: 1, qualified: 13, signals: { bottomWaiting: 3, rebounded: 18, breakout: 12 } },
     newsContext: { signal: '偏积极', summary: '政策与行业消息偏积极，仍需结合盘面确认。', items: [{ title: '中药行业最新政策消息', link: 'https://example.com/market-news', publishedAt: '2026-08-12 11:00:00', source: '测试资讯' }] },
     analysis: '三大指数多数上涨，市场情绪偏强；资金集中于半导体、中药。',
     source: '腾讯指数 + 东方财富市场统计',
@@ -621,7 +621,7 @@ app.whenReady().then(async () => {
     && state.detailClickQuoteState.savedChangePct === -0.72;
   const marketUsable = /上证指数|深证成指|创业板指/.test(state.marketText)
     && /板块轮动|半导体|资金|涨停 68|跌停 7|技术形态推荐|一键添加|底部待反弹|已反弹|消息确认|消息面偏积极/.test(state.marketText)
-    && state.marketText.includes('未来半年风险核验 16 只，排除 2 只，未确认 1 只')
+    && state.marketText.includes('未来半年风险核验 16 只，排除 2 只，未确认 1 只（降分保留 1 只）')
     && state.marketBatchLabelState.initialAll && state.marketBatchLabelState.afterClear
     && state.marketBatchLabelState.choiceCount === 13
     && state.marketBatchLabelState.labelsAboveStocks

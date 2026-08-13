@@ -24,6 +24,7 @@ Module._load = function(request, parent, isMain) {
 };
 
 const {
+  evaluateRecommendationRisk,
   assessRecommendationTimingRisk,
   buildFutureRiskProfile,
   mergeQuoteIntoHistory,
@@ -31,6 +32,28 @@ const {
   settleWithConcurrency
 } = require('../main.js');
 Module._load = originalLoad;
+
+test('大盘推荐仅在解禁接口网络失败时降分保留未确认候选', () => {
+  const item = { code: '600001', score: 80, signalScore: 80, reason: '待突破。' };
+  const unverified = evaluateRecommendationRisk(item, {
+    status: 'unknown', summary: '限售解禁数据未确认',
+    st: { status: 'clear' }, reduction: { status: 'clear' }, unlock: { status: 'unknown' },
+    errors: ['限售解禁查询失败：read ECONNRESET']
+  });
+  assert.equal(unverified.status, 'unverified');
+  assert.equal(unverified.item.signalScore, 72);
+  assert.equal(unverified.item.riskUnverified, true);
+  assert.match(unverified.item.reason, /限售解禁数据未确认/);
+
+  assert.equal(evaluateRecommendationRisk(item, {
+    status: 'risk', summary: '未来半年存在减持计划',
+    st: { status: 'clear' }, reduction: { status: 'risk' }, unlock: { status: 'clear' }, errors: []
+  }).status, 'rejected');
+  assert.equal(evaluateRecommendationRisk(item, {
+    status: 'unknown', summary: '减持计划数据未确认',
+    st: { status: 'clear' }, reduction: { status: 'unknown' }, unlock: { status: 'unknown' }, errors: []
+  }).status, 'unknown');
+});
 
 test('command input uses a focus-hidden recommendation prompt', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
