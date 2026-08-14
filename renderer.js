@@ -181,7 +181,8 @@ function recommendationCanslimText(item){
 function recommendationCardHtml(item, selectable=false){
   const industry = recommendationIndustry(item);
   const sectorLabel = item.factorAnalysis?.sectorProfile?.label || '板块待确认';
-  const content = `<span class="market-stock-content"><b class="market-stock-head"><span class="market-stock-name">${escapeHtml(item.name)}</span><span class="code">${escapeHtml(item.code)}</span><span class="market-signal ${badgeClass(item.signal)}">${escapeHtml(item.signal || '待突破')}</span><span class="market-signal ${badgeClass(item.newsLabel)}">${escapeHtml(item.newsLabel || '消息中性')}</span><span class="market-current-price">${yuan(item.price)}</span></b>
+  const changeClass = Number.isFinite(item.changePct) ? pctClass(item.changePct) : 'neutral';
+  const content = `<span class="market-stock-content"><b class="market-stock-head"><span class="market-stock-name">${escapeHtml(item.name)}</span><span class="code">${escapeHtml(item.code)}</span><span class="market-signal ${badgeClass(item.signal)}">${escapeHtml(item.signal || '待突破')}</span><span class="market-signal ${badgeClass(item.newsLabel)}">${escapeHtml(item.newsLabel || '消息中性')}</span><span class="market-current-price">${yuan(item.price)}</span><span class="market-current-change ${changeClass}">${formatPct(item.changePct)}</span></b>
     <span>${escapeHtml(sectorLabel)} · ${escapeHtml(item.verdict || '等待确认')} · 推荐评分 ${escapeHtml(item.signalScore ?? item.score)} · ${escapeHtml(recommendationCanslimText(item))} · ${escapeHtml(recommendationFactorText(item))} · MA30 ${yuan(item.ma30)} · 突破价 ${yuan(item.breakoutPrice)}</span>
     <small>${escapeHtml(item.reason || '')}</small></span>`;
   if(selectable) return `<label class="market-recommendation market-stock-choice" data-market-industry="${escapeHtml(industry)}"><input type="checkbox" data-market-stock-choice="${escapeHtml(item.code)}" checked />${content}</label>`;
@@ -543,8 +544,10 @@ function updateStatusByQuote(s){
 
   const trendUp = price >= Number(analysis.ma20) && Number(analysis.ma5) >= Number(analysis.ma10);
   const breakoutDistance = (price / breakout - 1) * 100;
+  const volumeRatio = Number(analysis.volumeRatio);
+  if(volumeRatio > 4) return '爆量观察';
   const confirmed = breakoutDistance >= .3 && breakoutDistance <= 12
-    && score >= 65 && trendUp && Number(analysis.return5) >= -1 && Number(analysis.volumeRatio) >= .9;
+    && score >= 65 && trendUp && Number(analysis.return5) >= -1 && volumeRatio >= 1.5 && volumeRatio <= 4;
   if(confirmed) return '已突破';
   if(score < 45 || price < Number(analysis.ma30) && Number(analysis.ma5) < Number(analysis.ma10)) return '趋势偏弱';
   if(breakoutDistance > 12 && score >= 60 && trendUp) return '突破后运行';
@@ -1305,6 +1308,10 @@ function renderHistoryAnalysis(s, result){
     : '<p class="corporate-risk"><b>未来半年公司风险：</b>未确认。</p>';
   const plan = a.tradePlan;
   const breakout = a.breakoutPotential || a.consolidationBreakout;
+  const entryAssessment = a.entryAssessment;
+  const entryAssessmentHtml = entryAssessment
+    ? `<p class="entry-assessment ${escapeHtml(entryAssessment.tone || 'neutral')}"><b>当前入场结论：${escapeHtml(entryAssessment.status || '等待确认')}</b><span>${escapeHtml(entryAssessment.summary || '')}</span>${entryAssessment.structureSummary ? `<span><strong>吸筹 / 洗盘评估：</strong>${escapeHtml(entryAssessment.structureSummary)}</span>` : ''}<small>${(entryAssessment.evidence || []).map(escapeHtml).join(' · ')}</small></p>`
+    : '<p class="entry-assessment neutral"><b>当前入场结论：数据待补充</b><span>关键价格、均线或量能数据不足，暂不形成入场结论。</span></p>';
   const breakoutHtml = breakout?.available
     ? `<p><b>横盘突破评估：</b>${escapeHtml(breakout.status || '横盘观察')}，评分 ${escapeHtml(breakout.score ?? breakout.technicalScore ?? '--')}/100；横盘 ${escapeHtml(breakout.boxDays)} 日，箱顶 ${yuan(breakout.boxHigh)}，箱底 ${yuan(breakout.boxLow)}，箱体宽度 ${formatPct(breakout.rangePct)}；放量试压 ${escapeHtml(breakout.pressureTestCount || 0)} 次${breakout.failedPressureCount ? `，冲高回落 ${escapeHtml(breakout.failedPressureCount)} 次` : ''}。<br><b>确认条件：</b>${escapeHtml(breakout.trigger || '--')}；<b>失效条件：</b>${escapeHtml(breakout.invalidation || '--')}。</p>`
     : '<p><b>横盘突破评估：</b>历史行情不足，暂不能形成箱体判断。</p>';
@@ -1326,6 +1333,7 @@ function renderHistoryAnalysis(s, result){
       <div><p><b>当前判断：</b>${escapeHtml(displayedVerdict || '等待确认')}</p><p>${escapeHtml(conclusion)}</p></div>
     </div>
     <div class="analysis-grid">
+      ${entryAssessmentHtml}
       <p><b>趋势：</b>${escapeHtml(a.summary)}</p>
       <p><b>涨跌表现：</b>近5日 ${formatPct(a.return5)}；近20日 ${formatPct(a.return20)}；近60日 ${formatPct(a.return60)}</p>
       <p><b>均线综合：</b>${escapeHtml(a.maAlignment || '--')}；MA5 ${yuan(a.ma5)}；MA10 ${yuan(a.ma10)}；MA20 ${yuan(a.ma20)}；MA30 ${yuan(a.ma30)}；MA60 ${yuan(a.ma60)}；RSI14 ${formatNumber(a.rsi14)}</p>

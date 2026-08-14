@@ -43,8 +43,10 @@ const {
   analyzeAccumulationSetup,
   analyzeConsolidationBreakout,
   combineConsolidationBreakout,
+  assessCurrentEntry,
   scoreConsolidationCandidate,
   applyIndividualCapitalAssessment,
+  applyEntryContextAssessment,
   analyzeHistory,
   mergeQuoteIntoHistory,
   parseReductionPlanWindow,
@@ -237,6 +239,8 @@ test('本轮大盘推荐为空时保留最近成功推荐并刷新行情', () =>
   assert.equal(result.recommendations.length, 1);
   assert.equal(result.recommendations[0].industry, '半导体');
   assert.equal(result.recommendations[0].price, 10.8);
+  assert.equal(result.recommendations[0].entryAssessment.status, '数据待补充');
+  assert.match(result.recommendations[0].reason, /综合入场：数据待补充/);
   assert.equal(result.recommendationCoverage.cachedFallback, true);
   assert.equal(result.recommendationCoverage.qualified, 1);
   assert.deepEqual(result.recommendationCoverage.signals, { bottomWaiting:0, rebounded:0, breakout:1 });
@@ -499,7 +503,7 @@ test('大盘分析返回指数、轮动、资金和涨跌停结构', { timeout: 
   assert.ok(result.recommendations.length > 0);
   assert.ok(result.recommendations.every(item => item.breakoutPrice > 0 && item.ma30 > 0));
   assert.ok(result.recommendations.every(item => [
-    '底部待反弹', '已反弹', '待突破', '横盘观察', '突破蓄势', '接近突破', '突破确认'
+    '底部待反弹', '已反弹', '待突破', '横盘观察', '突破蓄势', '接近突破', '突破确认', '底部吸筹', '震荡洗盘'
   ].includes(item.signal)));
   assert.ok(result.recommendations.every(item => ['消息确认', '消息中性', '消息谨慎'].includes(item.newsLabel)));
   assert.ok(result.recommendations.every(item => Number.isFinite(item.signalScore) && item.reason.includes(item.signal)));
@@ -519,6 +523,9 @@ test('大盘分析返回指数、轮动、资金和涨跌停结构', { timeout: 
   assert.deepEqual(result.recommendationCoverage.signals, finalSignalCounts);
   assert.equal(Object.values(result.recommendationCoverage.signals).reduce((sum, count) => sum + count, 0), result.recommendations.length);
   assert.ok(result.recommendations.every(item => item.score === item.signalScore && Number.isFinite(item.technicalScore)));
+  assert.ok(result.recommendations.every(item => item.entryAssessment?.status));
+  assert.ok(result.recommendations.every(item => !['破位', '爆量观察', '结构偏弱', '不宜追高', '公司风险'].includes(item.entryAssessment.status)));
+  assert.ok(result.recommendations.every(item => /综合入场/.test(item.reason)));
   assert.ok((result.recommendationCoverage.signals?.breakout || 0) > 0);
   assert.ok(result.recommendations.slice(0, 10).some(item =>
     ['待突破', '横盘观察', '突破蓄势', '接近突破', '突破确认'].includes(item.signal)
@@ -623,6 +630,9 @@ test('识别底部五线粘合后三次温和放量并开始多头发散', () =>
   assert.match(setup.summary, /五线粘合/);
   assert.match(setup.summary, /3次/);
 
+  const upperBoundary = rows.map((row, index) => [68, 76, 84].includes(index) ? ({ ...row, volume: 3_800_000, amount: row.close * 3_800_000 }) : row);
+  assert.equal(analyzeAccumulationSetup(upperBoundary).passed, true);
+
   const overheated = rows.map((row, index) => index < 70 ? row : ({ ...row, close: row.close * 1.45, high: row.high * 1.45, low: row.low * 1.45 }));
   assert.equal(analyzeAccumulationSetup(overheated).passed, false);
 });
@@ -641,7 +651,7 @@ test('横盘箱体量能试压可识别蓄势和放量突破', () => {
     open: close - .03, close,
     high: index === 7 ? 8.58 : close + .10,
     low: index === 0 ? 8.00 : close - .08,
-    volume: index === 7 ? 1_300_000 : 760_000
+    volume: index === 7 ? 1_600_000 : 760_000
   }));
   const latest = {
     date: '2026-08-10', open: 8.31, close: 8.40, high: 8.48, low: 8.25, volume: 900_000
@@ -661,6 +671,21 @@ test('横盘箱体量能试压可识别蓄势和放量突破', () => {
   assert.equal(breakout.breakoutConfirmed, true);
   assert.equal(breakout.status, '突破确认');
   assert.equal(breakout.boxHigh, 8.58);
+  assert.match(breakout.trigger, /1\.5.*4\.0/);
+
+  const insufficientVolume = analyzeConsolidationBreakout([
+    ...trend, ...box,
+    { ...latest, close: 8.70, high: 8.75, low: 8.40, volume: 1_300_000 }
+  ]);
+  assert.equal(insufficientVolume.breakoutConfirmed, false);
+
+  const explosiveVolume = analyzeConsolidationBreakout([
+    ...trend, ...box,
+    { ...latest, close: 8.70, high: 8.75, low: 8.40, volume: 4_500_000 }
+  ]);
+  assert.equal(explosiveVolume.breakoutConfirmed, false);
+  assert.equal(explosiveVolume.explosiveVolume, true);
+  assert.equal(explosiveVolume.status, '结构偏弱');
 });
 
 test('横盘突破合并阶段资金后统一升级或降级', () => {
@@ -701,6 +726,97 @@ test('横盘突破合并阶段资金后统一升级或降级', () => {
   assert.equal(nonConsolidating.flowAdjustment, 0);
 });
 
+test('个股入场结论区分破位、爆量、等待确认和可分批入场', () => {
+  const base = {
+    latestPrice: 10.8, ma5: 10.5, ma10: 10.3, ma20: 10.1, ma30: 9.9,
+    supportPrice: 9.8, resistance: 10.5, volumeRatio: 1.8, rsi14: 62,
+    breakoutStatus: '突破确认'
+  };
+  const ready = assessCurrentEntry(base);
+  assert.equal(ready.allowed, true);
+  assert.equal(ready.status, '可分批入场');
+  assert.match(ready.summary, /现价10\.80元.*量比1\.80/);
+
+  const broken = assessCurrentEntry({
+    ...base, latestPrice: 8.8, ma5: 9.1, ma10: 9.3, ma20: 9.4, ma30: 9.5,
+    supportPrice: 9.2, resistance: 10.5, volumeRatio: .8, breakoutStatus: '结构偏弱'
+  });
+  assert.equal(broken.allowed, false);
+  assert.equal(broken.status, '破位');
+  assert.match(broken.summary, /不建议入场/);
+
+  const explosive = assessCurrentEntry({ ...base, volumeRatio: 4.2 });
+  assert.equal(explosive.allowed, false);
+  assert.equal(explosive.status, '爆量观察');
+  assert.match(explosive.summary, /超过4\.0倍/);
+
+  const waiting = assessCurrentEntry({ ...base, volumeRatio: 1.4 });
+  assert.equal(waiting.allowed, false);
+  assert.equal(waiting.status, '等待确认');
+  assert.match(waiting.summary, /未达到1\.5倍/);
+  assert.equal(waiting.structureSummary, undefined);
+
+  const extended = assessCurrentEntry({ ...base, latestPrice: 11.2 });
+  assert.equal(extended.allowed, false);
+  assert.equal(extended.status, '不宜追高');
+  assert.match(extended.summary, /偏离突破位/);
+
+  const accumulating = assessCurrentEntry({
+    ...base, latestPrice: 10.1, resistance: 10.8, volumeRatio: .9,
+    breakoutStatus: '横盘观察',
+    accumulationSetup: {
+      passed: true, bullishAlignment: true, diverging: true,
+      volumeSurgeCount: 3, summary: '底部五线粘合后转为多头发散，三次温和放量'
+    },
+    consolidationBreakout: { available: true, isConsolidating: false },
+    macdHistogram: .08, return20: 2.1
+  });
+  assert.equal(accumulating.status, '底部吸筹观察');
+  assert.equal(accumulating.setupType, 'bottom-accumulation');
+  assert.equal(accumulating.lowBuyCandidate, true);
+  assert.match(accumulating.summary, /底部吸筹.*温和放量/);
+
+  const washing = assessCurrentEntry({
+    ...base, latestPrice: 10.15, resistance: 10.8, volumeRatio: .82,
+    breakoutStatus: '突破蓄势', accumulationSetup: { passed: false },
+    consolidationBreakout: {
+      available: true, isConsolidating: true, status: '突破蓄势',
+      boxLow: 9.8, boxHigh: 10.8, boxDays: 9, volumeCompressionRatio: .82,
+      pressureTestCount: 1, failedPressureCount: 0
+    },
+    macdHistogram: .03, return20: 1.2
+  });
+  assert.equal(washing.status, '震荡洗盘观察');
+  assert.equal(washing.setupType, 'sideways-washout');
+  assert.equal(washing.lowBuyCandidate, true);
+  assert.match(washing.summary, /9日.*缩量.*洗盘/);
+
+  const suspectedAccumulation = assessCurrentEntry({
+    ...base, latestPrice: 10.1, resistance: 10.8, volumeRatio: 1.15,
+    breakoutStatus: '横盘观察',
+    accumulationSetup: {
+      passed: false, bullishAlignment: true, diverging: true, notMainWave: true,
+      adhesionDate: '2026-07-20', volumeSurgeCount: 2,
+      summary: '五线粘合2.80%；多头排列成立，发散成立，温和放量2次，区间涨幅6.0%'
+    },
+    consolidationBreakout: { available: true, isConsolidating: false, status: '非横盘', summary: '最近7至12日未形成稳定横盘箱体' }
+  });
+  assert.equal(suspectedAccumulation.status, '疑似吸筹，等待确认');
+  assert.match(suspectedAccumulation.structureSummary, /疑似吸筹.*温和放量2次.*洗盘证据不足/);
+
+  const uncompressedBox = assessCurrentEntry({
+    ...base, latestPrice: 10.2, resistance: 10.8, volumeRatio: 1.15,
+    breakoutStatus: '横盘观察', accumulationSetup: { passed: false, summary: '近阶段未识别到底部五线粘合' },
+    consolidationBreakout: {
+      available: true, isConsolidating: true, status: '横盘观察', boxDays: 10,
+      boxLow: 9.8, boxHigh: 10.8, volumeCompressionRatio: 1.12,
+      failedPressureCount: 0, summary: '近10日形成稳定横盘箱体，但量能尚未压缩'
+    }
+  });
+  assert.equal(uncompressedBox.status, '箱体震荡，洗盘待确认');
+  assert.match(uncompressedBox.structureSummary, /洗盘待确认.*量能压缩比1\.12/);
+});
+
 test('横盘预筛优先低波动缩量且接近日内高位的股票', () => {
   const quiet = scoreConsolidationCandidate({
     amount: 2e8, changePct: .5, snapshotVolumeRatio: .8,
@@ -720,7 +836,8 @@ test('个股分析结合阶段主力资金评估蓄势强弱', () => {
     verdict: '可关注',
     buyCondition: '等待技术突破后再评估。',
     tradePlan: { enabled: true },
-    accumulationSetup: { passed: true, summary: '五线粘合后多头发散，三次温和放量价格抬高' }
+    accumulationSetup: { passed: true, summary: '五线粘合后多头发散，三次温和放量价格抬高' },
+    entryAssessment: { allowed: true, status: '可分批入场', tone: 'positive', summary: '量价条件已满足。' }
   };
   const positive = applyIndividualCapitalAssessment(technical, {
     available: true, days: 10, mainInflow: 8e8, mainOutflow: 5e8,
@@ -730,6 +847,7 @@ test('个股分析结合阶段主力资金评估蓄势强弱', () => {
   assert.equal(positive.capitalSetupAssessment.status, '蓄势增强');
   assert.match(positive.capitalSetupAssessment.summary, /近10日主力买入/);
   assert.equal(positive.tradePlan.enabled, true);
+  assert.equal(positive.entryAssessment.allowed, true);
 
   const negative = applyIndividualCapitalAssessment(technical, {
     available: true, days: 10, mainInflow: 4e8, mainOutflow: 7e8,
@@ -740,6 +858,54 @@ test('个股分析结合阶段主力资金评估蓄势强弱', () => {
   assert.equal(negative.verdict, '等待确认');
   assert.equal(negative.tradePlan.enabled, false);
   assert.match(negative.buyCondition, /持续净流出/);
+  assert.equal(negative.entryAssessment.allowed, false);
+  assert.equal(negative.entryAssessment.status, '资金未确认');
+
+  const bottomAccumulation = applyIndividualCapitalAssessment({
+    ...technical,
+    entryAssessment: {
+      allowed: false, status: '底部吸筹观察', tone: 'warning',
+      setupType: 'bottom-accumulation', lowBuyCandidate: true,
+      summary: '底部五线粘合后温和放量，疑似吸筹。', evidence: []
+    }
+  }, {
+    available: true, days: 10, mainInflow: 8e8, mainOutflow: 5e8,
+    mainNetInflow: 3e8, netRatio: 23.08, positiveDays: 7
+  });
+  assert.equal(bottomAccumulation.entryAssessment.allowed, true);
+  assert.equal(bottomAccumulation.entryAssessment.status, '底部吸筹，可分批低吸');
+  assert.match(bottomAccumulation.entryAssessment.summary, /阶段主力净流入/);
+});
+
+test('消息面和大盘环境会调整个股及大盘推荐入场结论', () => {
+  const analysis = {
+    entryAssessment: {
+      allowed: true, status: '底部吸筹，可分批低吸', tone: 'positive',
+      setupType: 'bottom-accumulation', summary: '量价与阶段资金已确认。', evidence: []
+    }
+  };
+  const positive = applyEntryContextAssessment(analysis, {
+    newsContext: { signal: '偏积极', items: [{ title: '订单增长' }] },
+    riskProfile: { status: 'clear' },
+    marketOverview: { breadth: { up: 3200, down: 1800 }, indices: [{ changePct: .8 }] }
+  });
+  assert.equal(positive.entryAssessment.allowed, true);
+  assert.match(positive.entryAssessment.summary, /消息面偏积极.*大盘环境偏强/);
+
+  const cautious = applyEntryContextAssessment(analysis, {
+    newsContext: { signal: '偏谨慎', items: [{ title: '减持计划' }] },
+    riskProfile: { status: 'clear' },
+    marketOverview: { breadth: { up: 3000, down: 1800 }, indices: [{ changePct: .4 }] }
+  });
+  assert.equal(cautious.entryAssessment.allowed, false);
+  assert.equal(cautious.entryAssessment.status, '消息风险待确认');
+
+  const weakMarket = applyEntryContextAssessment(analysis, {
+    newsContext: { signal: '中性', items: [] }, riskProfile: { status: 'clear' },
+    marketOverview: { breadth: { up: 1200, down: 3500 }, indices: [{ changePct: -1.4 }] }
+  });
+  assert.equal(weakMarket.entryAssessment.allowed, false);
+  assert.equal(weakMarket.entryAssessment.status, '大盘偏弱，等待确认');
 });
 
 test('低价高估值弱反弹股票不会进入大盘推荐', { timeout: 60000 }, async () => {

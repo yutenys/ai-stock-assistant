@@ -22,6 +22,18 @@ let stockDirectoryFetchedAt = 0;
 let boardDirectoryCache = null;
 let boardDirectoryFetchedAt = 0;
 let marketDirectorySavedAt = 0;
+const CONTROLLED_VOLUME_MIN = 1.5;
+const CONTROLLED_VOLUME_MAX = 4;
+
+function isControlledVolumeExpansion(value) {
+  const ratio = Number(value);
+  return Number.isFinite(ratio) && ratio >= CONTROLLED_VOLUME_MIN && ratio <= CONTROLLED_VOLUME_MAX;
+}
+
+function isExplosiveVolume(value) {
+  const ratio = Number(value);
+  return Number.isFinite(ratio) && ratio > CONTROLLED_VOLUME_MAX;
+}
 
 function readTimedCache(cache, key, maxAgeMs) {
   const entry = cache.get(key);
@@ -1062,6 +1074,10 @@ function assessRecommendationTimingRisk(item) {
     penalty += 15;
     reasons.push('现价偏离MA20过大');
   }
+  if (isExplosiveVolume(item.analysis.volumeRatio)) {
+    penalty += 35;
+    reasons.push('当日量比超过4倍，属于爆量');
+  }
   return { penalty, reasons };
 }
 
@@ -1208,6 +1224,8 @@ function combineConsolidationBreakout(technical, flow) {
 function applyIndividualCapitalAssessment(analysis, flow) {
   const setup = analysis?.accumulationSetup || { passed: false, summary: '蓄势结构数据不足' };
   const available = Boolean(flow?.available && flow.days);
+  const strongFlow = available && flow.mainNetInflow > 0
+    && flow.positiveDays >= Math.ceil(flow.days * .6);
   const persistentOutflow = available && flow.mainNetInflow < 0
     && flow.netRatio <= -3 && flow.positiveDays <= Math.floor(flow.days * .4);
   const adjustment = !available ? 0
@@ -1226,6 +1244,37 @@ function applyIndividualCapitalAssessment(analysis, flow) {
             : status === '资金数据不足' ? '本次不使用资金数据调整评分' : '资金与形态均需继续确认';
   const breakoutPotential = combineConsolidationBreakout(analysis.consolidationBreakout, flow);
   const breakoutWeak = breakoutPotential.status === '结构偏弱';
+  let entryAssessment = analysis.entryAssessment;
+  if (entryAssessment && (persistentOutflow || breakoutWeak)) {
+    entryAssessment = {
+      ...entryAssessment,
+      allowed: false,
+      status: persistentOutflow ? '资金未确认' : '结构偏弱',
+      tone: 'negative',
+      summary: persistentOutflow
+        ? `${entryAssessment.summary} 但阶段主力资金持续净流出，当前不建议入场。`
+        : `${entryAssessment.summary} 但横盘量价结构已转弱，当前不建议入场。`
+    };
+  } else if (entryAssessment?.lowBuyCandidate && strongFlow
+    && ['bottom-accumulation', 'sideways-washout'].includes(entryAssessment.setupType)) {
+    const setupLabel = entryAssessment.setupType === 'bottom-accumulation' ? '底部吸筹' : '震荡洗盘';
+    const capitalEvidence = `近${flow.days}日阶段主力净流入${formatCapitalAmount(flow.mainNetInflow)}，净流入${flow.positiveDays}日`;
+    entryAssessment = {
+      ...entryAssessment,
+      allowed: true,
+      status: `${setupLabel}，可分批低吸`,
+      tone: 'positive',
+      summary: `${entryAssessment.summary} ${capitalEvidence}，资金与量价结构相互确认，可在支撑有效前提下分批低吸。`,
+      evidence: [...new Set([...(entryAssessment.evidence || []), capitalEvidence])]
+    };
+  } else if (entryAssessment?.allowed && available && flow.mainNetInflow <= 0) {
+    entryAssessment = { ...entryAssessment, allowed: false, status: '资金未确认', tone: 'warning', summary: `${entryAssessment.summary} 但阶段资金尚未转为净流入，等待资金确认后再入场。` };
+  } else if (entryAssessment?.allowed && available && flow.mainNetInflow > 0) {
+    entryAssessment = { ...entryAssessment, summary: `${entryAssessment.summary} 阶段主力净流入${formatCapitalAmount(flow.mainNetInflow)}，资金方向同步。` };
+  } else if (entryAssessment?.lowBuyCandidate && available && flow.mainNetInflow <= 0) {
+    entryAssessment = { ...entryAssessment, status: '资金未确认', tone: 'warning', summary: `${entryAssessment.summary} 阶段主力资金尚未转为净流入，当前只观察，不执行低吸。` };
+  }
+  const entryBlockedByFunds = Boolean(analysis.entryAssessment?.allowed && entryAssessment && !entryAssessment.allowed);
   const verdict = (persistentOutflow || breakoutWeak) && analysis.verdict === '可关注' ? '等待确认' : analysis.verdict;
   return {
     ...analysis,
@@ -1236,13 +1285,48 @@ function applyIndividualCapitalAssessment(analysis, flow) {
       : breakoutWeak
         ? `横盘结构已经转弱，暂不执行低吸；等待重新站回箱底并修复量价结构后再评估。`
       : analysis.buyCondition,
-    tradePlan: analysis.tradePlan ? { ...analysis.tradePlan, enabled: persistentOutflow || breakoutWeak ? false : analysis.tradePlan.enabled } : analysis.tradePlan,
+    tradePlan: analysis.tradePlan ? { ...analysis.tradePlan, enabled: persistentOutflow || breakoutWeak || entryBlockedByFunds ? false : analysis.tradePlan.enabled } : analysis.tradePlan,
+    entryAssessment,
     breakoutPotential,
     capitalSetupAssessment: {
       status, scoreAdjustment: adjustment,
       summary: `${fundFlowPeriodEvidence(flow)}；${interpretation}。`
     }
   };
+}
+
+function applyEntryContextAssessment(analysis, { newsContext = null, riskProfile = null, marketOverview = null } = {}) {
+  if (!analysis?.entryAssessment) return analysis;
+  const entry = analysis.entryAssessment;
+  const evidence = [...(entry.evidence || [])];
+  const newsSignal = newsContext?.signal || '中性';
+  const hasNews = Boolean(newsContext?.items?.length);
+  evidence.push(hasNews ? `消息面${newsSignal}` : '消息面暂无可核验资讯');
+
+  const indexChanges = (marketOverview?.indices || []).map(item => Number(item.changePct)).filter(Number.isFinite);
+  const indexAverage = indexChanges.length ? average(indexChanges) : null;
+  const up = Number(marketOverview?.breadth?.up || 0);
+  const down = Number(marketOverview?.breadth?.down || 0);
+  const marketWeak = Number.isFinite(indexAverage) && indexAverage <= -1
+    || down > 0 && down > up * 1.3;
+  const marketStrong = Number.isFinite(indexAverage) && indexAverage >= .4
+    || up > 0 && up > down * 1.3;
+  const marketLabel = marketWeak ? '偏弱' : marketStrong ? '偏强' : '分化';
+  evidence.push(`大盘环境${marketLabel}`);
+
+  let entryAssessment = {
+    ...entry,
+    evidence: [...new Set(evidence)],
+    summary: `${entry.summary} 消息面${hasNews ? newsSignal : '暂无可核验资讯'}，大盘环境${marketLabel}。`
+  };
+  if (riskProfile?.status === 'risk') {
+    entryAssessment = { ...entryAssessment, allowed: false, status: '公司风险', tone: 'negative', summary: `${entryAssessment.summary} 未来半年存在已核验公司风险，当前不建议入场。` };
+  } else if (newsSignal === '偏谨慎' && entryAssessment.allowed) {
+    entryAssessment = { ...entryAssessment, allowed: false, status: '消息风险待确认', tone: 'warning', summary: `${entryAssessment.summary} 风险消息尚未消化，等待价格和资金重新确认。` };
+  } else if (marketWeak && entryAssessment.allowed) {
+    entryAssessment = { ...entryAssessment, allowed: false, status: '大盘偏弱，等待确认', tone: 'warning', summary: `${entryAssessment.summary} 市场下跌家数或指数跌幅偏大，暂缓入场。` };
+  }
+  return { ...analysis, entryAssessment };
 }
 
 function evaluateRecommendationFactors(item, context, newsContext, financialAnalysis = null) {
@@ -1263,7 +1347,7 @@ function evaluateRecommendationFactors(item, context, newsContext, financialAnal
   const volumeRatio = finiteNumber(item.analysis?.volumeRatio ?? item.snapshotVolumeRatio);
   const turnover = finiteNumber(item.turnoverRate);
   const demandParts = [];
-  if (volumeRatio !== null) demandParts.push(volumeRatio >= 1.5 && volumeRatio <= 3.5 ? 88 : volumeRatio >= 1 ? 72 : volumeRatio >= .7 ? 55 : 35);
+  if (volumeRatio !== null) demandParts.push(isExplosiveVolume(volumeRatio) ? 20 : isControlledVolumeExpansion(volumeRatio) ? 88 : volumeRatio >= 1 ? 72 : volumeRatio >= .7 ? 55 : 35);
   if (turnover !== null) demandParts.push(turnover >= 1 && turnover <= 10 ? 78 : turnover > 10 && turnover <= 18 ? 58 : turnover > 18 ? 32 : 52);
   if (Number(item.amount) > 0) demandParts.push(item.amount >= 1e9 ? 88 : item.amount >= 3e8 ? 74 : item.amount >= 8e7 ? 58 : 35);
   add('supplyDemand', '供需量能', demandParts.length ? average(demandParts) : 0,
@@ -1328,6 +1412,12 @@ function restoreCachedMarketRecommendations(result, cachedOverview, marketQuotes
   const quoteByCode = new Map((marketQuotes || []).map(item => [item.code, item]));
   result.recommendations = cachedOverview.recommendations.map(item => {
     const quote = quoteByCode.get(item.code);
+    const entryAssessment = item.entryAssessment || {
+      allowed: false, status: '数据待补充', tone: 'neutral',
+      summary: '当前为旧缓存推荐，需刷新走势、资金、消息面和大盘数据后重新评估。', evidence: []
+    };
+    const reason = /综合入场/.test(item.reason || '')
+      ? item.reason : `${item.reason ? item.reason.replace(/[。；;]+$/, '') + '；' : ''}综合入场：${entryAssessment.status}，${entryAssessment.summary}`;
     return {
       ...item,
       ...(quote ? {
@@ -1336,7 +1426,9 @@ function restoreCachedMarketRecommendations(result, cachedOverview, marketQuotes
         amount: quote.amount, totalMarketCap: quote.totalMarketCap, floatMarketCap: quote.floatMarketCap,
         fetchedAt: quote.fetchedAt || item.fetchedAt
       } : {}),
-      industry: resolveRecommendationIndustry(item)
+      industry: resolveRecommendationIndustry(item),
+      entryAssessment,
+      reason
     };
   });
   const signals = result.recommendations.reduce((counts, item) => {
@@ -1397,7 +1489,7 @@ function buildIndividualInvestmentAnalysis({ technical, financial, newsContext, 
   const supplyParts = [];
   if (finiteNumber(technical?.volumeRatio) !== null) {
     const ratio = Number(technical.volumeRatio);
-    supplyParts.push(ratio >= 1.5 && ratio <= 3 ? 88 : ratio >= 1 ? 70 : ratio >= .7 ? 52 : 32);
+    supplyParts.push(isExplosiveVolume(ratio) ? 20 : isControlledVolumeExpansion(ratio) ? 88 : ratio >= 1 ? 70 : ratio >= .7 ? 52 : 32);
   }
   if (finiteNumber(quote?.turnoverRate) !== null) {
     const turnover = Number(quote.turnoverRate);
@@ -1510,6 +1602,15 @@ function scoreConsolidationCandidate(item) {
 }
 
 async function buildMarketRecommendations(marketQuotes, force = false) {
+  const marketAssessmentContext = {
+    breadth: (marketQuotes || []).reduce((counts, item) => {
+      if (item.changePct > 0) counts.up++;
+      else if (item.changePct < 0) counts.down++;
+      else counts.flat++;
+      return counts;
+    }, { up: 0, down: 0, flat: 0 }),
+    indices: []
+  };
   let directory = [];
   try {
     directory = await fetchStockDirectory();
@@ -1623,14 +1724,22 @@ async function buildMarketRecommendations(marketQuotes, force = false) {
       fetchStockFinancials({ code: item.code, force: false })
     ]);
     const fundFlowPeriod = fundFlowResult.status === 'fulfilled' ? fundFlowResult.value : null;
-    const breakoutPotential = combineConsolidationBreakout(item.analysis.consolidationBreakout, fundFlowPeriod);
+    const capitalAnalysis = applyIndividualCapitalAssessment(item.analysis, fundFlowPeriod);
+    const breakoutPotential = capitalAnalysis.breakoutPotential;
     const breakoutSignal = !['已反弹', '底部待反弹'].includes(item.signal);
-    const signal = breakoutSignal && breakoutPotential.isConsolidating ? breakoutPotential.status : item.signal;
+    let signal = breakoutSignal && breakoutPotential.isConsolidating ? breakoutPotential.status : item.signal;
     item = { ...item, fundFlowPeriod, breakoutPotential, signal };
     const windowStart = breakoutSignal
       ? new Date(Date.now() - 21 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
       : item.analysis.bottomDate;
     const newsContext = newsResult.status === 'fulfilled' ? summarizeNews(newsResult.value.news, windowStart) : summarizeNews([]);
+    const entryAnalysis = applyEntryContextAssessment(capitalAnalysis, {
+      newsContext, marketOverview: marketAssessmentContext
+    });
+    const entryAssessment = entryAnalysis.entryAssessment;
+    if (entryAssessment?.setupType === 'bottom-accumulation') signal = '底部吸筹';
+    else if (entryAssessment?.setupType === 'sideways-washout') signal = '震荡洗盘';
+    item = { ...item, signal };
     const financialAnalysis = financialResult.status === 'fulfilled' ? financialResult.value.analysis : null;
     let verdict = item.analysis.verdict;
     if (newsContext.signal === '偏谨慎' && verdict === '可关注') verdict = '等待确认';
@@ -1649,7 +1758,8 @@ async function buildMarketRecommendations(marketQuotes, force = false) {
     const sectorDescription = factorAnalysis.sectorProfile
       ? `${factorAnalysis.sectorProfile.name}${factorAnalysis.sectorProfile.label}（板块评分${factorAnalysis.sectorProfile.score}）` : '板块强度未确认';
     const capitalDescription = fundFlowPeriod?.available ? fundFlowPeriodEvidence(fundFlowPeriod) : '阶段主力资金暂未取得，不据此加分';
-    const reason = `${item.signal}；${technicalReason}；${capitalDescription}；${sectorDescription}；${newsContext.signal === '偏积极' ? '阶段低点以来存在正向消息催化' : newsContext.signal === '偏谨慎' ? '阶段低点以来存在风险消息，信号降级等待确认' : '阶段低点以来消息面中性'}。`;
+    const structureReason = entryAssessment?.structureSummary ? `；形态评估：${entryAssessment.structureSummary}` : '';
+    const reason = `${item.signal}；${technicalReason}；${capitalDescription}；${sectorDescription}；${newsContext.signal === '偏积极' ? '阶段低点以来存在正向消息催化' : newsContext.signal === '偏谨慎' ? '阶段低点以来存在风险消息，信号降级等待确认' : '阶段低点以来消息面中性'}；综合入场：${entryAssessment?.status || '数据待补充'}，${entryAssessment?.summary || '关键数据不足'}${structureReason}。`;
     const flowAdjustment = !fundFlowPeriod?.available ? 0
       : fundFlowPeriod.mainNetInflow > 0 && fundFlowPeriod.positiveDays >= 6 ? 8
         : fundFlowPeriod.mainNetInflow > 0 ? 4 : fundFlowPeriod.netRatio <= -3 ? -10 : -4;
@@ -1688,6 +1798,7 @@ async function buildMarketRecommendations(marketQuotes, force = false) {
       consolidationBreakout: item.analysis.consolidationBreakout,
       breakoutPotential,
       fundFlowPeriod,
+      entryAssessment,
       reason,
       newsContext
     };
@@ -1695,6 +1806,8 @@ async function buildMarketRecommendations(marketQuotes, force = false) {
   const recommendations = recommendationResults.filter(result => result.status === 'fulfilled').map(result => result.value);
   const qualityRecommendations = recommendations.filter(item => item.qualityScore >= 65
     && item.breakoutPotential?.status !== '结构偏弱'
+    && !isExplosiveVolume(item.analysis?.volumeRatio)
+    && !['破位', '爆量观察', '结构偏弱', '不宜追高', '公司风险'].includes(item.entryAssessment?.status)
     && !(item.newsLabel === '消息谨慎' && item.signalScore < 65)
     && !(item.fundFlowPeriod?.available && item.fundFlowPeriod.netRatio <= -3 && item.fundFlowPeriod.positiveDays <= 4)
     && !(item.financialAnalysis?.hardRisks?.length >= 2 && item.financialAnalysis?.score < 45)
@@ -3123,7 +3236,7 @@ function analyzeConsolidationBreakout(history) {
     available: false, isConsolidating: false, status: '数据不足', technicalScore: 0,
     boxDays: 0, boxLow: null, boxHigh: null, rangePct: null, distanceToBreakoutPct: null,
     volumeCompressionRatio: null, pressureTestCount: 0, failedPressureCount: 0,
-    breakoutConfirmed: false, overheated: false,
+    breakoutConfirmed: false, overheated: false, explosiveVolume: false, explosiveVolumeCount: 0,
     summary: '历史行情不足，暂不能评估横盘突破', trigger: '', invalidation: ''
   };
   if (rows.length < 35) return empty;
@@ -3149,12 +3262,18 @@ function analyzeConsolidationBreakout(history) {
   const volumeCompressionRatio = prior20Volume ? recent5Volume / prior20Volume : 1;
   let pressureTestCount = 0;
   let failedPressureCount = 0;
+  let explosiveVolumeCount = 0;
   box.boxRows.forEach((row, offset) => {
     const index = box.startIndex + offset;
     const priorVolume = average(rows.slice(Math.max(0, index - 20), index).map(item => item.volume));
     const nearTop = row.high >= box.boxHigh * .985;
     const volumeRatio = priorVolume ? row.volume / priorVolume : 0;
-    if (!nearTop || volumeRatio < 1.1) return;
+    if (!nearTop) return;
+    if (isExplosiveVolume(volumeRatio)) {
+      explosiveVolumeCount++;
+      return;
+    }
+    if (!isControlledVolumeExpansion(volumeRatio)) return;
     pressureTestCount++;
     const dayRange = Math.max(row.high - row.low, row.close * .001);
     const upperShadowRatio = (row.high - Math.max(row.open, row.close)) / dayRange;
@@ -3171,10 +3290,11 @@ function analyzeConsolidationBreakout(history) {
   const mediumAverageHealthy = ma20 >= ma20FiveDaysAgo * .99;
   const distanceToBreakoutPct = (box.boxHigh - latest.close) / box.boxHigh * 100;
   const currentVolumeRatio = prior20Volume ? latest.volume / prior20Volume : 0;
-  const breakoutConfirmed = latest.close > box.boxHigh && currentVolumeRatio >= 1.2;
+  const explosiveVolume = isExplosiveVolume(currentVolumeRatio);
+  const breakoutConfirmed = latest.close > box.boxHigh && isControlledVolumeExpansion(currentVolumeRatio);
   const breakdown = latest.close < box.boxLow * .99;
   const return20 = percentageReturn(rows, 20) || 0;
-  const overheated = return20 > 30 || latest.close > box.boxHigh * 1.08;
+  const overheated = return20 > 30 || latest.close > box.boxHigh * 1.08 || explosiveVolume;
   const isConsolidating = !breakdown && !overheated && (latest.close <= box.boxHigh * 1.02 || breakoutConfirmed);
 
   let technicalScore = 30;
@@ -3185,8 +3305,9 @@ function analyzeConsolidationBreakout(history) {
   if (volumeCompressionRatio <= .95) technicalScore += 8;
   if (pressureTestCount) technicalScore += 10;
   if (failedPressureCount) technicalScore -= 8;
+  if (explosiveVolumeCount) technicalScore -= 8;
   if (breakoutConfirmed) technicalScore += 20;
-  if (overheated) technicalScore -= 15;
+  if (overheated) technicalScore -= explosiveVolume ? 25 : 15;
   if (breakdown) technicalScore -= 25;
   technicalScore = clampRecommendationScore(technicalScore);
 
@@ -3194,15 +3315,15 @@ function analyzeConsolidationBreakout(history) {
     : breakoutConfirmed ? '突破确认'
       : technicalScore >= 70 && distanceToBreakoutPct <= 2 ? '接近突破'
         : technicalScore >= 58 ? '突破蓄势' : '横盘观察';
-  const summary = `近${box.days}日横盘箱体${box.boxLow.toFixed(2)}-${box.boxHigh.toFixed(2)}元，箱体宽度${box.rangePct.toFixed(1)}%，现价距箱顶${distanceToBreakoutPct >= 0 ? distanceToBreakoutPct.toFixed(1) + '%' : '已越过' + Math.abs(distanceToBreakoutPct).toFixed(1) + '%'}；量能压缩比${volumeCompressionRatio.toFixed(2)}，放量试压${pressureTestCount}次${failedPressureCount ? `，其中${failedPressureCount}次冲高回落` : ''}`;
+  const summary = `近${box.days}日横盘箱体${box.boxLow.toFixed(2)}-${box.boxHigh.toFixed(2)}元，箱体宽度${box.rangePct.toFixed(1)}%，现价距箱顶${distanceToBreakoutPct >= 0 ? distanceToBreakoutPct.toFixed(1) + '%' : '已越过' + Math.abs(distanceToBreakoutPct).toFixed(1) + '%'}；量能压缩比${volumeCompressionRatio.toFixed(2)}，有效放量试压${pressureTestCount}次${failedPressureCount ? `，其中${failedPressureCount}次冲高回落` : ''}${explosiveVolumeCount ? `，另有${explosiveVolumeCount}次爆量不计入有效试压` : ''}${explosiveVolume ? `；当前量比${currentVolumeRatio.toFixed(2)}超过4.0倍，属于爆量` : ''}`;
   return {
     available: true, isConsolidating, status, technicalScore,
     boxDays: box.days, boxLow: roundMetric(box.boxLow), boxHigh: roundMetric(box.boxHigh),
     rangePct: roundMetric(box.rangePct, 1), distanceToBreakoutPct: roundMetric(distanceToBreakoutPct, 1),
-    volumeCompressionRatio: roundMetric(volumeCompressionRatio), pressureTestCount, failedPressureCount,
-    breakoutConfirmed, overheated, currentVolumeRatio: roundMetric(currentVolumeRatio),
+    volumeCompressionRatio: roundMetric(volumeCompressionRatio), pressureTestCount, failedPressureCount, explosiveVolumeCount,
+    breakoutConfirmed, overheated, explosiveVolume, currentVolumeRatio: roundMetric(currentVolumeRatio),
     shortAverageHealthy, mediumAverageHealthy, summary,
-    trigger: `放量收盘突破${box.boxHigh.toFixed(2)}元，成交量至少达到20日均量1.2倍`,
+    trigger: `放量收盘突破${box.boxHigh.toFixed(2)}元，成交量达到20日均量1.5-4.0倍`,
     invalidation: `收盘跌破${box.boxLow.toFixed(2)}元，或放量冲高回落后连续两日未收复箱顶`
   };
 }
@@ -3251,7 +3372,7 @@ function analyzeAccumulationSetup(history) {
     const ratio = priorVolume ? rows[index].volume / priorVolume : 0;
     const previousClose = rows[index - 1].close;
     const dayChangePct = previousClose ? (rows[index].close / previousClose - 1) * 100 : 0;
-    if (ratio < 1.35 || ratio > 3.5 || dayChangePct < -1 || dayChangePct > 5.5) continue;
+    if (!isControlledVolumeExpansion(ratio) || dayChangePct < -1 || dayChangePct > 5.5) continue;
     const candidate = { index, date: rows[index].date || '', close: rows[index].close, ratio, dayChangePct };
     const previous = surgeCandidates.at(-1);
     if (previous && candidate.index - previous.index < 3) {
@@ -3284,6 +3405,142 @@ function analyzeAccumulationSetup(history) {
     surgePriceRisePct: surgeTriple ? roundMetric(surgeTriple.risePct) : null,
     surgeDates: surgeTriple ? surgeTriple.rows.map(row => row.date) : []
   };
+}
+
+function assessCurrentEntry({
+  latestPrice, ma5, ma10, ma20, ma30, supportPrice, resistance, volumeRatio, rsi14,
+  breakoutStatus, accumulationSetup = null, consolidationBreakout = null,
+  macdHistogram = null, return20 = null
+}) {
+  const price = Number(latestPrice);
+  const support = Number(supportPrice);
+  const breakout = Number(resistance);
+  const ratio = Number(volumeRatio);
+  const evidence = [
+    `现价${Number.isFinite(price) ? price.toFixed(2) : '--'}元`,
+    `突破位${Number.isFinite(breakout) ? breakout.toFixed(2) : '--'}元`,
+    `MA30 ${Number.isFinite(Number(ma30)) ? Number(ma30).toFixed(2) : '--'}元`,
+    `量比${Number.isFinite(ratio) ? ratio.toFixed(2) : '--'}`
+  ];
+  const accumulationSignalCount = [
+    accumulationSetup?.bullishAlignment,
+    accumulationSetup?.diverging,
+    accumulationSetup?.notMainWave
+  ].filter(Boolean).length;
+  const suspectedAccumulation = Boolean(!accumulationSetup?.passed
+    && accumulationSetup?.adhesionDate
+    && Number(accumulationSetup?.volumeSurgeCount || 0) >= 2
+    && accumulationSignalCount >= 2);
+  const accumulationSummary = !accumulationSetup
+    ? '吸筹评估数据不足'
+    : accumulationSetup.passed
+      ? `吸筹特征成立：${accumulationSetup.summary}`
+      : suspectedAccumulation
+        ? `疑似吸筹：${accumulationSetup.summary}`
+        : `吸筹证据不足：${accumulationSetup.summary || '未识别到底部均线粘合和温和放量组合'}`;
+  const compression = Number(consolidationBreakout?.volumeCompressionRatio);
+  const washoutSummary = !consolidationBreakout || !consolidationBreakout.available
+    ? '洗盘评估数据不足'
+    : consolidationBreakout.isConsolidating && Number.isFinite(compression) && compression <= 1
+      ? `洗盘特征成立：${consolidationBreakout.summary}`
+      : consolidationBreakout.isConsolidating
+        ? `洗盘待确认：已形成${consolidationBreakout.boxDays || '--'}日箱体，但量能压缩比${Number.isFinite(compression) ? compression.toFixed(2) : '--'}尚未体现缩量`
+        : `洗盘证据不足：${consolidationBreakout.summary || '最近7至12日未形成稳定横盘箱体'}`;
+  const structureSummary = `${accumulationSummary}；${washoutSummary}`;
+  const hasStructureSignal = Boolean(accumulationSetup?.passed || suspectedAccumulation
+    || consolidationBreakout?.available && consolidationBreakout.isConsolidating);
+  const withStructure = result => hasStructureSignal ? { ...result, structureSummary } : result;
+  if (![price, support, breakout, Number(ma5), Number(ma10), Number(ma20), Number(ma30), ratio].every(Number.isFinite)) {
+    return withStructure({ allowed: false, status: '数据待补充', tone: 'neutral', summary: '关键价格、均线或量能数据不足，暂不形成入场结论。', evidence });
+  }
+  const trendBroken = price < support * .99 || (price < Number(ma30) && Number(ma5) < Number(ma10) && Number(ma20) < Number(ma30));
+  if (trendBroken) {
+    return withStructure({ allowed: false, status: '破位', tone: 'negative', summary: `现价${price.toFixed(2)}元已跌破支撑${support.toFixed(2)}元或处于MA30 ${Number(ma30).toFixed(2)}元下方，短期均线转弱，当前走势已经破位，不建议入场。`, evidence });
+  }
+  if (isExplosiveVolume(ratio)) {
+    return withStructure({ allowed: false, status: '爆量观察', tone: 'negative', summary: `当前量比${ratio.toFixed(2)}已超过4.0倍，属于爆量，波动和冲高回落风险偏高，不建议追入。`, evidence });
+  }
+  if (breakoutStatus === '结构偏弱') {
+    return withStructure({ allowed: false, status: '结构偏弱', tone: 'negative', summary: '横盘或量价结构已经转弱，当前不建议入场，等待重新站回关键均线和支撑位。', evidence });
+  }
+  const priceConfirmed = price > breakout;
+  const breakoutAdvancePct = breakout ? (price / breakout - 1) * 100 : 0;
+  const trendConfirmed = price >= Number(ma30) && Number(ma5) >= Number(ma10) && Number(ma20) >= Number(ma30) * .98;
+  const momentumHealthy = !Number.isFinite(Number(rsi14)) || Number(rsi14) <= 75;
+  if (priceConfirmed && breakoutAdvancePct > 5) {
+    return withStructure({ allowed: false, status: '不宜追高', tone: 'warning', summary: `现价${price.toFixed(2)}元已高于突破位${breakout.toFixed(2)}元${breakoutAdvancePct.toFixed(1)}%，偏离突破位较远，当前不建议追入，等待回踩确认。`, evidence });
+  }
+  if (priceConfirmed && trendConfirmed && momentumHealthy && isControlledVolumeExpansion(ratio)) {
+    return withStructure({ allowed: true, status: '可分批入场', tone: 'positive', summary: `现价${price.toFixed(2)}元已收盘突破${breakout.toFixed(2)}元，站上MA30 ${Number(ma30).toFixed(2)}元，MA5不低于MA10，量比${ratio.toFixed(2)}处于1.5-4.0倍有效放量区间，可考虑分批入场。`, evidence });
+  }
+  if (priceConfirmed && ratio < CONTROLLED_VOLUME_MIN) {
+    return withStructure({ allowed: false, status: '等待确认', tone: 'warning', summary: `现价${price.toFixed(2)}元虽已越过突破位${breakout.toFixed(2)}元，但量比${ratio.toFixed(2)}未达到1.5倍，有效放量尚未确认，暂不入场。`, evidence });
+  }
+  if (accumulationSetup?.passed) {
+    const lowBuyCandidate = price >= support * .99
+      && price <= Math.min(breakout * .98, Math.max(Number(ma20), Number(ma30)) * 1.06);
+    const volumeDescription = ratio < 1 ? '当前缩量，抛压未明显放大' : `当前量比${ratio.toFixed(2)}，量能仍属温和`;
+    const macdDescription = Number.isFinite(Number(macdHistogram))
+      ? Number(macdHistogram) >= 0 ? 'MACD动能未转弱' : 'MACD仍待修复'
+      : 'MACD数据待补充';
+    return withStructure({
+      allowed: false,
+      status: lowBuyCandidate ? '底部吸筹观察' : '吸筹后等待回踩',
+      tone: 'warning',
+      setupType: 'bottom-accumulation',
+      lowBuyCandidate,
+      summary: `底部吸筹结构：${accumulationSetup.summary || '均线收敛后出现温和放量'}；${volumeDescription}，${macdDescription}${Number.isFinite(Number(return20)) ? `，近20日涨跌${Number(return20).toFixed(1)}%` : ''}。${lowBuyCandidate ? '价格仍处于支撑与箱顶之间，可等待阶段资金进一步确认后考虑分批低吸。' : '价格已离开低吸区，等待回踩关键均线后再评估。'}`,
+      evidence: [...evidence, `温和放量${accumulationSetup.volumeSurgeCount || 0}次`, macdDescription]
+    });
+  }
+  if (suspectedAccumulation) {
+    const lowBuyCandidate = price >= support * .99
+      && price <= Math.min(breakout * .98, Math.max(Number(ma20), Number(ma30)) * 1.06);
+    return withStructure({
+      allowed: false,
+      status: '疑似吸筹，等待确认',
+      tone: 'warning',
+      setupType: 'bottom-accumulation',
+      lowBuyCandidate,
+      summary: `均线粘合、多头发散和温和放量已有部分吸筹特征，但尚未全部满足严格吸筹条件。当前量比${ratio.toFixed(2)}，${lowBuyCandidate ? '价格仍在支撑与阻力之间，可继续观察阶段资金是否连续净流入。' : '价格不在低吸区，等待回踩后再评估。'}`,
+      evidence: [...evidence, `温和放量${accumulationSetup.volumeSurgeCount || 0}次`, '吸筹证据部分成立']
+    });
+  }
+  if (consolidationBreakout?.available && consolidationBreakout.isConsolidating) {
+    const boxLow = Number(consolidationBreakout.boxLow);
+    const boxHigh = Number(consolidationBreakout.boxHigh);
+    const compression = Number(consolidationBreakout.volumeCompressionRatio);
+    const boxPosition = Number.isFinite(boxLow) && Number.isFinite(boxHigh) && boxHigh > boxLow
+      ? (price - boxLow) / (boxHigh - boxLow) : null;
+    const looksLikeWashout = Number.isFinite(compression) && compression <= 1
+      && Number(consolidationBreakout.failedPressureCount || 0) <= 1;
+    const lowBuyCandidate = looksLikeWashout && Number.isFinite(boxPosition)
+      && boxPosition >= .1 && boxPosition <= .65 && price >= support * .99;
+    const nearBoxTop = Number.isFinite(boxPosition) && boxPosition > .7;
+    if (looksLikeWashout) {
+      return withStructure({
+        allowed: false,
+        status: lowBuyCandidate ? '震荡洗盘观察' : nearBoxTop ? '震荡洗盘，等待回踩' : '震荡洗盘观察',
+        tone: 'warning',
+        setupType: 'sideways-washout',
+        lowBuyCandidate,
+        summary: `近${consolidationBreakout.boxDays || '--'}日维持${Number.isFinite(boxLow) ? boxLow.toFixed(2) : '--'}-${Number.isFinite(boxHigh) ? boxHigh.toFixed(2) : '--'}元箱体，近5日量能压缩至20日均量的${compression.toFixed(2)}倍，价格反复震荡但未破箱底，偏向缩量洗盘。${lowBuyCandidate ? '现价位于箱体中低位，可等待主力资金连续净流入后分批低吸。' : nearBoxTop ? '现价靠近箱顶，暂不追入，等待回踩或有效突破。' : '仍需资金和均线方向确认。'}`,
+        evidence: [...evidence, `箱体位置${Number.isFinite(boxPosition) ? (boxPosition * 100).toFixed(0) + '%' : '--'}`, `量能压缩比${compression.toFixed(2)}`]
+      });
+    }
+    return withStructure({
+      allowed: false,
+      status: '箱体震荡，洗盘待确认',
+      tone: 'warning',
+      setupType: 'sideways-consolidation',
+      lowBuyCandidate: false,
+      summary: `近${consolidationBreakout.boxDays || '--'}日仍在${Number.isFinite(boxLow) ? boxLow.toFixed(2) : '--'}-${Number.isFinite(boxHigh) ? boxHigh.toFixed(2) : '--'}元箱体内震荡，但近5日量能压缩比${Number.isFinite(compression) ? compression.toFixed(2) : '--'}尚未体现缩量，暂不能确认洗盘或吸筹。继续观察箱底是否守住、成交量是否收缩及阶段资金是否转为连续净流入。`,
+      evidence: [...evidence, `箱体位置${Number.isFinite(boxPosition) ? (boxPosition * 100).toFixed(0) + '%' : '--'}`, `量能压缩比${Number.isFinite(compression) ? compression.toFixed(2) : '--'}`]
+    });
+  }
+  const distancePct = breakout ? (breakout - price) / breakout * 100 : null;
+  const position = Number.isFinite(distancePct) && distancePct >= 0 && distancePct <= 4 ? '已经接近突破位' : '尚未突破关键阻力';
+  return withStructure({ allowed: false, status: '等待确认', tone: 'warning', summary: `现价${price.toFixed(2)}元${position}${breakout.toFixed(2)}元，当前量比${ratio.toFixed(2)}。尚未形成明确突破信号，结合下方吸筹与洗盘评估继续观察量价、资金和均线变化。`, evidence });
 }
 
 function buildTradePlan({ latestPrice, supportPrice, resistance, rangeHigh, recent10Low, ma5, ma10, ma20, ma30, atr14, volumeRatio, verdict }) {
@@ -3320,7 +3577,7 @@ function buildTradePlan({ latestPrice, supportPrice, resistance, rangeHigh, rece
     entrySteps: [
       { buyPct: 40, condition: `进入${entryLow.toFixed(2)}-${entryHigh.toFixed(2)}元区间，日内不跌破${invalidationPrice.toFixed(2)}元且量能不高于20日均量` },
       { buyPct: 30, condition: `回踩后重新站上MA5（${ma5.toFixed(2)}元）并保持MA5不低于MA10（${ma10.toFixed(2)}元）` },
-      { buyPct: 30, condition: `收盘突破${Math.max(resistance, ma20, ma10).toFixed(2)}元且量比达到1.2以上` }
+      { buyPct: 30, condition: `收盘突破${Math.max(resistance, ma20, ma10).toFixed(2)}元且量比处于1.5-4.0倍` }
     ],
     targetNotes: [
       `到达第一目标后卖出30%，剩余仓位保护价上移到低吸区中值${entryMid.toFixed(2)}元附近`,
@@ -3445,37 +3702,43 @@ function analyzeHistory(history) {
   if (ma20 > ma30) score += 6;
   if (ma30 > ma60) score += 6;
   if (distanceToBreakout >= -1.5 && distanceToBreakout <= 4) score += 18;
-  if (volumeRatio >= 1.1 && volumeRatio <= 2.8) score += 14;
-  else if (volumeRatio >= .85) score += 7;
+  if (isControlledVolumeExpansion(volumeRatio)) score += 14;
+  else if (volumeRatio >= .85 && volumeRatio < CONTROLLED_VOLUME_MIN) score += 7;
   if (rsi14 >= 50 && rsi14 <= 72) score += 8;
   if (macdHistogram > 0) score += 6;
   if (accumulationSetup.passed) score += 16;
-  if (rsi14 > 80 || distanceToBreakout < -5 || volumeRatio > 4) score -= 18;
+  if (rsi14 > 80 || distanceToBreakout < -5 || isExplosiveVolume(volumeRatio)) score -= 18;
   score = Math.max(0, Math.min(100, Math.round(score)));
-  const verdict = rsi14 > 80 || distanceToBreakout < -5
+  const verdict = rsi14 > 80 || distanceToBreakout < -5 || isExplosiveVolume(volumeRatio)
     ? '不宜追高'
     : score >= 72 ? '可关注' : score >= 50 ? '等待确认' : latest.close < ma20 ? '暂不适合介入' : '等待确认';
   const summary = `近${Math.min(rows.length, 120)}个交易日累计${direction}${Math.abs(periodReturn).toFixed(2)}%，当前处于${phase}阶段，${maAlignment}。现价${latest.close.toFixed(2)}元，MA5 ${ma5.toFixed(2)}元、MA10 ${ma10.toFixed(2)}元、MA20 ${ma20.toFixed(2)}元、MA30 ${ma30.toFixed(2)}元、MA60 ${ma60.toFixed(2)}元；近5/20/60日涨跌分别为${roundMetric(percentageReturn(rows, 5))}%/${roundMetric(percentageReturn(rows, 20))}%/${roundMetric(percentageReturn(rows, 60))}%。`;
-  const volume = volumeRatio >= 1.5 ? `当日量为20日均量的${volumeRatio.toFixed(2)}倍，属于明显放量；近5日均量比为${volume5Ratio.toFixed(2)}。` : volumeRatio <= .75 ? `当日量为20日均量的${volumeRatio.toFixed(2)}倍，当前缩量；近5日均量比为${volume5Ratio.toFixed(2)}。` : `当日量为20日均量的${volumeRatio.toFixed(2)}倍，量能处于常态区间；近5日均量比为${volume5Ratio.toFixed(2)}。`;
+  const volume = isExplosiveVolume(volumeRatio) ? `当日量为20日均量的${volumeRatio.toFixed(2)}倍，超过4.0倍，属于爆量，不作为健康突破确认；近5日均量比为${volume5Ratio.toFixed(2)}。` : isControlledVolumeExpansion(volumeRatio) ? `当日量为20日均量的${volumeRatio.toFixed(2)}倍，处于1.5-4.0倍有效放量区间；近5日均量比为${volume5Ratio.toFixed(2)}。` : volumeRatio <= .75 ? `当日量为20日均量的${volumeRatio.toFixed(2)}倍，当前缩量；近5日均量比为${volume5Ratio.toFixed(2)}。` : `当日量为20日均量的${volumeRatio.toFixed(2)}倍，未达到1.5倍有效放量标准；近5日均量比为${volume5Ratio.toFixed(2)}。`;
   const entry = rising
-    ? `未来3-5个交易日观察回踩MA10（${ma10.toFixed(2)}元）、MA20（${ma20.toFixed(2)}元）或MA30（${ma30.toFixed(2)}元）后企稳；若放量收盘突破${resistance.toFixed(2)}元，可作为趋势确认。`
+    ? `未来3-5个交易日观察回踩MA10（${ma10.toFixed(2)}元）、MA20（${ma20.toFixed(2)}元）或MA30（${ma30.toFixed(2)}元）后企稳；若以1.5-4.0倍量比收盘突破${resistance.toFixed(2)}元，可作为趋势确认。`
     : falling
       ? `当前不宜追价，等待收盘重新站上MA20（${ma20.toFixed(2)}元）和MA30（${ma30.toFixed(2)}元），再观察MA5上穿MA10。`
-      : `未来3-10个交易日观察${support.toFixed(2)}元附近缩量企稳，或放量收盘突破${resistance.toFixed(2)}元后确认。`;
+      : `未来3-10个交易日观察${support.toFixed(2)}元附近缩量企稳，或以1.5-4.0倍量比收盘突破${resistance.toFixed(2)}元后确认。`;
   const stop = latest.close >= ma20
     ? ma20 * .97
     : Math.min(latest.close * .95, support * .98);
   const exit = `收盘连续2日跌破MA20（${ma20.toFixed(2)}元）应降低仓位；继续跌破MA30（${ma30.toFixed(2)}元）或有效跌破${stop.toFixed(2)}元时加强风控；接近${resistance.toFixed(2)}元但放量滞涨时分批止盈。`;
   const buyCondition = verdict === '可关注'
-    ? `不追涨，等待收盘站上${resistance.toFixed(2)}元且成交量达到20日均量1.2倍以上，或回踩${supportPrice.toFixed(2)}元附近缩量企稳后再评估。`
+    ? `不追涨，等待收盘站上${resistance.toFixed(2)}元且成交量处于20日均量1.5-4.0倍，或回踩${supportPrice.toFixed(2)}元附近缩量企稳后再评估。`
     : verdict === '不宜追高'
       ? `当前价格或指标偏热，等待回踩${supportPrice.toFixed(2)}元附近并让RSI回落至70以下，不满足前不介入。`
-      : `等待收盘突破${resistance.toFixed(2)}元、站稳MA30（${ma30.toFixed(2)}元）、MA5保持高于MA10且量比不低于1.2，再从“等待”转为“可关注”。`;
+      : `等待收盘突破${resistance.toFixed(2)}元、站稳MA30（${ma30.toFixed(2)}元）、MA5保持高于MA10且量比处于1.5-4.0倍，再从“等待”转为“可关注”。`;
   const risk = `ATR14为${atr14.toFixed(2)}元，20日年化波动约${volatility20.toFixed(1)}%，区间最大回撤${maxDrawdown.toFixed(1)}%；波动越高，观察仓位应越小。`;
   const tradePlan = buildTradePlan({
     latestPrice: latest.close, supportPrice, resistance, rangeHigh, recent10Low: Math.min(...rows.slice(-10).map(row => row.low)),
     ma5, ma10, ma20, ma30, atr14, volumeRatio, verdict
   });
+  const entryAssessment = assessCurrentEntry({
+    latestPrice: latest.close, ma5, ma10, ma20, ma30, supportPrice, resistance,
+    volumeRatio, rsi14, breakoutStatus: consolidationBreakout.status,
+    accumulationSetup, consolidationBreakout, macdHistogram, return20
+  });
+  if (['破位', '爆量观察', '结构偏弱'].includes(entryAssessment.status)) tradePlan.enabled = false;
   return {
     summary, ma5: roundMetric(ma5), ma10: roundMetric(ma10), ma20: roundMetric(ma20), ma30: roundMetric(ma30), ma60: roundMetric(ma60), maAlignment,
     rsi14: roundMetric(rsi14, 1), rangeLow: roundMetric(rangeLow), rangeHigh: roundMetric(rangeHigh),
@@ -3485,7 +3748,7 @@ function analyzeHistory(history) {
     bollUpper: roundMetric(bollUpper), bollMiddle: roundMetric(ma20), bollLower: roundMetric(bollLower),
     atr14: roundMetric(atr14), volatility20: roundMetric(volatility20, 1), maxDrawdown: roundMetric(maxDrawdown, 1),
     breakoutPrice: roundMetric(resistance), supportPrice: roundMetric(supportPrice), distanceToBreakout: roundMetric(distanceToBreakout),
-    score, verdict, buyCondition, risk, entry, exit, tradePlan,
+    score, verdict, buyCondition, risk, entry, exit, tradePlan, entryAssessment,
     reboundSignal, reboundScore, reboundReason, bottomDate: bottomRow.date,
     bottomPrice: roundMetric(bottomRow.low), bottomDrawdown: roundMetric(bottomDrawdown, 1),
     reboundFromBottom: roundMetric(reboundFromBottom, 1), bottomRangePosition: roundMetric(bottomRangePosition, 1),
@@ -3562,6 +3825,13 @@ async function fetchStockHistory({ code, name, force = false }) {
   } else if (riskProfile.status === 'unknown' && analysis.verdict === '可关注') {
     analysis.verdict = '等待确认';
   }
+  analysis = applyEntryContextAssessment(analysis, {
+    newsContext, riskProfile, marketOverview: marketOverviewCache?.value || null
+  });
+  if (!analysis.entryAssessment?.allowed && analysis.verdict === '可关注'
+    && ['消息风险待确认', '大盘偏弱，等待确认'].includes(analysis.entryAssessment.status)) {
+    analysis.verdict = '等待确认';
+  }
   analysis.newsImpact = newsContext.summary;
   const financialAnalysis = financialResult.status === 'fulfilled' ? financialResult.value.analysis : null;
   if (financialResult.status === 'fulfilled') errors.push(...(financialResult.value.errors || []));
@@ -3573,7 +3843,7 @@ async function fetchStockHistory({ code, name, force = false }) {
   });
   const breakoutConclusion = analysis.breakoutPotential?.available
     ? `横盘突破评估：${analysis.breakoutPotential.status}，${analysis.breakoutPotential.trigger}。` : '';
-  analysis.combinedConclusion = `${analysis.verdict}（技术评分${analysis.score}/100，CANSLIM可验证得分${investmentAnalysis.canslim.score ?? '--'}/100）。${analysis.buyCondition}${analysis.capitalSetupAssessment.summary}${breakoutConclusion}${newsContext.signal === '偏谨慎' ? '消息面存在风险关键词，需降低优先级。' : '消息面暂未发现与技术条件明显冲突的风险关键词。'}未来半年公司风险：${riskProfile.summary}。`;
+  analysis.combinedConclusion = `${analysis.verdict}（技术评分${analysis.score}/100，CANSLIM可验证得分${investmentAnalysis.canslim.score ?? '--'}/100）。${analysis.entryAssessment?.summary || analysis.buyCondition}${analysis.capitalSetupAssessment.summary}${breakoutConclusion}${newsContext.signal === '偏谨慎' ? '消息面存在风险关键词，需降低优先级。' : '消息面暂未发现与技术条件明显冲突的风险关键词。'}未来半年公司风险：${riskProfile.summary}。`;
   const analyzedAt = new Date().toISOString();
   const latestTradeDate = history.at(-1)?.date || '';
   return writeTimedCache(stockHistoryCache, cacheKey, { history, analysis: { ...analysis, source, latestTradeDate, analyzedAt }, fundFlowPeriod, financialAnalysis, investmentAnalysis, riskProfile, newsContext, errors, source, latestTradeDate, analyzedAt });
@@ -4015,8 +4285,10 @@ module.exports = {
   analyzeAccumulationSetup,
   analyzeConsolidationBreakout,
   combineConsolidationBreakout,
+  assessCurrentEntry,
   scoreConsolidationCandidate,
   applyIndividualCapitalAssessment,
+  applyEntryContextAssessment,
   analyzeHistory,
   mergeQuoteIntoHistory,
   parseReductionPlanWindow,

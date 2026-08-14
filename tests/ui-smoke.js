@@ -86,7 +86,7 @@ app.whenReady().then(async () => {
         boxDays:9, boxLow:8.00, boxHigh:8.60, rangePct:7.2, distanceToBreakoutPct:2.5,
         volumeCompressionRatio:.83, pressureTestCount:1, failedPressureCount:0,
         breakoutConfirmed:false, summary:'近9日横盘箱体8.00-8.60元，箱体宽度7.2%，现价距箱顶2.5%；量能压缩比0.83，放量试压1次',
-        trigger:'放量收盘突破8.60元，成交量至少达到20日均量1.2倍',
+        trigger:'放量收盘突破8.60元，成交量达到20日均量1.5-4.0倍',
         invalidation:'收盘跌破8.00元，或放量冲高回落后连续两日未收复箱顶'
       },
       breakoutPotential: {
@@ -95,10 +95,16 @@ app.whenReady().then(async () => {
         volumeCompressionRatio:.83, pressureTestCount:1, failedPressureCount:0,
         breakoutConfirmed:false,
         summary:'近9日横盘箱体8.00-8.60元；近10日主力净流入3.00亿；综合状态接近突破',
-        trigger:'放量收盘突破8.60元，成交量至少达到20日均量1.2倍',
+        trigger:'放量收盘突破8.60元，成交量达到20日均量1.5-4.0倍',
         invalidation:'收盘跌破8.00元，或放量冲高回落后连续两日未收复箱顶'
       },
       buyCondition: '等待放量突破7.40元且收盘站稳，当前不宜无条件追价。',
+      entryAssessment: {
+        allowed:true, status:'震荡洗盘，可分批低吸', tone:'positive', setupType:'sideways-washout',
+        summary:'近9日维持6.20-7.40元箱体，近5日量能压缩至20日均量的0.83倍，价格反复震荡但未破箱底，偏向缩量洗盘。近10日阶段主力净流入3.00亿，资金与量价结构相互确认。消息面偏积极，大盘环境偏强。',
+        structureSummary:'吸筹特征部分成立：五线粘合后温和放量3次；洗盘特征成立：近9日箱体内量能压缩比0.83，箱底未破。',
+        evidence:['现价7.25元','箱体6.20-7.40元','量能压缩比0.83','近10日阶段主力净流入3.00亿','消息面偏积极','大盘环境偏强']
+      },
       newsImpact: '消息面偏积极，但需等待量价确认。',
       combinedConclusion: '等待确认（技术评分76/100）。等待放量突破7.40元且收盘站稳。消息面偏积极，但需等待量价确认。',
       entry: '未来3-5个交易日回踩MA10后企稳，或放量突破7.40元再确认。',
@@ -109,7 +115,7 @@ app.whenReady().then(async () => {
         entrySteps: [
           { buyPct: 40, condition: '进入6.11-6.25元区间，缩量企稳' },
           { buyPct: 30, condition: '重新站上MA5并保持MA5不低于MA10' },
-          { buyPct: 30, condition: '收盘突破7.40元且量比达到1.2以上' }
+          { buyPct: 30, condition: '收盘突破7.40元且量比处于1.5-4.0倍' }
         ],
         targets: [{ price: 7.40, sellPct: 30 }, { price: 7.75, sellPct: 30 }, { price: 8.10, sellPct: 40 }],
         targetNotes: ['第一目标后保护到成本附近', '第二目标后以MA10保护', '第三目标退出剩余仓位'],
@@ -187,8 +193,8 @@ app.whenReady().then(async () => {
     fundSectors: [{ name: '半导体', changePct: 1.82, mainNet: 3260000000, leader: '中芯国际' }],
     limits: { upCount: 68, downCount: 7, upStocks: [{ code: '603567', name: '珍宝岛', industry: '中药' }], downStocks: [] },
     recommendations: [
-      { code: '603567', name: '珍宝岛', price:11.08, signal: '底部待反弹', newsLabel: '消息确认', signalScore: 84, verdict: '等待确认', score: 76, breakoutPrice: 7.40, supportPrice: 6.20, ma30: 6.42, reason: '底部待反弹；回撤充分且短均线改善；阶段低点以来存在正向消息催化。', canslim:{score:81,available:6,total:7}, factorAnalysis:{score:78,available:5,total:7,sectorProfile:{name:'中药',score:76,label:'强势板块'}}, newsContext: { summary: '最新消息偏积极。' } },
-      { code: '600111', name: '北方稀土股份', industry:'稀土', price:42.36, signal: '已反弹', newsLabel: '消息中性', signalScore: 80, verdict: '可关注', score: 78, breakoutPrice: 44.60, supportPrice: 39.20, ma30: 40.10, reason: '已反弹；站上MA20且MA5高于MA10；阶段低点以来消息面中性。', factorAnalysis:{score:70,available:4,total:7,sectorProfile:{name:'稀土',score:68,label:'活跃板块'}}, newsContext: { summary: '消息面中性。' } },
+      { code: '603567', name: '珍宝岛', price:11.08, changePct:-0.72, signal: '底部待反弹', newsLabel: '消息确认', signalScore: 84, verdict: '等待确认', score: 76, breakoutPrice: 7.40, supportPrice: 6.20, ma30: 6.42, reason: '底部待反弹；回撤充分且短均线改善；阶段低点以来存在正向消息催化。', canslim:{score:81,available:6,total:7}, factorAnalysis:{score:78,available:5,total:7,sectorProfile:{name:'中药',score:76,label:'强势板块'}}, newsContext: { summary: '最新消息偏积极。' } },
+      { code: '600111', name: '北方稀土股份', industry:'稀土', price:42.36, changePct:1.25, signal: '已反弹', newsLabel: '消息中性', signalScore: 80, verdict: '可关注', score: 78, breakoutPrice: 44.60, supportPrice: 39.20, ma30: 40.10, reason: '已反弹；站上MA20且MA5高于MA10；阶段低点以来消息面中性。', factorAnalysis:{score:70,available:4,total:7,sectorProfile:{name:'稀土',score:68,label:'活跃板块'}}, newsContext: { summary: '消息面中性。' } },
       ...Array.from({ length: 11 }, (_, index) => ({
         code: String(600200 + index), name: `测试推荐${index + 1}`, signal: '待突破', newsLabel: '消息中性',
         industry:index < 7 ? '半导体' : '软件', price:11.08 + index * .1, signalScore: 79 - index, verdict: '等待确认', score: 70 - index, breakoutPrice: 12.40,
@@ -351,6 +357,8 @@ app.whenReady().then(async () => {
     }))
   })`);
   const marketBatchLabelState = await win.webContents.executeJavaScript(`(() => {
+    const changeState = selector => [...document.querySelectorAll(selector)].map(node => ({ text:node.textContent.trim(), color:getComputedStyle(node).color }));
+    const marketChanges = changeState('#marketRecommendations .market-current-change');
     document.getElementById('addMarketRecommendations').click();
     const stockChoices = [...document.querySelectorAll('[data-market-stock-choice]')];
     const firstChoiceText = stockChoices[0]?.closest('.market-stock-choice')?.innerText || '';
@@ -362,9 +370,11 @@ app.whenReady().then(async () => {
     const firstPrice = document.querySelector('#marketStockChoices .market-current-price');
     const firstHead = document.querySelector('#marketStockChoices .market-stock-head');
     const firstPriceText = firstPrice?.textContent || '';
+    const choiceChanges = changeState('#marketStockChoices .market-current-change');
     const firstHeadLayout = firstHead ? { flexWrap:getComputedStyle(firstHead).flexWrap, whiteSpace:getComputedStyle(firstHead).whiteSpace, alignItems:getComputedStyle(firstHead).alignItems, headCenter:firstHead.getBoundingClientRect().top + firstHead.getBoundingClientRect().height / 2, priceCenter:firstPrice.getBoundingClientRect().top + firstPrice.getBoundingClientRect().height / 2 } : {};
     const stockHeads = [...document.querySelectorAll('#marketStockChoices .market-stock-head')];
     const allHeadsFit = stockHeads.every(head => head.scrollWidth <= head.clientWidth + 1);
+    const mainChangesWithinCards = [...document.querySelectorAll('#marketRecommendations .market-current-change')].every(node => node.getBoundingClientRect().right <= node.closest('.market-recommendation').getBoundingClientRect().right - 8);
     const longName = [...document.querySelectorAll('#marketStockChoices .market-stock-name')].find(node => node.textContent === '北方稀土股份');
     const longNameFullyVisible = Boolean(longName) && longName.scrollWidth <= longName.clientWidth + 1 && getComputedStyle(longName).textOverflow !== 'ellipsis';
     const coloredCount = getComputedStyle(document.querySelector('.market-label-count')).color;
@@ -381,7 +391,7 @@ app.whenReady().then(async () => {
     document.querySelector('[data-market-recommendation="600200"]').click();
     const breakoutDetailTags = [...document.querySelectorAll('#detailPanel .detail-tags .badge')].map(node => node.textContent.trim());
     document.querySelector('[data-market-recommendation="603567"]').click();
-    return { choiceCount:stockChoices.length, firstChoiceText, labelsAboveStocks, recommendationTitle, groupNames, groupOrders, hasIndividualIndustryTag, firstPriceText, firstHeadLayout, allHeadsFit, longNameFullyVisible, coloredCount, initialAll, afterClear, savedCount:label?.stocks?.length || 0, savedScore:savedStock?.score, savedSignalScore:savedStock?.signalScore, savedBreakoutTags:stockTagValues(savedBreakout), breakoutDetailTags, closed:document.getElementById('marketLabelPanel').classList.contains('hidden') };
+    return { choiceCount:stockChoices.length, firstChoiceText, labelsAboveStocks, recommendationTitle, groupNames, groupOrders, hasIndividualIndustryTag, firstPriceText, marketChanges, choiceChanges, firstHeadLayout, allHeadsFit, mainChangesWithinCards, longNameFullyVisible, coloredCount, initialAll, afterClear, savedCount:label?.stocks?.length || 0, savedScore:savedStock?.score, savedSignalScore:savedStock?.signalScore, savedBreakoutTags:stockTagValues(savedBreakout), breakoutDetailTags, closed:document.getElementById('marketLabelPanel').classList.contains('hidden') };
   })()`);
   await win.webContents.executeJavaScript(`
     window.scrollTo(0, document.body.scrollHeight);
@@ -720,6 +730,7 @@ app.whenReady().then(async () => {
     desktopLayoutState: (() => {
       const toolbar = document.querySelector('.toolbar');
       const marketHead = document.querySelector('.market-head');
+      const market = document.querySelector('.market');
       const labelHead = document.querySelector('.label-head');
       const hero = document.querySelector('.hero');
       const commandBox = document.querySelector('.command-box');
@@ -729,6 +740,7 @@ app.whenReady().then(async () => {
         labelHeadPosition: getComputedStyle(labelHead).position,
         searchPlaceholder: document.getElementById('searchInput').placeholder,
         refreshInToolbar: toolbar.contains(document.getElementById('refreshAll')),
+        marketWidth: Math.round(market.getBoundingClientRect().width),
         topAreaHeight: Math.round(commandBox.getBoundingClientRect().bottom - hero.getBoundingClientRect().top)
       };
     })()
@@ -743,6 +755,7 @@ app.whenReady().then(async () => {
     && state.desktopLayoutState.labelHeadPosition === 'sticky'
     && state.desktopLayoutState.searchPlaceholder.startsWith('线上股票搜索')
     && state.desktopLayoutState.refreshInToolbar
+    && state.desktopLayoutState.marketWidth >= 350
     && state.desktopLayoutState.topAreaHeight < 140;
   const backToTopUsable = state.backToTopState.position === 'fixed'
     && state.backToTopState.title === '回到顶部'
@@ -764,6 +777,11 @@ app.whenReady().then(async () => {
     && state.detailState.text.includes('未来3-10个交易日')
     && state.detailState.text.includes('离场 / 风控')
     && state.detailState.text.includes('是否适合购买')
+    && state.detailState.text.includes('当前入场结论：震荡洗盘，可分批低吸')
+    && state.detailState.text.includes('偏向缩量洗盘')
+    && state.detailState.text.includes('吸筹 / 洗盘评估：吸筹特征部分成立')
+    && state.detailState.text.includes('近10日阶段主力净流入3.00亿')
+    && state.detailState.text.includes('消息面偏积极 · 大盘环境偏强')
     && state.detailState.text.includes('当前放量')
     && state.detailState.text.includes('阶段主力资金')
     && state.detailState.text.includes('近10日主力买入8.00亿')
@@ -773,6 +791,7 @@ app.whenReady().then(async () => {
     && state.detailState.text.includes('箱顶 ¥8.60')
     && state.detailState.text.includes('箱底 ¥8.00')
     && state.detailState.text.includes('放量收盘突破8.60元')
+    && state.detailState.text.includes('20日均量1.5-4.0倍')
     && state.detailState.text.includes('收盘跌破8.00元')
     && state.detailState.text.includes('MA30 ¥6.42')
     && state.detailState.text.includes('低吸区间：¥6.11-¥6.25')
@@ -826,11 +845,20 @@ app.whenReady().then(async () => {
     && state.marketBatchLabelState.groupOrders.every(group => new Set(group).size === group.length)
     && !state.marketBatchLabelState.hasIndividualIndustryTag
     && state.marketBatchLabelState.firstPriceText === '¥11.08'
+    && state.marketBatchLabelState.marketChanges[0]?.text === '-0.72%'
+    && state.marketBatchLabelState.marketChanges[0]?.color === 'rgb(22, 163, 74)'
+    && state.marketBatchLabelState.marketChanges[1]?.text === '+1.25%'
+    && state.marketBatchLabelState.marketChanges[1]?.color === 'rgb(220, 38, 38)'
+    && state.marketBatchLabelState.choiceChanges[0]?.text === '-0.72%'
+    && state.marketBatchLabelState.choiceChanges[0]?.color === 'rgb(22, 163, 74)'
+    && state.marketBatchLabelState.choiceChanges[1]?.text === '+1.25%'
+    && state.marketBatchLabelState.choiceChanges[1]?.color === 'rgb(220, 38, 38)'
     && state.marketBatchLabelState.firstHeadLayout.flexWrap === 'nowrap'
     && state.marketBatchLabelState.firstHeadLayout.whiteSpace === 'nowrap'
     && state.marketBatchLabelState.firstHeadLayout.alignItems === 'center'
     && Math.abs(state.marketBatchLabelState.firstHeadLayout.headCenter - state.marketBatchLabelState.firstHeadLayout.priceCenter) < 1
     && state.marketBatchLabelState.allHeadsFit
+    && state.marketBatchLabelState.mainChangesWithinCards
     && state.marketBatchLabelState.longNameFullyVisible
     && state.marketBatchLabelState.coloredCount === 'rgb(37, 99, 235)'
     && /珍宝岛[\s\S]*底部待反弹[\s\S]*消息确认[\s\S]*¥11\.08[\s\S]*推荐评分 84[\s\S]*多因子 78/.test(state.marketBatchLabelState.firstChoiceText)
