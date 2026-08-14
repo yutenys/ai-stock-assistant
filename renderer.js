@@ -33,6 +33,7 @@ const detailHistoryCache = new Map();
 const detailHistoryPending = new Map();
 const detailFundFlowCache = new Map();
 const detailChartCache = new Map();
+const detailRequestPending = new Map();
 const activeChartPeriod = new Map();
 const STORAGE_KEY = 'ai-stock-assistant-state-v1';
 
@@ -51,6 +52,13 @@ async function settleWithConcurrency(items, limit, task){
   });
   await Promise.all(workers);
   return results;
+}
+
+function withDetailPending(key, task){
+  if(detailRequestPending.has(key)) return detailRequestPending.get(key);
+  const pending = Promise.resolve().then(task).finally(() => detailRequestPending.delete(key));
+  detailRequestPending.set(key, pending);
+  return pending;
 }
 
 function escapeHtml(value){
@@ -1241,14 +1249,21 @@ function investmentAnalysisHtml(result){
   const quality = value.quality || financial?.quality || {};
   const financialRows = (financial?.rows || []).map(row => `<tr><td>${escapeHtml(row.report || '--')}</td><td>${row.eps == null ? '--' : formatNumber(row.eps,2)}</td><td>${row.epsGrowth == null ? '--' : formatPct(row.epsGrowth)}</td><td>${row.revenueGrowth == null ? '--' : formatPct(row.revenueGrowth)}</td><td>${row.profitGrowth == null ? '--' : formatPct(row.profitGrowth)}</td><td>${row.roe == null ? '--' : formatPct(row.roe)}</td><td>${row.cashPerShare == null ? '--' : formatNumber(row.cashPerShare,2)}</td></tr>`).join('');
   const risks = financial?.hardRisks || [];
+  const qualityScore = quality.score !== null && quality.score !== '' && Number.isFinite(Number(quality.score))
+    ? `${escapeHtml(quality.score)}/100` : '未评分';
+  const financialRiskHtml = !financial
+    ? '<p><b>财务红旗：</b>未核验，财务接口暂时不可用。</p>'
+    : risks.length
+      ? `<p class="financial-risk"><b>财务红旗：</b>${risks.map(escapeHtml).join('；')}。</p>`
+      : '<p><b>财务红旗：</b>当前已获取指标未触发硬性恶化条件；仍不等于财务无风险。</p>';
   return `<section class="investment-framework">
     <h3>CANSLIM 与价值质量分析</h3>
     <div class="analysis-verdict"><div class="analysis-score"><b>${escapeHtml(canslim?.score ?? '--')}</b><span>CANSLIM / 100</span></div><div><p><b>可验证覆盖：</b>${escapeHtml(canslim?.available ?? 0)}/${escapeHtml(canslim?.total ?? 7)}维，原始得分 ${escapeHtml(canslim?.rawScore ?? '--')}/${escapeHtml(canslim?.availableMax ?? '--')}。</p><p>${escapeHtml(canslim?.note || '缺失项不推测。')}</p></div></div>
     <div class="framework-table-wrap"><table class="framework-table"><thead><tr><th>维度</th><th>得分</th><th>真实数据依据</th></tr></thead><tbody>${dimensionRows || '<tr><td colspan="3">CANSLIM数据不足</td></tr>'}</tbody></table></div>
-    <div class="value-summary"><p><b>价值综合分：</b>${escapeHtml(value.score ?? '--')}/100；<b>财务质量：</b>${escapeHtml(quality.score ?? '--')}/100；<b>估值分：</b>${escapeHtml(value.valuationScore ?? '--')}/100。</p>
-      <p><b>PE / PB：</b>${value.pe == null ? '--' : formatNumber(value.pe,1)} / ${value.pb == null ? '--' : formatNumber(value.pb,1)}；<b>质量依据：</b>${escapeHtml(quality.evidence || '数据不可用')}。</p>
+    <div class="value-summary"><p><b>价值综合分：</b>${escapeHtml(value.score ?? '--')}/100；<b>财务质量：</b>${qualityScore}；<b>估值分：</b>${escapeHtml(value.valuationScore ?? '--')}/100。</p>
+      <p><b>PE / PB：</b>${value.pe == null ? '--' : formatNumber(value.pe,1)} / ${value.pb == null ? '--' : formatNumber(value.pb,1)}；<b>质量依据：</b>${escapeHtml(quality.evidence || '财务接口暂时不可用，本次不生成财务质量评分')}。</p>
       <p><b>DCF：</b>${escapeHtml(value.dcf?.evidence || '数据不可用')}。</p><p><b>护城河：</b>${escapeHtml(value.moat?.evidence || '数据不可用')}。</p>
-      ${risks.length ? `<p class="financial-risk"><b>财务红旗：</b>${risks.map(escapeHtml).join('；')}。</p>` : '<p><b>财务红旗：</b>当前已获取指标未触发硬性恶化条件；仍不等于财务无风险。</p>'}
+      ${financialRiskHtml}
       <p><b>数据源：</b>${escapeHtml(financial?.source || value.source || '--')}；<b>最新报告期：</b>${escapeHtml(financial?.latestReport || '--')}。</p></div>
     <div class="framework-table-wrap"><table class="framework-table financial-table"><thead><tr><th>报告期</th><th>EPS</th><th>EPS同比</th><th>营收同比</th><th>净利同比</th><th>ROE</th><th>经营现金流/股</th></tr></thead><tbody>${financialRows || '<tr><td colspan="7">季度财务序列不可用</td></tr>'}</tbody></table></div>
   </section>`;
@@ -1364,63 +1379,73 @@ async function loadStockFundFlow(s, force=false){
     renderFundFlow(updated);
     return cached;
   }
-  source.innerHTML = '<b>资金数据：</b>正在汇总主力流入/流出...';
-  try{
-    const result = await window.stockApi.fetchStockFundFlow({code:s.code, force});
-    detailFundFlowCache.set(s.code, result);
-    const updated = mergeFundFlow(s.code, result);
-    renderFundFlow(updated);
-    if(detailHistoryCache.has(s.code)) renderHistoryAnalysis(updated, detailHistoryCache.get(s.code));
-    saveState();
-    (result.errors || []).forEach(message => addLog('warn', `资金源切换：${message}`));
-    return result;
-  }catch(err){
-    source.innerHTML = `<b>资金数据：</b>获取失败：${escapeHtml(err.message || err)}`;
-    addLog('error', `资金汇总失败：${s.name} ${err.message || err}`);
-    return null;
-  }
+  return withDetailPending(`fund:${s.code}`, async () => {
+    source.innerHTML = '<b>资金数据：</b>正在汇总主力流入/流出...';
+    try{
+      const result = await window.stockApi.fetchStockFundFlow({code:s.code, force});
+      detailFundFlowCache.set(s.code, result);
+      const updated = mergeFundFlow(s.code, result);
+      renderFundFlow(updated);
+      if(detailHistoryCache.has(s.code)) renderHistoryAnalysis(updated, detailHistoryCache.get(s.code));
+      saveState();
+      (result.errors || []).forEach(message => addLog('warn', `资金源切换：${message}`));
+      return result;
+    }catch(err){
+      if(source.isConnected) source.innerHTML = `<b>资金数据：</b>获取失败：${escapeHtml(err.message || err)}`;
+      addLog('error', `资金汇总失败：${s.name} ${err.message || err}`);
+      return null;
+    }
+  });
 }
 
 async function loadLatestDetailQuote(s){
   if(!window.stockApi?.fetchQuotes) return;
-  try{
-    const result = parseQuoteResponse(await window.stockApi.fetchQuotes([s.code]));
-    recordQuoteMessages(result);
-    if(!result.quotes.length) throw new Error(result.errors.join('；') || '未获取到最新行情');
-    applyQuoteData(result.quotes);
-    const updated = findStockByCode(s.code);
-    const values = {
-      price: yuan(updated.price), changePct: formatPct(updated.changePct), change: formatNumber(updated.change),
-      open: yuan(updated.open), high: yuan(updated.high), low: yuan(updated.low), prevClose: yuan(updated.prevClose),
-      volume: volume(updated.volume), amount: money(updated.amount), totalMarketCap: marketCapValue(updated.totalMarketCap),
-      floatMarketCap: metricValue(updated.floatMarketCap, money)
-    };
-    Object.entries(values).forEach(([name, value]) => {
-      const node = document.querySelector(`[data-quote-${name}-for="${s.code}"]`);
-      if(node) node.textContent = value;
-    });
-    const pctNode = document.querySelector(`[data-quote-changePct-for="${s.code}"]`);
-    if(pctNode) pctNode.parentElement.className = pctClass(updated.changePct);
-    const current = document.querySelector(`[data-current-for="${s.code}"]`);
-    if(current) current.innerHTML = `<b>当前情况：</b>${escapeHtml(updated.news || '--')}`;
-    const source = document.querySelector(`[data-quote-source-for="${s.code}"]`);
-    if(source) source.innerHTML = `<b>行情数据源：</b>${escapeHtml(updated.source || '--')}；<b>更新时间：</b>${updated.fetchedAt ? escapeHtml(new Date(updated.fetchedAt).toLocaleString('zh-CN', {hour12:false})) : '--'}`;
-    if(detailHistoryCache.has(s.code)) renderHistoryAnalysis(updated, detailHistoryCache.get(s.code));
-    saveState();
-    renderLabels();
-    return updated;
-  }catch(err){
-    const source = document.querySelector(`[data-quote-source-for="${s.code}"]`);
-    if(source) source.innerHTML = `<b>行情更新失败：</b>${escapeHtml(err.message || err)}；当前保留原数据。`;
-    notify(`个股最新行情获取失败：${err.message || err}`, 'error');
-    return null;
-  }
+  return withDetailPending(`quote:${s.code}`, async () => {
+    try{
+      const result = parseQuoteResponse(await window.stockApi.fetchQuotes([s.code]));
+      recordQuoteMessages(result);
+      if(!result.quotes.length) throw new Error(result.errors.join('；') || '未获取到最新行情');
+      applyQuoteData(result.quotes);
+      const updated = findStockByCode(s.code);
+      const values = {
+        price: yuan(updated.price), changePct: formatPct(updated.changePct), change: formatNumber(updated.change),
+        open: yuan(updated.open), high: yuan(updated.high), low: yuan(updated.low), prevClose: yuan(updated.prevClose),
+        volume: volume(updated.volume), amount: money(updated.amount), totalMarketCap: marketCapValue(updated.totalMarketCap),
+        floatMarketCap: metricValue(updated.floatMarketCap, money),
+        turnoverRate: metricValue(updated.turnoverRate, value => `${formatNumber(value,2)}%`),
+        peRatio: metricValue(updated.peRatio, value => formatNumber(value,2)),
+        pbRatio: metricValue(updated.pbRatio, value => formatNumber(value,2)),
+        snapshotVolumeRatio: metricValue(updated.snapshotVolumeRatio, value => formatNumber(value,2)),
+        amplitude: metricValue(updated.amplitude, value => `${formatNumber(value,2)}%`),
+        upperLimit: metricValue(updated.upperLimit, yuan), lowerLimit: metricValue(updated.lowerLimit, yuan)
+      };
+      Object.entries(values).forEach(([name, value]) => {
+        const node = document.querySelector(`[data-quote-${name}-for="${s.code}"]`);
+        if(node) node.textContent = value;
+      });
+      const pctNode = document.querySelector(`[data-quote-changePct-for="${s.code}"]`);
+      if(pctNode) pctNode.parentElement.className = pctClass(updated.changePct);
+      const current = document.querySelector(`[data-current-for="${s.code}"]`);
+      if(current) current.innerHTML = `<b>当前情况：</b>${escapeHtml(updated.news || '--')}`;
+      const source = document.querySelector(`[data-quote-source-for="${s.code}"]`);
+      if(source) source.innerHTML = `<b>行情数据源：</b>${escapeHtml(updated.source || '--')}；<b>更新时间：</b>${updated.fetchedAt ? escapeHtml(new Date(updated.fetchedAt).toLocaleString('zh-CN', {hour12:false})) : '--'}`;
+      if(detailHistoryCache.has(s.code)) renderHistoryAnalysis(updated, detailHistoryCache.get(s.code));
+      saveState();
+      renderLabels();
+      return updated;
+    }catch(err){
+      const source = document.querySelector(`[data-quote-source-for="${s.code}"]`);
+      if(source) source.innerHTML = `<b>行情更新失败：</b>${escapeHtml(err.message || err)}；当前保留原数据。`;
+      notify(`个股最新行情获取失败：${err.message || err}`, 'error');
+      return null;
+    }
+  });
 }
 
 async function fetchStockAnalysis(s, force=false){
   if(!force && detailHistoryCache.has(s.code)) return detailHistoryCache.get(s.code);
   if(!window.stockApi?.fetchStockHistory) return null;
-  const pendingKey = `${s.code}:${force ? 'force' : 'normal'}`;
+  const pendingKey = s.code;
   if(detailHistoryPending.has(pendingKey)) return detailHistoryPending.get(pendingKey);
   const pending = window.stockApi.fetchStockHistory({code:s.code, name:s.name, force})
     .then(result => {
@@ -1436,7 +1461,7 @@ async function fetchStockAnalysis(s, force=false){
 
 async function ensureLabelScores(labelStocks){
   const missing = (labelStocks || []).filter(stock => !detailHistoryCache.has(stock.code)
-    && !detailHistoryPending.has(`${stock.code}:normal`));
+    && !detailHistoryPending.has(stock.code));
   if(!missing.length) return;
   const results = await settleWithConcurrency(missing, 3, stock => fetchStockAnalysis(stock));
   const changed = results.some(result => result.status === 'fulfilled' && result.value);
@@ -1470,7 +1495,9 @@ async function refreshActiveFundFlow(codes){
 }
 
 function refreshSecondaryData(codes){
-  Promise.allSettled([refreshAnalysisScores(codes), refreshActiveFundFlow(codes)])
+  const activeCodes = activeDetailCode && (codes || []).includes(activeDetailCode) ? [activeDetailCode] : [];
+  if(!activeCodes.length) return;
+  Promise.allSettled([refreshAnalysisScores(activeCodes), refreshActiveFundFlow(activeCodes)])
     .then(() => {
       saveState();
       renderStocks();
@@ -1834,35 +1861,45 @@ async function loadStockChart(s, period = 'day', force=false){
   if(legend) legend.innerHTML = chartLegendHtml(period);
   if(!canvas || !meta || !window.stockApi?.fetchStockChart) return;
   const cacheKey = `${s.code}-${period}`;
-  delete canvas.dataset.rendered;
-  meta.textContent = '正在加载走势数据...';
-  if(refreshButton){
-    refreshButton.disabled = true;
-    refreshButton.textContent = '刷新中';
-  }
-  try{
-    let result = force ? null : detailChartCache.get(cacheKey);
-    if(!result){
-      result = await window.stockApi.fetchStockChart({code:s.code, period, force});
-      detailChartCache.set(cacheKey, result);
-    }
-    if(activeChartPeriod.get(s.code) !== period || !canvas.isConnected) return result;
+  if(!force && detailChartCache.has(cacheKey)){
+    const result = detailChartCache.get(cacheKey);
     const referencePrice = result.previousClose ?? s.prevClose;
     drawStockChart(canvas, result.rows, period, referencePrice);
     const latestIndex = result.rows.length - 1;
     const closeSummary = period === 'minute' ? '' : ` · 收盘 ${yuan(Number(result.rows[latestIndex]?.close))} · 涨跌 ${formatPct(chartChangePct(result.rows, latestIndex, period, referencePrice))}`;
     meta.textContent = `${result.source || '行情接口'} · ${result.rows.length} 个数据点${period === 'day' || period === 'week' || period === 'month' ? ' · 均线 MA5 / MA10 / MA20 / MA30 / MA60' : ''}${closeSummary}`;
     return result;
-  }catch(err){
-    meta.textContent = `走势加载失败：${err.message || err}`;
-    addLog('error', `走势加载失败：${s.name} ${period} ${err.message || err}`);
-    return null;
-  }finally{
-    if(refreshButton?.isConnected){
-      refreshButton.disabled = false;
-      refreshButton.textContent = '刷新';
-    }
   }
+  if(detailRequestPending.has(`chart:${cacheKey}`)) return detailRequestPending.get(`chart:${cacheKey}`);
+  delete canvas.dataset.rendered;
+  meta.textContent = '正在加载走势数据...';
+  if(refreshButton){
+    refreshButton.disabled = true;
+    refreshButton.textContent = '刷新中';
+  }
+  return withDetailPending(`chart:${cacheKey}`, async () => {
+    try{
+      let result = null;
+      result = await window.stockApi.fetchStockChart({code:s.code, period, force});
+      detailChartCache.set(cacheKey, result);
+      if(activeChartPeriod.get(s.code) !== period || !canvas.isConnected) return result;
+      const referencePrice = result.previousClose ?? s.prevClose;
+      drawStockChart(canvas, result.rows, period, referencePrice);
+      const latestIndex = result.rows.length - 1;
+      const closeSummary = period === 'minute' ? '' : ` · 收盘 ${yuan(Number(result.rows[latestIndex]?.close))} · 涨跌 ${formatPct(chartChangePct(result.rows, latestIndex, period, referencePrice))}`;
+      meta.textContent = `${result.source || '行情接口'} · ${result.rows.length} 个数据点${period === 'day' || period === 'week' || period === 'month' ? ' · 均线 MA5 / MA10 / MA20 / MA30 / MA60' : ''}${closeSummary}`;
+      return result;
+    }catch(err){
+      meta.textContent = `走势加载失败：${err.message || err}`;
+      addLog('error', `走势加载失败：${s.name} ${period} ${err.message || err}`);
+      return null;
+    }finally{
+      if(refreshButton?.isConnected){
+        refreshButton.disabled = false;
+        refreshButton.textContent = '刷新';
+      }
+    }
+  });
 }
 
 async function loadCompanyProfile(s, force=false){
@@ -1873,18 +1910,20 @@ async function loadCompanyProfile(s, force=false){
     renderCompanyProfile(s.code, cached, s);
     return cached;
   }
-  box.innerHTML = '<p><b>公司产业：</b>正在加载公司资料...</p>';
-  try{
-    const result = await window.stockApi.fetchCompanyProfile({code:s.code, name:s.name, sector:s.sector, force});
-    detailProfileCache.set(s.code, result);
-    renderCompanyProfile(s.code, result, s);
-    (result?.errors || []).forEach(msg => addLog('error', msg));
-    return result;
-  }catch(err){
-    renderCompanyProfile(s.code, {}, s);
-    addLog('error', `公司资料加载失败：${s.name} ${err.message || err}`);
-    return null;
-  }
+  return withDetailPending(`profile:${s.code}`, async () => {
+    box.innerHTML = '<p><b>公司产业：</b>正在加载公司资料...</p>';
+    try{
+      const result = await window.stockApi.fetchCompanyProfile({code:s.code, name:s.name, sector:s.sector, force});
+      detailProfileCache.set(s.code, result);
+      renderCompanyProfile(s.code, result, s);
+      (result?.errors || []).forEach(msg => addLog('error', msg));
+      return result;
+    }catch(err){
+      renderCompanyProfile(s.code, {}, s);
+      addLog('error', `公司资料加载失败：${s.name} ${err.message || err}`);
+      return null;
+    }
+  });
 }
 
 function renderStockNews(code, result){
@@ -1927,18 +1966,20 @@ async function loadStockNews(s, force=false){
     renderStockNews(s.code, cached);
     return cached;
   }
-  box.innerHTML = '<div class="note inline-note">正在加载最新资讯...</div>';
-  try{
-    const result = await window.stockApi.fetchStockNews({code:s.code, name:s.name, force});
-    detailNewsCache.set(s.code, result);
-    renderStockNews(s.code, result);
-    (result?.errors || []).forEach(msg => addLog('error', msg));
-    return result;
-  }catch(err){
-    box.innerHTML = `<div class="note inline-note">资讯加载失败：${escapeHtml(err.message || err)}</div>`;
-    addLog('error', `资讯加载失败：${s.name} ${err.message || err}`);
-    return null;
-  }
+  return withDetailPending(`news:${s.code}`, async () => {
+    box.innerHTML = '<div class="note inline-note">正在加载最新资讯...</div>';
+    try{
+      const result = await window.stockApi.fetchStockNews({code:s.code, name:s.name, force});
+      detailNewsCache.set(s.code, result);
+      renderStockNews(s.code, result);
+      (result?.errors || []).forEach(msg => addLog('error', msg));
+      return result;
+    }catch(err){
+      if(box.isConnected) box.innerHTML = `<div class="note inline-note">资讯加载失败：${escapeHtml(err.message || err)}</div>`;
+      addLog('error', `资讯加载失败：${s.name} ${err.message || err}`);
+      return null;
+    }
+  });
 }
 
 async function refreshStockDetail(s){
@@ -1946,26 +1987,28 @@ async function refreshStockDetail(s){
   if(!button || button.disabled) return;
   button.disabled = true;
   button.textContent = '刷新分析中';
-  detailNewsCache.delete(s.code);
   addLog('info', `开始刷新个股综合分析：${s.name} ${s.code}`);
   const period = activeChartPeriod.get(s.code) || 'day';
   try{
-    const results = await Promise.all([
+    const results = await Promise.allSettled([
       loadLatestDetailQuote(s),
-      loadStockFundFlow(s, true),
-      loadStockHistory(s, true),
-      loadCompanyProfile(s, true),
-      loadStockChart(s, period, true),
+      loadStockHistory(s, true)
+    ]);
+    const updated = findStockByCode(s.code) || s;
+    const historyResult = detailHistoryCache.get(s.code)
+      || (results[1].status === 'fulfilled' ? results[1].value : null);
+    if(activeDetailCode === s.code && historyResult) renderHistoryAnalysis(updated, historyResult);
+    const failed = results.filter(result => result.status === 'rejected' || !result.value).length;
+    const partialErrors = results.flatMap(result => result.status === 'fulfilled' ? result.value?.errors || [] : []).length;
+    void Promise.allSettled([
+      loadStockFundFlow(updated, false),
+      loadCompanyProfile(updated, false),
+      loadStockChart(updated, period, false),
+      loadStockNews(updated, false),
       latestMarketOverview || loadMarketOverview(false, true)
     ]);
-    const newsResult = await loadStockNews(findStockByCode(s.code) || s, false);
-    const updated = findStockByCode(s.code) || s;
-    const historyResult = detailHistoryCache.get(s.code) || results[2];
-    if(activeDetailCode === s.code && historyResult) renderHistoryAnalysis(updated, historyResult);
-    const failed = results.filter(result => !result).length + (newsResult ? 0 : 1);
-    const partialErrors = results.flatMap(result => result?.errors || []).length + (newsResult?.errors?.length || 0);
     if(failed) notify(`个股综合分析部分刷新失败（${failed}项），已保留可用数据`, 'warn');
-    else notify(partialErrors ? '个股综合分析已更新，部分数据源已自动切换' : '个股综合分析已按最新行情、消息和大盘数据更新', partialErrors ? 'warn' : 'success');
+    else notify(partialErrors ? '个股综合分析已更新，部分数据源已自动切换' : '个股最新行情与技术分析已更新', partialErrors ? 'warn' : 'success');
     addLog(failed ? 'warn' : 'success', `个股综合分析刷新完成：${s.name}`, {failed, partialErrors, period});
   }catch(err){
     notify(`个股综合分析刷新失败：${err.message || err}`, 'error');
@@ -2002,6 +2045,13 @@ function renderDetailPanel(){
       <div><b data-quote-prevClose-for="${s.code}">${yuan(s.prevClose)}</b><span>昨收</span></div>
       <div><b data-quote-volume-for="${s.code}">${volume(s.volume)}</b><span>成交量</span></div>
       <div><b data-quote-amount-for="${s.code}">${money(s.amount)}</b><span>成交额</span></div>
+      <div><b data-quote-turnoverRate-for="${s.code}">${metricValue(s.turnoverRate, value => `${formatNumber(value,2)}%`)}</b><span>换手率</span></div>
+      <div><b data-quote-snapshotVolumeRatio-for="${s.code}">${metricValue(s.snapshotVolumeRatio, value => formatNumber(value,2))}</b><span>量比</span></div>
+      <div><b data-quote-amplitude-for="${s.code}">${metricValue(s.amplitude, value => `${formatNumber(value,2)}%`)}</b><span>振幅</span></div>
+      <div><b data-quote-peRatio-for="${s.code}">${metricValue(s.peRatio, value => formatNumber(value,2))}</b><span>动态 PE</span></div>
+      <div><b data-quote-pbRatio-for="${s.code}">${metricValue(s.pbRatio, value => formatNumber(value,2))}</b><span>PB</span></div>
+      <div><b data-quote-upperLimit-for="${s.code}">${metricValue(s.upperLimit, yuan)}</b><span>涨停价</span></div>
+      <div><b data-quote-lowerLimit-for="${s.code}">${metricValue(s.lowerLimit, yuan)}</b><span>跌停价</span></div>
       <div><b data-fund-in-for="${s.code}">${metricValue(s.mainInflow, money)}</b><span>主力流入</span></div>
       <div><b data-fund-out-for="${s.code}">${metricValue(s.mainOutflow, money)}</b><span>主力流出</span></div>
       <div><b data-fund-net-for="${s.code}">${metricValue(s.mainNetInflow, money)}</b><span>主力净额</span></div>
@@ -2051,13 +2101,13 @@ function renderDetailPanel(){
     const input = panel.querySelector(`[data-sim-sell-quantity="${button.dataset.simCode}"]`);
     if(input) input.value = String(quantity);
   });
-  panel.querySelectorAll('[data-chart-period]').forEach(button => button.onclick = () => loadStockChart(s, button.dataset.chartPeriod, true));
+  panel.querySelectorAll('[data-chart-period]').forEach(button => button.onclick = () => loadStockChart(s, button.dataset.chartPeriod, false));
   panel.querySelectorAll('[data-chart-refresh]').forEach(button => button.onclick = () => loadStockChart(s, activeChartPeriod.get(s.code) || chartPeriod, true));
   loadCompanyProfile(s);
-  loadStockHistory(s, forceLatest);
-  loadStockNews(s, forceLatest);
-  loadStockChart(s, chartPeriod, forceLatest);
-  loadStockFundFlow(s, forceLatest);
+  loadStockHistory(s, false);
+  loadStockNews(s, false);
+  loadStockChart(s, chartPeriod, false);
+  loadStockFundFlow(s, false);
   if(forceLatest) loadLatestDetailQuote(s);
 }
 
@@ -2118,6 +2168,13 @@ function applyQuoteData(quotes){
       low: q.low ?? s.low,
       open: q.open ?? s.open,
       prevClose: q.prevClose ?? s.prevClose,
+      amplitude: q.amplitude ?? s.amplitude,
+      turnoverRate: q.turnoverRate ?? s.turnoverRate,
+      peRatio: q.peRatio ?? s.peRatio,
+      snapshotVolumeRatio: q.snapshotVolumeRatio ?? s.snapshotVolumeRatio,
+      pbRatio: q.pbRatio ?? s.pbRatio,
+      upperLimit: q.upperLimit ?? s.upperLimit,
+      lowerLimit: q.lowerLimit ?? s.lowerLimit,
       totalMarketCap: q.totalMarketCap ?? s.totalMarketCap,
       floatMarketCap: q.floatMarketCap ?? s.floatMarketCap,
       mainNetInflow: q.mainNetInflow ?? s.mainNetInflow,

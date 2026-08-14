@@ -8,6 +8,10 @@ app.disableHardwareAcceleration();
 app.whenReady().then(async () => {
   let quoteRequestCount = 0;
   let marketRequestCount = 0;
+  let fundFlowRequestCount = 0;
+  let profileRequestCount = 0;
+  let newsRequestCount = 0;
+  let historyRequestCount = 0;
   ipcMain.handle('append-operation-log', async () => true);
   ipcMain.handle('run-industry-workflow', async () => ({
     subject: '中药',
@@ -17,11 +21,13 @@ app.whenReady().then(async () => {
   ipcMain.handle('fetch-a-share-quotes', async () => {
     quoteRequestCount += 1;
     return {
-      quotes: [{ code: '603567', name: '珍宝岛', price: 11.08, change: -0.08, changePct: -0.72, open: 11.16, high: 11.25, low: 11.02, prevClose: 11.16, amount: 389000000, mainNetInflow: 1666200, mainNetPct: 0.43, floatMarketCap: 6454000000, totalMarketCap: 9432000000, source: `腾讯实时行情 + 东方财富资金#${quoteRequestCount}`, fetchedAt: new Date(2026, 7, 12, 11, 17, quoteRequestCount).toISOString() }],
+      quotes: [{ code: '603567', name: '珍宝岛', price: 11.08, change: -0.08, changePct: -0.72, open: 11.16, high: 11.25, low: 11.02, prevClose: 11.16, volume: 350000, amount: 389000000, turnoverRate: 3.26, peRatio: 28.61, pbRatio: 3.22, snapshotVolumeRatio: 1.43, amplitude: 2.06, upperLimit: 12.28, lowerLimit: 10.04, mainNetInflow: 1666200, mainNetPct: 0.43, floatMarketCap: 6454000000, totalMarketCap: 9432000000, source: `腾讯实时行情 + 东方财富资金#${quoteRequestCount}`, fetchedAt: new Date(2026, 7, 12, 11, 17, quoteRequestCount).toISOString() }],
       errors: [], warnings: [], requested: 1, updated: 1, cached: 0, failed: 0
     };
   });
-  ipcMain.handle('fetch-stock-fund-flow', async () => ({
+  ipcMain.handle('fetch-stock-fund-flow', async () => {
+    fundFlowRequestCount += 1;
+    return ({
     mainInflow: 32662000,
     mainOutflow: 30995800,
     mainNetInflow: 1666200,
@@ -30,20 +36,29 @@ app.whenReady().then(async () => {
     tradeDate: '2026-08-12',
     estimated: true,
     errors: []
-  }));
-  ipcMain.handle('fetch-company-profile', async () => ({
-    profile: { industry: '中药', business: '中药材种植、中成药研发生产与销售。', products: '中成药；中药材', summary: '公司主营中药制剂，业务覆盖研发、生产和销售。', source: '公司资料接口' },
+    });
+  });
+  ipcMain.handle('fetch-company-profile', async () => {
+    profileRequestCount += 1;
+    return ({
+    profile: { industry: '中药', business: '中药材种植、中成药研发生产与销售。', products: '中成药；中药材', summary: '公司主营中药制剂，业务覆盖研发、生产和销售。', source: `公司资料接口#${profileRequestCount}` },
     errors: []
-  }));
-  ipcMain.handle('fetch-stock-news', async () => ({
+    });
+  });
+  ipcMain.handle('fetch-stock-news', async () => {
+    newsRequestCount += 1;
+    return ({
     news: [
       { title: '较早资讯', link: 'https://example.com/old', publishedAt: '2026-08-10 09:00:00', source: '测试资讯' },
       { title: '最新资讯', link: 'https://example.com/new', publishedAt: '2026-08-12 10:00:00', source: '测试资讯' },
       { title: '次新资讯', link: 'https://example.com/middle', publishedAt: '2026-08-11 10:00:00', source: '测试资讯' }
     ],
     errors: []
-  }));
-  ipcMain.handle('fetch-stock-history', async (_event, request) => ({
+    });
+  });
+  ipcMain.handle('fetch-stock-history', async (_event, request) => {
+    historyRequestCount += 1;
+    return ({
     history: Array.from({ length: 66 }, (_, index) => ({ date: `2026-06-${String(index + 1).padStart(2, '0')}`, close: 6 + index * 0.01 })),
     analysis: {
       summary: '近3个月累计上涨18.42%，当前处于震荡上行阶段。',
@@ -104,7 +119,8 @@ app.whenReady().then(async () => {
       value:{score:80,valuationScore:74,quality:{available:true,score:86,evidence:'ROE18.0%，经营现金流/股1.20，流动比率2.00，资产负债率35.0%'},pe:28.6,pb:3.2,dcf:{available:false,evidence:'缺少可验证的自由现金流预测、净债务与增长假设，暂不计算DCF或目标价'},moat:{available:false,evidence:'护城河需要人工核验，当前不自动给高分'},source:'东方财富F10主要指标'}
     },
     errors: []
-  }));
+    });
+  });
   let chartRequestCount = 0;
   ipcMain.handle('fetch-stock-chart', async (_event, request) => ({
     period: request.period,
@@ -206,6 +222,14 @@ app.whenReady().then(async () => {
     const savedStock = saved.labels?.flatMap(label => label.stocks || []).find(stock => stock.code === '603567');
     return {before, after, savedPrice:savedStock?.price, savedChangePct:savedStock?.changePct};
   })()`);
+  const detailRequestsBeforeRefresh = {
+    quote: quoteRequestCount,
+    fundFlow: fundFlowRequestCount,
+    profile: profileRequestCount,
+    news: newsRequestCount,
+    history: historyRequestCount,
+    chart: chartRequestCount
+  };
   const detailRefreshState = await win.webContents.executeJavaScript(`(async () => {
     const button = document.querySelector('[data-detail-refresh="603567"]');
     const quoteSourceBefore = document.querySelector('[data-quote-source-for="603567"]')?.innerText || '';
@@ -224,6 +248,17 @@ app.whenReady().then(async () => {
       analysis:document.querySelector('[data-analysis-for="603567"]')?.innerText || ''
     };
   })()`);
+  detailRefreshState.requestCounts = {
+    before: detailRequestsBeforeRefresh,
+    after: {
+      quote: quoteRequestCount,
+      fundFlow: fundFlowRequestCount,
+      profile: profileRequestCount,
+      news: newsRequestCount,
+      history: historyRequestCount,
+      chart: chartRequestCount
+    }
+  };
   const chartState = await win.webContents.executeJavaScript(`(async () => {
     const periods = ['minute', 'five-day', 'day', 'week', 'month'];
     const rendered = [];
@@ -274,7 +309,13 @@ app.whenReady().then(async () => {
   const detailState = await win.webContents.executeJavaScript(`({
     text: document.getElementById('detailPanel').innerText,
     labelText: document.getElementById('labelStocks').innerText,
-    newsTitles: [...document.querySelectorAll('[data-news-for="603567"] .news-row b')].map(node => node.textContent)
+    newsTitles: [...document.querySelectorAll('[data-news-for="603567"] .news-row b')].map(node => node.textContent),
+    dimensionNames: [...document.querySelectorAll('[data-history-for="603567"] .framework-table:not(.financial-table) tbody td:first-child')].map(node => ({
+      text:node.innerText.trim(),
+      whiteSpace:getComputedStyle(node).whiteSpace,
+      lineHeight:parseFloat(getComputedStyle(node).lineHeight),
+      height:node.getBoundingClientRect().height
+    }))
   })`);
   const marketBatchLabelState = await win.webContents.executeJavaScript(`(() => {
     document.getElementById('addMarketRecommendations').click();
@@ -656,7 +697,22 @@ app.whenReady().then(async () => {
     && state.detailRefreshState.marketAfter.includes('上涨3210家、下跌1780家')
     && state.detailRefreshState.marketAfter.includes('板块表现：中药+2.31%')
     && state.detailRefreshState.marketAfter.includes('全市场筛选信号为底部待反弹')
-    && state.detailRefreshState.analysis.includes('大盘更新时间');
+    && state.detailRefreshState.analysis.includes('大盘更新时间')
+    && state.detailState.dimensionNames.length === 7
+    && state.detailState.dimensionNames.every(item => item.whiteSpace === 'nowrap')
+    && state.detailState.text.includes('3.26%\n换手率')
+    && state.detailState.text.includes('28.61\n动态 PE')
+    && state.detailState.text.includes('3.22\nPB')
+    && state.detailState.text.includes('1.43\n量比')
+    && state.detailState.text.includes('2.06%\n振幅')
+    && state.detailState.text.includes('¥12.28\n涨停价')
+    && state.detailState.text.includes('¥10.04\n跌停价')
+    && state.detailRefreshState.requestCounts.after.quote === state.detailRefreshState.requestCounts.before.quote + 1
+    && state.detailRefreshState.requestCounts.after.history === state.detailRefreshState.requestCounts.before.history + 1
+    && state.detailRefreshState.requestCounts.after.fundFlow === state.detailRefreshState.requestCounts.before.fundFlow
+    && state.detailRefreshState.requestCounts.after.profile === state.detailRefreshState.requestCounts.before.profile
+    && state.detailRefreshState.requestCounts.after.news === state.detailRefreshState.requestCounts.before.news
+    && state.detailRefreshState.requestCounts.after.chart === state.detailRefreshState.requestCounts.before.chart;
   const detailClickQuoteUsable = state.detailClickQuoteState.before.includes('¥9.99')
     && state.detailClickQuoteState.before.includes('今 -9.99%')
     && state.detailClickQuoteState.after.includes('¥11.08')

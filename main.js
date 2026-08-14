@@ -288,10 +288,11 @@ function requestText(url, timeout = 12000, extraHeaders = {}, encoding = 'utf8',
   return new Promise((resolve, reject) => {
     const client = url.startsWith('http://') ? http : https;
     const req = client.get(url, {
+      autoSelectFamily: true,
+      autoSelectFamilyAttemptTimeout: 250,
       headers: {
         'User-Agent': 'Mozilla/5.0',
         'Referer': 'https://quote.eastmoney.com/',
-        'Connection': 'close',
         ...extraHeaders
       }
     }, (res) => {
@@ -604,6 +605,13 @@ function normalizeQuoteRow(r) {
     low: typeof r.f16 === 'number' ? r.f16 : null,
     open: typeof r.f17 === 'number' ? r.f17 : null,
     prevClose: typeof r.f18 === 'number' ? r.f18 : null,
+    amplitude: typeof r.f7 === 'number' ? r.f7 : null,
+    turnoverRate: typeof r.f8 === 'number' ? r.f8 : null,
+    peRatio: typeof r.f9 === 'number' ? r.f9 : null,
+    snapshotVolumeRatio: typeof r.f10 === 'number' ? r.f10 : null,
+    pbRatio: typeof r.f23 === 'number' ? r.f23 : null,
+    upperLimit: typeof r.f51 === 'number' ? r.f51 : null,
+    lowerLimit: typeof r.f52 === 'number' ? r.f52 : null,
     totalMarketCap: typeof r.f20 === 'number' ? r.f20 : null,
     floatMarketCap: typeof r.f21 === 'number' ? r.f21 : null,
     mainNetInflow: typeof r.f62 === 'number' ? r.f62 : null,
@@ -614,7 +622,7 @@ function normalizeQuoteRow(r) {
 }
 
 async function fetchQuoteRows(codes) {
-  const fields = 'f12,f14,f2,f3,f4,f5,f6,f15,f16,f17,f18,f20,f21,f62,f184,f57,f58';
+  const fields = 'f12,f14,f2,f3,f4,f5,f6,f7,f8,f9,f10,f15,f16,f17,f18,f20,f21,f23,f51,f52,f62,f184,f57,f58';
   const secids = codes.map(secidOf).join(',');
   const url = `https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2&fields=${fields}&secids=${encodeURIComponent(secids)}&_=${Date.now()}`;
   const json = await getJsonWithRetry(url, 1);
@@ -711,6 +719,7 @@ async function fetchStockFundFlow({ code, force = false }) {
   if (!/^\d{6}$/.test(safeCode)) throw new Error('股票代码无效');
   const cached = force ? null : readTimedCache(stockFundFlowCache, safeCode, 2 * 60 * 1000);
   if (cached) return { ...cached, cached: true };
+  const previous = stockFundFlowCache.get(safeCode)?.value;
   const errors = [];
   const primary = await Promise.allSettled([
     fetchEastmoneySingleFundFlow(safeCode),
@@ -722,8 +731,14 @@ async function fetchStockFundFlow({ code, force = false }) {
     }
     errors.push(result.status === 'fulfilled' ? `${result.value.source}未提供主力流入/流出分项` : result.reason?.message || String(result.reason));
   }
-  const fallback = await fetchTencentEstimatedFundFlow(safeCode);
-  return writeTimedCache(stockFundFlowCache, safeCode, { ...fallback, errors });
+  try {
+    const fallback = await fetchTencentEstimatedFundFlow(safeCode);
+    return writeTimedCache(stockFundFlowCache, safeCode, { ...fallback, errors });
+  } catch (err) {
+    errors.push(`腾讯逐笔资金失败：${err.message || err}`);
+    if (previous) return { ...previous, cached: true, stale: true, errors };
+    throw new Error(errors.join('；'));
+  }
 }
 
 async function fetchSinaQuote(code) {
@@ -775,6 +790,13 @@ function normalizeTencentQuote(body) {
     low: finiteNumber(cols[34]),
     open: finiteNumber(cols[5]),
     prevClose: Number.isFinite(prevClose) ? prevClose : null,
+    amplitude: finiteNumber(cols[43]),
+    turnoverRate: finiteNumber(cols[38]),
+    peRatio: finiteNumber(cols[39]),
+    snapshotVolumeRatio: finiteNumber(cols[49]),
+    pbRatio: finiteNumber(cols[46]),
+    upperLimit: finiteNumber(cols[47]),
+    lowerLimit: finiteNumber(cols[48]),
     totalMarketCap: finiteNumber(cols[45]) == null ? null : Number(cols[45]) * 1e8,
     floatMarketCap: finiteNumber(cols[44]) == null ? null : Number(cols[44]) * 1e8,
     mainNetInflow: null,
@@ -1317,7 +1339,7 @@ function buildIndividualInvestmentAnalysis({ technical, financial, newsContext, 
     value: {
       score: availableScores.length ? clampRecommendationScore(average(availableScores)) : null,
       valuationScore,
-      quality: financial?.quality || { available:false, score:null, evidence:'财务质量数据不可用' },
+      quality: financial?.quality || { available:false, score:null, evidence:'财务接口暂时不可用，本次不生成财务质量评分' },
       pe, pb,
       dcf: { available:false, evidence:'缺少可验证的自由现金流预测、净债务与增长假设，暂不计算DCF或目标价' },
       moat: { available:false, evidence:'护城河需要主营结构、竞争优势和多年经营质量人工核验，当前不自动给高分' },
@@ -1372,16 +1394,21 @@ async function fetchEastmoneyNews(keyword, cacheKey = keyword, maxAgeMs = 10 * 6
 }
 
 async function fetchMarketNews(force = false) {
-  const maxAgeMs = force ? 0 : 45 * 1000;
+  const maxAgeMs = 5 * 60 * 1000;
   const keyword = 'A股 大盘 板块 资金 今日 最新消息';
+  const errors = [];
   try {
     const news = await fetchEastmoneyNews(keyword, 'market-overview-news', maxAgeMs);
     if (news.length) return news;
-  } catch {}
+  } catch (err) {
+    errors.push(`东方财富资讯失败：${err.message || err}`);
+  }
   try {
     return await fetchBingNews(keyword, 'market-overview-news-bing', maxAgeMs);
-  } catch {}
-  return [];
+  } catch (err) {
+    errors.push(`Bing资讯失败：${err.message || err}`);
+  }
+  throw new Error(errors.join('；') || '市场资讯接口未返回数据');
 }
 
 async function buildMarketRecommendations(marketQuotes, force = false) {
@@ -1622,6 +1649,13 @@ function marketAnalysis(result) {
 async function fetchMarketOverview(force = false) {
   if (!force && marketOverviewCache && Date.now() - marketOverviewCache.savedAt < 30 * 1000) return { ...marketOverviewCache.value, cached: true };
   const previousOverview = readDiskCache('market-overview', 24 * 60 * 60 * 1000);
+  const recommendationCache = marketOverviewCache?.value?.recommendations?.length
+    ? marketOverviewCache.value
+    : previousOverview;
+  const recommendationSavedAt = Date.parse(recommendationCache?.recommendationsFetchedAt || recommendationCache?.fetchedAt || '');
+  const reuseRecommendations = Boolean(recommendationCache?.recommendations?.length
+    && Number.isFinite(recommendationSavedAt)
+    && Date.now() - recommendationSavedAt < 10 * 60 * 1000);
   const result = { errors: [], fetchedAt: new Date().toISOString() };
   const [indicesResult, snapshotResult] = await Promise.allSettled([
     fetchTencentMarketIndices(), fetchTencentMarketSnapshot()
@@ -1636,14 +1670,20 @@ async function fetchMarketOverview(force = false) {
     result.errors.push(...snapshotResult.value.errors.map(error => `全市场行情部分失败：${error}`));
     const [sectorsResult, recommendationsResult, newsResult] = await Promise.allSettled([
       fetchTencentMarketSectors(snapshotResult.value.quotes),
-      buildMarketRecommendations(snapshotResult.value.quotes, force),
+      reuseRecommendations ? Promise.resolve(null) : buildMarketRecommendations(snapshotResult.value.quotes, force),
       fetchMarketNews(force)
     ]);
     if (sectorsResult.status === 'fulfilled') Object.assign(result, sectorsResult.value);
     else result.errors.push(`板块轮动失败：${sectorsResult.reason?.message || sectorsResult.reason}`);
-    if (recommendationsResult.status === 'fulfilled') {
+    if (recommendationsResult.status === 'fulfilled' && recommendationsResult.value) {
       result.recommendations = recommendationsResult.value.recommendations;
       result.recommendationCoverage = recommendationsResult.value.coverage;
+      result.recommendationsFetchedAt = new Date().toISOString();
+    } else if (reuseRecommendations) {
+      restoreCachedMarketRecommendations(result, recommendationCache, snapshotResult.value.quotes);
+      result.recommendationsFetchedAt = recommendationCache.recommendationsFetchedAt || recommendationCache.fetchedAt;
+      result.recommendationCoverage.cachedFallback = false;
+      delete result.recommendationFallback;
     }
     else result.errors.push(`技术形态候选分析失败：${recommendationsResult.reason?.message || recommendationsResult.reason}`);
     if (newsResult.status === 'fulfilled') result.newsContext = summarizeNews(newsResult.value);
@@ -2311,7 +2351,11 @@ async function discoverStocksFromIndustryNews(subject, terms, errors) {
     errors.push(`全市场股票名称加载失败：${err.message || err}`);
     marketStocks = readDiskCache('tencent-stock-directory', 30 * 24 * 60 * 60 * 1000) || [];
     if (marketStocks.length) errors.push(`已使用本地全市场名称快照：${marketStocks.length}只`);
-    else try { marketStocks = await fetchStockDirectory(); } catch {}
+    else try {
+      marketStocks = await fetchStockDirectory();
+    } catch (err) {
+      errors.push(`备用股票目录加载失败：${err.message || err}`);
+    }
   }
   if (!marketStocks.length) return [];
 
@@ -2557,20 +2601,128 @@ function buildFinancialAnalysis(quarterRows, annualRows, source = '东方财富F
   };
 }
 
+function splitDataCenterFinancialRows(rows) {
+  const quarters = (rows || []).filter(Boolean);
+  const annuals = quarters.filter(row => String(row.REPORT_TYPE || row.REPORT_DATE_NAME || '').includes('年报'));
+  return { quarters, annuals };
+}
+
+function mapSinaFinancialData(data) {
+  const reports = data?.report_date || [];
+  const reportList = data?.report_list || {};
+  const rows = reports.map(report => {
+    const items = reportList[report.date_value]?.data || [];
+    const byField = new Map(items.filter(item => item?.item_field).map(item => [item.item_field, item]));
+    const value = field => finiteNumber(byField.get(field)?.item_value);
+    const growth = field => {
+      const ratio = finiteNumber(byField.get(field)?.item_tongbi);
+      return ratio === null ? null : ratio * 100;
+    };
+    return {
+      REPORT_DATE_NAME: report.date_description || String(report.date_value || ''),
+      REPORT_TYPE: report.date_description || '',
+      REPORT_YEAR: String(report.date_value || '').slice(0, 4),
+      EPSJB: value('EPSBASIC'), EPSJBTZ: growth('EPSBASIC'),
+      PARENTNETPROFITTZ: growth('PARENETP'), TOTALOPERATEREVETZ: growth('BIZTOTINCO'),
+      ROEKCJQ: value('ROEWEIGHTED'), MGJYXJJE: value('OPNCFPS'), LD: value('CURRENTRT'),
+      ZCFZL: value('ASSLIABRT'), XSMLL: value('SGPMARGIN'), XSJLL: value('SNPMARGINCONMS')
+    };
+  });
+  return {
+    quarters: rows,
+    annuals: rows.filter((_row, index) => Number(reports[index]?.date_type) === 4)
+  };
+}
+
+async function fetchSinaFinancialRows(code) {
+  const symbol = `${marketPrefixOf(code)}${code}`;
+  const params = new URLSearchParams({ paperCode:symbol, source:'gjzb', type:'0', page:'1', num:'20' });
+  const json = await getJsonWithRetry(`https://quotes.sina.cn/cn/api/openapi.php/CompanyFinanceService.getFinanceReport2022?${params}`, 1);
+  const data = json?.result?.data;
+  const rows = mapSinaFinancialData(data);
+  if (!rows.quarters.length) throw new Error('新浪财务接口返回空数据');
+  return rows;
+}
+
+async function fetchDataCenterFinancialRows(code) {
+  const cacheKey = String(code || '');
+  const market = emF10Code(cacheKey).slice(0, 2);
+  const params = new URLSearchParams({
+    reportName: 'RPT_F10_FINANCE_MAINFINADATA',
+    columns: 'ALL',
+    filter: `(SECUCODE="${cacheKey}.${market}")`,
+    pageNumber: '1',
+    pageSize: '20',
+    sortColumns: 'REPORT_DATE',
+    sortTypes: '-1'
+  });
+  const json = await getJsonWithRetry(`https://datacenter-web.eastmoney.com/api/data/v1/get?${params}`, 1);
+  const rows = json?.result?.data || [];
+  if (!rows.length) throw new Error('备用财务接口返回空数据');
+  return splitDataCenterFinancialRows(rows);
+}
+
 async function fetchStockFinancials({ code, force = false }) {
   const cacheKey = String(code || '');
   const cached = force ? null : readTimedCache(stockFinancialCache, cacheKey, 6 * 60 * 60 * 1000);
   if (cached) return { ...cached, cached: true };
+  const previous = stockFinancialCache.get(cacheKey)?.value
+    || readDiskCache(`stock-financial-${cacheKey}`, 180 * 24 * 60 * 60 * 1000);
   const endpoint = 'https://emweb.securities.eastmoney.com/PC_HSF10/NewFinanceAnalysis/ZYZBAjaxNew';
   const requests = await Promise.allSettled([0, 1].map(type => getJsonWithRetry(`${endpoint}?type=${type}&code=${encodeURIComponent(emF10Code(cacheKey))}`, 1)));
-  const errors = [];
-  const quarters = requests[0].status === 'fulfilled' ? requests[0].value?.data || [] : [];
-  const annuals = requests[1].status === 'fulfilled' ? requests[1].value?.data || [] : [];
+  const warnings = [];
+  let quarters = requests[0].status === 'fulfilled' ? requests[0].value?.data || [] : [];
+  let annuals = requests[1].status === 'fulfilled' ? requests[1].value?.data || [] : [];
   requests.forEach((result, index) => {
-    if (result.status === 'rejected') errors.push(`${index ? '年度' : '季度'}财务指标失败：${result.reason?.message || result.reason}`);
+    if (result.status === 'rejected') warnings.push(`${index ? '年度' : '季度'}财务指标失败：${result.reason?.message || result.reason}`);
   });
-  const analysis = buildFinancialAnalysis(quarters, annuals);
-  return writeTimedCache(stockFinancialCache, cacheKey, { analysis, errors });
+  let source = '东方财富F10主要指标';
+  if (!quarters.length || !annuals.length) {
+    const hasPrimaryRows = Boolean(quarters.length || annuals.length);
+    try {
+      const fallback = await fetchDataCenterFinancialRows(cacheKey);
+      if (!quarters.length) quarters = fallback.quarters;
+      if (!annuals.length) annuals = fallback.annuals;
+      source = hasPrimaryRows ? '东方财富F10与数据中心主要指标' : '东方财富数据中心主要指标';
+    } catch (err) {
+      warnings.push(`备用财务指标失败：${err.message || err}`);
+    }
+  }
+  if (!quarters.length || !annuals.length) {
+    const hasRows = Boolean(quarters.length || annuals.length);
+    try {
+      const fallback = await fetchSinaFinancialRows(cacheKey);
+      if (!quarters.length) quarters = fallback.quarters;
+      if (!annuals.length) annuals = fallback.annuals;
+      source = hasRows ? `${source}与新浪财务主要指标` : '新浪财务主要指标';
+    } catch (err) {
+      warnings.push(`新浪财务指标失败：${err.message || err}`);
+    }
+  }
+  const analysis = buildFinancialAnalysis(quarters, annuals, source);
+  if (analysis.latestReport && analysis.available > 0) {
+    const value = { analysis, errors: [], warnings };
+    writeDiskCache(`stock-financial-${cacheKey}`, value);
+    return writeTimedCache(stockFinancialCache, cacheKey, value);
+  }
+  if (previous?.analysis?.latestReport) {
+    return {
+      ...previous,
+      analysis: {
+        ...previous.analysis,
+        source: `${previous.analysis.source || '财务指标'}（最近成功缓存）`
+      },
+      cached: true,
+      stale: true,
+      errors: [],
+      warnings: [...warnings, '财务接口暂时异常，已沿用最近一次成功数据']
+    };
+  }
+  return {
+    analysis: null,
+    errors: [...warnings, '财务指标暂时无法取得，本次不生成财务质量评分'],
+    warnings
+  };
 }
 
 function plainText(value) {
@@ -3004,9 +3156,9 @@ async function fetchStockHistory({ code, name, force = false }) {
       }
     })(),
     fetchTencentQuotes([cacheKey]),
-    fetchStockNews({ code: cacheKey, name, force }),
-    fetchFutureRiskProfile({ code: cacheKey, name, force }),
-    fetchStockFinancials({ code: cacheKey, force })
+    fetchStockNews({ code: cacheKey, name, force: false }),
+    fetchFutureRiskProfile({ code: cacheKey, name, force: false }),
+    fetchStockFinancials({ code: cacheKey, force: false })
   ]);
   const errors = [...historyErrors];
   let history = historyResult.status === 'fulfilled' ? historyResult.value.history : [];
@@ -3064,6 +3216,8 @@ async function fetchStockChart({ code, period, force = false }) {
   const cacheKey = `${code}-${safePeriod}`;
   const cached = force ? null : readTimedCache(stockChartCache, cacheKey, safePeriod === 'minute' ? 60 * 1000 : 10 * 60 * 1000);
   if (cached) return { ...cached, cached: true };
+  const previous = stockChartCache.get(cacheKey)?.value;
+  try {
   const symbol = `${marketPrefixOf(code)}${code}`;
   let rows = [];
   let source = '';
@@ -3104,6 +3258,12 @@ async function fetchStockChart({ code, period, force = false }) {
   const minimumRows = safePeriod === 'minute' ? 1 : 10;
   if (rows.length < minimumRows) throw new Error(`${source || safePeriod}返回数据不足`);
   return writeTimedCache(stockChartCache, cacheKey, { period: safePeriod, rows, previousClose, source, fetchedAt: new Date().toISOString() });
+  } catch (err) {
+    if (previous?.rows?.length) {
+      return { ...previous, stale: true, errors: [`走势接口暂时不可用，已显示最近一次成功数据：${err.message || err}`] };
+    }
+    throw err;
+  }
 }
 
 function parseRssItems(xml) {
@@ -3133,6 +3293,7 @@ async function fetchStockNews({ code, name, force = false }) {
   const cacheKey = String(code || name || '');
   const cached = force ? null : readTimedCache(stockNewsCache, cacheKey, 10 * 60 * 1000);
   if (cached) return { ...cached, cached: true };
+  const previous = stockNewsCache.get(cacheKey)?.value;
   const keyword = `${cleanStockName(name) || code} 股票 最新消息`;
   const errors = [];
   try {
@@ -3170,7 +3331,8 @@ async function fetchStockNews({ code, name, force = false }) {
   } catch (err) {
     errors.push(`Bing新闻失败：${err.message || err}`);
   }
-  return writeTimedCache(stockNewsCache, cacheKey, { news: [], errors, source: '' });
+  if (previous?.news?.length) return { ...previous, cached: true, stale: true, errors };
+  return { news: [], errors, source: '' };
 }
 
 async function runIndustryWorkflow(command) {
@@ -3264,7 +3426,7 @@ ipcMain.handle('fetch-a-share-quotes', async (_event, codes) => {
       fetchQuoteRows(batch)
         .then(rows => ({ rows: rows.map(normalizeQuoteRow), error: '' }))
         .catch(err => ({ rows: [], error: err.message || String(err) })),
-      sleep(2500).then(() => ({ rows: [], error: '请求超过 2.5 秒，已跳过资金数据补充' }))
+      sleep(1200).then(() => ({ rows: [], error: '请求超过 1.2 秒，已跳过资金数据补充' }))
     ]);
     const [tencentResult, eastmoneyResult] = await Promise.allSettled([fetchTencentQuotes(batch), eastmoneyTask]);
     return { batch, tencentResult, eastmoneyResult };
@@ -3291,6 +3453,13 @@ ipcMain.handle('fetch-a-share-quotes', async (_event, codes) => {
           ...tencentQuote,
           mainNetInflow: eastmoneyQuote?.mainNetInflow ?? null,
           mainNetPct: eastmoneyQuote?.mainNetPct ?? null,
+          amplitude: tencentQuote.amplitude ?? eastmoneyQuote?.amplitude ?? null,
+          turnoverRate: tencentQuote.turnoverRate ?? eastmoneyQuote?.turnoverRate ?? null,
+          peRatio: tencentQuote.peRatio ?? eastmoneyQuote?.peRatio ?? null,
+          snapshotVolumeRatio: tencentQuote.snapshotVolumeRatio ?? eastmoneyQuote?.snapshotVolumeRatio ?? null,
+          pbRatio: tencentQuote.pbRatio ?? eastmoneyQuote?.pbRatio ?? null,
+          upperLimit: tencentQuote.upperLimit ?? eastmoneyQuote?.upperLimit ?? null,
+          lowerLimit: tencentQuote.lowerLimit ?? eastmoneyQuote?.lowerLimit ?? null,
           totalMarketCap: tencentQuote.totalMarketCap ?? eastmoneyQuote?.totalMarketCap ?? null,
           floatMarketCap: tencentQuote.floatMarketCap ?? eastmoneyQuote?.floatMarketCap ?? null,
           source: eastmoneyQuote ? '腾讯实时行情 + 东方财富资金' : '腾讯实时行情'
@@ -3459,7 +3628,11 @@ app.on('window-all-closed', () => {
 });
 
 module.exports = {
+  normalizeQuoteRow,
+  normalizeTencentQuote,
+  mapSinaFinancialData,
   buildFinancialAnalysis,
+  splitDataCenterFinancialRows,
   buildCanslimFromFactors,
   buildIndividualInvestmentAnalysis,
   buildRecommendationFactorContext,
@@ -3470,6 +3643,7 @@ module.exports = {
   evaluateRecommendationRisk,
   assessRecommendationTimingRisk,
   buildFutureRiskProfile,
+  analyzeHistory,
   mergeQuoteIntoHistory,
   parseReductionPlanWindow,
   settleWithConcurrency

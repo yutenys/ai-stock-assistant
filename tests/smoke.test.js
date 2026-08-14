@@ -24,7 +24,12 @@ Module._load = function(request, parent, isMain) {
 };
 
 const {
+  normalizeQuoteRow,
+  normalizeTencentQuote,
+  mapSinaFinancialData,
   buildFinancialAnalysis,
+  buildIndividualInvestmentAnalysis,
+  splitDataCenterFinancialRows,
   buildCanslimFromFactors,
   buildRecommendationFactorContext,
   evaluateRecommendationFactors,
@@ -34,11 +39,88 @@ const {
   evaluateRecommendationRisk,
   assessRecommendationTimingRisk,
   buildFutureRiskProfile,
+  analyzeHistory,
   mergeQuoteIntoHistory,
   parseReductionPlanWindow,
   settleWithConcurrency
 } = require('../main.js');
 Module._load = originalLoad;
+
+test('单股行情解析保留估值、换手和盘口指标', () => {
+  const columns = Array(88).fill('');
+  Object.assign(columns, {
+    1:'贵州茅台', 2:'600519', 3:'1348.11', 4:'1355.29', 5:'1355.00',
+    30:'20260814110022', 31:'-7.18', 32:'-0.53', 33:'1359.00', 34:'1348.00',
+    36:'14401', 37:'194909', 38:'0.12', 39:'20.37', 43:'0.81', 44:'16852.48',
+    45:'16852.48', 46:'7.24', 47:'1490.82', 48:'1219.76', 49:'1.04'
+  });
+  const tencent = normalizeTencentQuote(columns.join('~'));
+  assert.equal(tencent.turnoverRate, 0.12);
+  assert.equal(tencent.peRatio, 20.37);
+  assert.equal(tencent.pbRatio, 7.24);
+  assert.equal(tencent.amplitude, 0.81);
+  assert.equal(tencent.snapshotVolumeRatio, 1.04);
+  assert.equal(tencent.upperLimit, 1490.82);
+  assert.equal(tencent.lowerLimit, 1219.76);
+
+  const eastmoney = normalizeQuoteRow({
+    f12:'600519', f14:'贵州茅台', f2:1348.11, f7:0.81, f8:0.12,
+    f9:20.37, f10:1.04, f23:7.24, f51:1490.82, f52:1219.76
+  });
+  assert.equal(eastmoney.turnoverRate, 0.12);
+  assert.equal(eastmoney.peRatio, 20.37);
+  assert.equal(eastmoney.pbRatio, 7.24);
+  assert.equal(eastmoney.amplitude, 0.81);
+  assert.equal(eastmoney.snapshotVolumeRatio, 1.04);
+  assert.equal(eastmoney.upperLimit, 1490.82);
+  assert.equal(eastmoney.lowerLimit, 1219.76);
+});
+
+test('新浪财务数据可映射为统一季度和年度指标', () => {
+  const item = (field, value, yoy = '') => ({ item_field:field, item_value:String(value), item_tongbi:yoy });
+  const data = {
+    report_date: [
+      { date_value:'20260331', date_description:'2026一季报', date_type:1 },
+      { date_value:'20251231', date_description:'2025年报', date_type:4 }
+    ],
+    report_list: {
+      20260331: { data:[item('EPSBASIC', .62, .32), item('PARENETP', 30, .3), item('BIZTOTINCO', 50, .18), item('ROEWEIGHTED', 18), item('OPNCFPS', 1.2), item('CURRENTRT', 2), item('ASSLIABRT', 35), item('SGPMARGIN', 45), item('SNPMARGINCONMS', 20)] },
+      20251231: { data:[item('EPSBASIC', 2.1, .2), item('ROEWEIGHTED', 17), item('OPNCFPS', 2.5)] }
+    }
+  };
+  const result = mapSinaFinancialData(data);
+  assert.equal(result.quarters.length, 2);
+  assert.equal(result.annuals.length, 1);
+  assert.deepEqual(result.quarters[0], {
+    REPORT_DATE_NAME:'2026一季报', REPORT_TYPE:'2026一季报', REPORT_YEAR:'2026',
+    EPSJB:.62, EPSJBTZ:32, PARENTNETPROFITTZ:30, TOTALOPERATEREVETZ:18,
+    ROEKCJQ:18, MGJYXJJE:1.2, LD:2, ZCFZL:35, XSMLL:45, XSJLL:20
+  });
+});
+
+test('数据中心财务序列可拆分为季度与年度数据', () => {
+  const rows = [
+    { REPORT_DATE_NAME:'2026一季报', REPORT_TYPE:'一季报' },
+    { REPORT_DATE_NAME:'2025年报', REPORT_TYPE:'年报' },
+    { REPORT_DATE_NAME:'2025三季报', REPORT_TYPE:'三季报' },
+    { REPORT_DATE_NAME:'2024年报', REPORT_TYPE:'年报' }
+  ];
+  const result = splitDataCenterFinancialRows(rows);
+  assert.equal(result.quarters.length, 4);
+  assert.deepEqual(result.annuals.map(item => item.REPORT_DATE_NAME), ['2025年报', '2024年报']);
+});
+
+test('财务源暂时失败时明确标记未评分而不是质量数据不可用', () => {
+  const result = buildIndividualInvestmentAnalysis({
+    technical: { score:70, return60:5, volumeRatio:1.2 },
+    financial: null,
+    newsContext: { items:[], signal:'中性' },
+    quote: { turnoverRate:2 },
+    marketOverview: null
+  });
+  assert.equal(result.value.quality.score, null);
+  assert.equal(result.value.quality.evidence, '财务接口暂时不可用，本次不生成财务质量评分');
+});
 
 test('财务序列生成可追溯的CANSLIM成长与价值质量评分', () => {
   const quarterRows = [{
@@ -310,6 +392,13 @@ test('行情刷新返回实时价格和市值', { timeout: 30000 }, async () => 
   assert.equal(result.cached, 0);
   assert.ok(result.quotes[0].price > 0);
   assert.ok(result.quotes[0].totalMarketCap > 0);
+  assert.equal(typeof result.quotes[0].turnoverRate, 'number');
+  assert.equal(typeof result.quotes[0].peRatio, 'number');
+  assert.equal(typeof result.quotes[0].pbRatio, 'number');
+  assert.equal(typeof result.quotes[0].snapshotVolumeRatio, 'number');
+  assert.equal(typeof result.quotes[0].amplitude, 'number');
+  assert.ok(result.quotes[0].upperLimit > result.quotes[0].price);
+  assert.ok(result.quotes[0].lowerLimit < result.quotes[0].price);
   assert.match(result.quotes[0].source, /腾讯|东方财富|新浪/);
 });
 
@@ -399,8 +488,11 @@ test('大盘分析返回指数、轮动、资金和涨跌停结构', { timeout: 
   assert.ok(result.recommendations.every(item => ['消息确认', '消息中性', '消息谨慎'].includes(item.newsLabel)));
   assert.ok(result.recommendations.every(item => Number.isFinite(item.signalScore) && item.reason.includes(item.signal)));
   assert.ok(result.recommendations.every(item => item.industry && item.industry !== '行业待确认'));
-  assert.ok(result.recommendations.every(item => item.canslim?.total === 7 && item.canslim.available >= 4));
-  assert.ok(result.recommendations.every(item => item.financialAnalysis?.source === '东方财富F10主要指标'));
+  assert.ok(result.recommendations.every(item => item.canslim?.total === 7));
+  assert.ok(result.recommendations.every(item => {
+    const source = item.financialAnalysis?.source || '';
+    return !item.financialAnalysis?.available || /东方财富(?:F10|数据中心)|新浪财务|本地缓存/.test(source);
+  }));
   assert.equal(result.recommendations.length, result.recommendationCoverage.qualified);
   const finalSignalCounts = result.recommendations.reduce((counts, item) => {
     if (item.signal === '底部待反弹') counts.bottomWaiting += 1;
@@ -455,15 +547,26 @@ test('深圳南宁高铁按线路端点返回高铁通用产业链', { timeout: 
   assert.ok(result.stocks.some(stock => stock.code === '000008'));
 });
 
-test('参考股票从2026-08-03附近底部形成已反弹信号', { timeout: 60000 }, async () => {
-  const handler = handlers.get('fetch-stock-history');
-  for (const code of ['002407', '600667', '600111', '002428', '002842']) {
-    const result = await handler(null, { code, force: true });
-    assert.equal(result.analysis.reboundSignal, '已反弹', `${code} 应识别为已反弹`);
-    assert.ok(result.analysis.bottomDate >= '2026-07-20' && result.analysis.bottomDate <= '2026-08-12');
-    assert.ok(result.analysis.bottomDrawdown <= -18);
-    assert.ok(result.analysis.reboundFromBottom >= 6);
-  }
+test('阶段深跌后均线与MACD改善可形成已反弹信号', () => {
+  const closes = [
+    ...Array(60).fill(100),
+    ...Array.from({ length: 40 }, (_, index) => 99 - index),
+    60, 62, 61, 64, 63, 66, 65, 68, 67, 70,
+    69, 72, 70, 73, 71, 74, 72, 75, 73, 76
+  ];
+  const history = closes.map((close, index) => ({
+    date: `2026-08-${String(index + 1).padStart(2, '0')}`,
+    open: close - 0.5,
+    close,
+    high: close + 1,
+    low: index === 100 ? 59 : close - 1,
+    volume: 1_000_000 + index * 1_000
+  }));
+  const analysis = analyzeHistory(history);
+  assert.equal(analysis.reboundSignal, '已反弹');
+  assert.ok(analysis.bottomDrawdown <= -18);
+  assert.ok(analysis.reboundFromBottom >= 6);
+  assert.ok(analysis.ma5 > analysis.ma10);
 });
 
 test('低价高估值弱反弹股票不会进入大盘推荐', { timeout: 60000 }, async () => {
