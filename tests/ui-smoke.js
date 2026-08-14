@@ -72,6 +72,32 @@ app.whenReady().then(async () => {
       breakoutPrice: 7.40, supportPrice: 6.20, distanceToBreakout: 2.10,
       score: request?.force ? 82 : 76, verdict: '等待确认', risk: '波动率偏高，ATR14为0.26元。',
       maAlignment: 'MA5/10/20/30/60多头排列',
+      accumulationSetup: {
+        passed: true, bullishAlignment: true, diverging: true, notMainWave: true,
+        volumeSurgeCount: 3, surgePriceRisePct: 8.6,
+        summary: '底部五线粘合后开始多头发散；识别3次温和放量，最近三次价格重心抬高8.6%，尚未进入快速主升'
+      },
+      capitalSetupAssessment: {
+        status: '蓄势增强', scoreAdjustment: 6,
+        summary: '近10日主力买入8.00亿、卖出5.00亿，净流入3.00亿，净流入7日；底部五线粘合后开始多头发散，三次温和放量价格抬高，资金与形态相互确认。'
+      },
+      consolidationBreakout: {
+        available:true, isConsolidating:true, status:'突破蓄势', technicalScore:72,
+        boxDays:9, boxLow:8.00, boxHigh:8.60, rangePct:7.2, distanceToBreakoutPct:2.5,
+        volumeCompressionRatio:.83, pressureTestCount:1, failedPressureCount:0,
+        breakoutConfirmed:false, summary:'近9日横盘箱体8.00-8.60元，箱体宽度7.2%，现价距箱顶2.5%；量能压缩比0.83，放量试压1次',
+        trigger:'放量收盘突破8.60元，成交量至少达到20日均量1.2倍',
+        invalidation:'收盘跌破8.00元，或放量冲高回落后连续两日未收复箱顶'
+      },
+      breakoutPotential: {
+        available:true, isConsolidating:true, status:'接近突破', score:82, technicalScore:72,
+        boxDays:9, boxLow:8.00, boxHigh:8.60, rangePct:7.2, distanceToBreakoutPct:2.5,
+        volumeCompressionRatio:.83, pressureTestCount:1, failedPressureCount:0,
+        breakoutConfirmed:false,
+        summary:'近9日横盘箱体8.00-8.60元；近10日主力净流入3.00亿；综合状态接近突破',
+        trigger:'放量收盘突破8.60元，成交量至少达到20日均量1.2倍',
+        invalidation:'收盘跌破8.00元，或放量冲高回落后连续两日未收复箱顶'
+      },
       buyCondition: '等待放量突破7.40元且收盘站稳，当前不宜无条件追价。',
       newsImpact: '消息面偏积极，但需等待量价确认。',
       combinedConclusion: '等待确认（技术评分76/100）。等待放量突破7.40元且收盘站稳。消息面偏积极，但需等待量价确认。',
@@ -117,6 +143,11 @@ app.whenReady().then(async () => {
         {key:'M',label:'市场方向',max:10,available:false,score:null,evidence:'大盘数据待补充'}
       ]},
       value:{score:80,valuationScore:74,quality:{available:true,score:86,evidence:'ROE18.0%，经营现金流/股1.20，流动比率2.00，资产负债率35.0%'},pe:28.6,pb:3.2,dcf:{available:false,evidence:'缺少可验证的自由现金流预测、净债务与增长假设，暂不计算DCF或目标价'},moat:{available:false,evidence:'护城河需要人工核验，当前不自动给高分'},source:'东方财富F10主要指标'}
+    },
+    fundFlowPeriod: {
+      available:true, days:10, startDate:'2026-07-30', endDate:'2026-08-12',
+      mainInflow:8e8, mainOutflow:5e8, mainNetInflow:3e8, netRatio:23.08, positiveDays:7,
+      source:'新浪历史资金流向'
     },
     errors: []
     });
@@ -164,7 +195,7 @@ app.whenReady().then(async () => {
         supportPrice: 10.20, ma30: 11.42, reason: '待突破；满足量价与质量闸门。', factorAnalysis:{score:72-index,available:4,total:7,sectorProfile:{name:index < 7 ? '半导体' : '软件',score:index < 7 ? 74 : 60,label:index < 7 ? '强势板块' : '活跃板块'}}, newsContext: { summary: '消息面中性。' }
       }))
     ],
-    recommendationCoverage: { scanned: 5230, prefiltered: 428, analyzed: 60, industries: 42, directoryAvailable: true, riskChecked: 16, riskRejected: 2, riskUnknown: 1, riskUnverifiedIncluded: 1, qualified: 13, signals: { bottomWaiting: 3, rebounded: 18, breakout: 12 } },
+    recommendationCoverage: { scanned: 5230, prefiltered: 428, analyzed: 60, industries: 42, directoryAvailable: true, consolidationCandidates:5, riskChecked: 16, riskRejected: 2, riskUnknown: 1, riskUnverifiedIncluded: 1, qualified: 13, signals: { bottomWaiting: 3, rebounded: 18, breakout: 12 } },
     newsContext: { signal: '偏积极', summary: '政策与行业消息偏积极，仍需结合盘面确认。', items: [{ title: '中药行业最新政策消息', link: 'https://example.com/market-news', publishedAt: '2026-08-12 11:00:00', source: '测试资讯' }] },
     analysis: '三大指数多数上涨，市场情绪偏强；资金集中于半导体、中药。',
     source: '腾讯指数 + 东方财富市场统计',
@@ -174,6 +205,8 @@ app.whenReady().then(async () => {
   });
   const errors = [];
   const win = new BrowserWindow({
+    width: 1480,
+    height: 920,
     show: false,
     webPreferences: {
       preload: path.join(__dirname, '..', 'preload.js'),
@@ -617,6 +650,28 @@ app.whenReady().then(async () => {
     commandInput: await clickAndType('commandInput', 'abc'),
     searchInput: await clickAndType('searchInput', 'xyz')
   };
+  const backToTopState = await win.webContents.executeJavaScript(`(async () => {
+    const button = document.getElementById('backToTop');
+    const panels = [...document.querySelectorAll('.market,.right')];
+    window.scrollTo(0, document.body.scrollHeight);
+    panels.forEach(panel => { panel.scrollTop = panel.scrollHeight; });
+    const before = {window:window.scrollY, panels:panels.map(panel => panel.scrollTop)};
+    button.click();
+    for(let index = 0; index < 80; index += 1){
+      await new Promise(resolve => setTimeout(resolve, 10));
+      if(window.scrollY <= 1 && panels.every(panel => panel.scrollTop <= 1)) break;
+    }
+    const style = getComputedStyle(button);
+    return {
+      position:getComputedStyle(button).position,
+      title:button.title,
+      text:button.textContent.trim(),
+      before,
+      after:{window:window.scrollY, panels:panels.map(panel => panel.scrollTop)},
+      right:style.right,
+      bottom:style.bottom
+    };
+  })()`);
   const state = await win.webContents.executeJavaScript(`({
     title: document.title,
     heading: document.querySelector('h1')?.textContent,
@@ -635,6 +690,7 @@ app.whenReady().then(async () => {
       }];
     })),
     typed: ${JSON.stringify(typed)},
+    backToTopState: ${JSON.stringify(backToTopState)},
     focusAfterAdd: ${JSON.stringify(focusAfterAdd)},
     multiLabelState: ${JSON.stringify(multiLabelState)},
     focusAfterDelete: ${JSON.stringify(focusAfterDelete)},
@@ -660,13 +716,43 @@ app.whenReady().then(async () => {
       down: getComputedStyle(document.querySelector('#marketDown + span')).color,
       sectorUp: getComputedStyle(document.querySelector('#marketSectors .up')).color,
       sectorDown: getComputedStyle(document.querySelector('#marketSectors .down')).color
-    }
+    },
+    desktopLayoutState: (() => {
+      const toolbar = document.querySelector('.toolbar');
+      const marketHead = document.querySelector('.market-head');
+      const labelHead = document.querySelector('.label-head');
+      const hero = document.querySelector('.hero');
+      const commandBox = document.querySelector('.command-box');
+      return {
+        toolbarPosition: getComputedStyle(toolbar).position,
+        marketHeadPosition: getComputedStyle(marketHead).position,
+        labelHeadPosition: getComputedStyle(labelHead).position,
+        searchPlaceholder: document.getElementById('searchInput').placeholder,
+        refreshInToolbar: toolbar.contains(document.getElementById('refreshAll')),
+        topAreaHeight: Math.round(commandBox.getBoundingClientRect().bottom - hero.getBoundingClientRect().top)
+      };
+    })()
     ,marketBatchLabelState: ${JSON.stringify(marketBatchLabelState)}
   })`);
   const inputsUsable = state.typed.commandInput.active === 'commandInput'
     && state.typed.commandInput.value === 'abc'
     && state.typed.searchInput.active === 'searchInput'
     && state.typed.searchInput.value === 'xyz';
+  const desktopLayoutUsable = state.desktopLayoutState.toolbarPosition === 'sticky'
+    && state.desktopLayoutState.marketHeadPosition === 'sticky'
+    && state.desktopLayoutState.labelHeadPosition === 'sticky'
+    && state.desktopLayoutState.searchPlaceholder.startsWith('线上股票搜索')
+    && state.desktopLayoutState.refreshInToolbar
+    && state.desktopLayoutState.topAreaHeight < 140;
+  const backToTopUsable = state.backToTopState.position === 'fixed'
+    && state.backToTopState.title === '回到顶部'
+    && state.backToTopState.text === '↑'
+    && state.backToTopState.before.window > 0
+    && state.backToTopState.before.panels.some(value => value > 0)
+    && state.backToTopState.after.window <= 1
+    && state.backToTopState.after.panels.every(value => value <= 1)
+    && state.backToTopState.right === '22px'
+    && state.backToTopState.bottom === '22px';
   const multiLabelUsable = state.multiLabelState.some(text => /半导体\s+1只/.test(text))
     && state.multiLabelState.some(text => /医疗\s+1只/.test(text));
   const detailUsable = state.detailState.text.includes('所属行业：中药')
@@ -679,6 +765,15 @@ app.whenReady().then(async () => {
     && state.detailState.text.includes('离场 / 风控')
     && state.detailState.text.includes('是否适合购买')
     && state.detailState.text.includes('当前放量')
+    && state.detailState.text.includes('阶段主力资金')
+    && state.detailState.text.includes('近10日主力买入8.00亿')
+    && state.detailState.text.includes('蓄势增强')
+    && state.detailState.text.includes('3次温和放量')
+    && state.detailState.text.includes('横盘突破评估')
+    && state.detailState.text.includes('箱顶 ¥8.60')
+    && state.detailState.text.includes('箱底 ¥8.00')
+    && state.detailState.text.includes('放量收盘突破8.60元')
+    && state.detailState.text.includes('收盘跌破8.00元')
     && state.detailState.text.includes('MA30 ¥6.42')
     && state.detailState.text.includes('低吸区间：¥6.11-¥6.25')
     && state.detailState.text.includes('第1档 ¥7.40 卖出30%')
@@ -722,6 +817,7 @@ app.whenReady().then(async () => {
   const marketUsable = /上证指数|深证成指|创业板指/.test(state.marketText)
     && /板块轮动|半导体|资金|涨停 68|跌停 7|技术形态推荐|一键添加|底部待反弹|已反弹|消息确认|消息面偏积极/.test(state.marketText)
     && state.marketText.includes('未来半年风险核验 16 只，排除 2 只，未确认 1 只（降分保留 1 只）')
+    && state.marketText.includes('横盘候选 5 只')
     && state.marketBatchLabelState.initialAll && state.marketBatchLabelState.afterClear
     && state.marketBatchLabelState.choiceCount === 13
     && state.marketBatchLabelState.labelsAboveStocks
@@ -853,8 +949,8 @@ app.whenReady().then(async () => {
     && state.tableScoreState.includes('底部待反弹')
     && state.tableScoreState.includes('消息确认')
     && !state.tableScoreState.includes('已突破');
-  if (state.title !== '股票观察助手' || state.heading !== state.title || !state.hasApi || !state.stockContainer || state.statusFixed !== 'fixed' || state.focusAfterAdd !== 'searchInput' || state.focusAfterDelete !== 'searchInput' || !inputsUsable || !multiLabelUsable || !detailUsable || !detailClickQuoteUsable || !marketUsable || !chartUsable || !simulationUsable || !labelModalUsable || !labelSortUsable || !labelRenameUsable || !favoriteChangeUsable || !labelListUsable || errors.length) {
-    console.error(JSON.stringify({ state, checks: { inputsUsable, multiLabelUsable, detailUsable, detailClickQuoteUsable, marketUsable, chartUsable, simulationUsable, labelModalUsable, labelSortUsable, labelRenameUsable, favoriteChangeUsable, labelListUsable }, errors }, null, 2));
+  if (state.title !== '股票观察助手' || state.heading !== state.title || !state.hasApi || !state.stockContainer || state.statusFixed !== 'fixed' || state.focusAfterAdd !== 'searchInput' || state.focusAfterDelete !== 'searchInput' || !inputsUsable || !desktopLayoutUsable || !backToTopUsable || !multiLabelUsable || !detailUsable || !detailClickQuoteUsable || !marketUsable || !chartUsable || !simulationUsable || !labelModalUsable || !labelSortUsable || !labelRenameUsable || !favoriteChangeUsable || !labelListUsable || errors.length) {
+    console.error(JSON.stringify({ state, checks: { inputsUsable, desktopLayoutUsable, backToTopUsable, multiLabelUsable, detailUsable, detailClickQuoteUsable, marketUsable, chartUsable, simulationUsable, labelModalUsable, labelSortUsable, labelRenameUsable, favoriteChangeUsable, labelListUsable }, errors }, null, 2));
     app.exit(1);
     return;
   }

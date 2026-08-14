@@ -235,14 +235,19 @@ function renderMarketOverview(result){
   const signals = recommendations.reduce((counts, item) => {
     if(item.signal === '底部待反弹') counts.bottomWaiting += 1;
     else if(item.signal === '已反弹') counts.rebounded += 1;
-    else if(item.signal === '待突破') counts.breakout += 1;
+    else counts.breakout += 1;
     return counts;
   }, {bottomWaiting:0, rebounded:0, breakout:0});
   const riskCoverage = Number.isFinite(Number(coverage.riskChecked))
     ? `；未来半年风险核验 ${coverage.riskChecked} 只，排除 ${coverage.riskRejected || 0} 只，未确认 ${coverage.riskUnknown || 0} 只${coverage.riskUnverifiedIncluded ? `（降分保留 ${coverage.riskUnverifiedIncluded} 只）` : ''}`
     : '';
+  const structureCounts = [];
+  if(Number.isFinite(Number(coverage.accumulationCandidates))) structureCounts.push(`蓄势结构 ${coverage.accumulationCandidates} 只`);
+  if(Number.isFinite(Number(coverage.consolidationCandidates))) structureCounts.push(`横盘候选 ${coverage.consolidationCandidates} 只`);
+  if(Number.isFinite(Number(coverage.fundFlowAvailable))) structureCounts.push(`阶段资金可用 ${coverage.fundFlowAvailable} 只`);
+  const accumulationCoverage = structureCounts.length ? `；${structureCounts.join('，')}` : '';
   $('marketRecommendationCoverage').textContent = coverage.scanned
-    ? `全市场扫描 ${coverage.scanned} 只，初筛 ${coverage.prefiltered || 0} 只，历史精筛 ${coverage.analyzed || 0} 只，覆盖 ${coverage.industries || 0} 个行业${riskCoverage}；实际推荐 ${recommendations.length} 只（待反弹 ${signals.bottomWaiting}，已反弹 ${signals.rebounded}，待突破 ${signals.breakout}）${fallbackNote}`
+    ? `全市场扫描 ${coverage.scanned} 只，初筛 ${coverage.prefiltered || 0} 只，历史精筛 ${coverage.analyzed || 0} 只，覆盖 ${coverage.industries || 0} 个行业${accumulationCoverage}${riskCoverage}；实际推荐 ${recommendations.length} 只（待反弹 ${signals.bottomWaiting}，已反弹 ${signals.rebounded}，待突破 ${signals.breakout}）${fallbackNote}`
     : '等待全市场扫描';
   const visibleRecommendations = recommendations.slice(0, 10);
   $('marketRecommendations').innerHTML = visibleRecommendations.length ? groupedRecommendationHtml(visibleRecommendations) : '<div class="market-row"><span>当前未筛出满足条件的候选</span></div>';
@@ -1299,6 +1304,10 @@ function renderHistoryAnalysis(s, result){
   const corporateRiskHtml = corporateRisk ? `<p class="corporate-risk"><b>未来半年公司风险：</b>${escapeHtml(corporateRisk.summary || '未确认')}；ST：${escapeHtml(corporateRisk.st?.status === 'risk' ? '有当前标记' : '无当前标记')}；减持：${escapeHtml(reductionText)}；解禁：${escapeHtml(unlockText)}。<br><b>核验窗口：</b>${escapeHtml(corporateRisk.windowStart || '--')} 至 ${escapeHtml(corporateRisk.windowEnd || '--')}；<b>数据源：</b>${escapeHtml(corporateRisk.source || '公开公司公告与限售解禁数据')}</p>`
     : '<p class="corporate-risk"><b>未来半年公司风险：</b>未确认。</p>';
   const plan = a.tradePlan;
+  const breakout = a.breakoutPotential || a.consolidationBreakout;
+  const breakoutHtml = breakout?.available
+    ? `<p><b>横盘突破评估：</b>${escapeHtml(breakout.status || '横盘观察')}，评分 ${escapeHtml(breakout.score ?? breakout.technicalScore ?? '--')}/100；横盘 ${escapeHtml(breakout.boxDays)} 日，箱顶 ${yuan(breakout.boxHigh)}，箱底 ${yuan(breakout.boxLow)}，箱体宽度 ${formatPct(breakout.rangePct)}；放量试压 ${escapeHtml(breakout.pressureTestCount || 0)} 次${breakout.failedPressureCount ? `，冲高回落 ${escapeHtml(breakout.failedPressureCount)} 次` : ''}。<br><b>确认条件：</b>${escapeHtml(breakout.trigger || '--')}；<b>失效条件：</b>${escapeHtml(breakout.invalidation || '--')}。</p>`
+    : '<p><b>横盘突破评估：</b>历史行情不足，暂不能形成箱体判断。</p>';
   const tradePlanHtml = plan ? `<div class="trade-plan">
       <h4>条件化操作参考</h4>
       <p><b>低吸区间：</b>${yuan(plan.entryLow)}-${yuan(plan.entryHigh)}。${plan.enabled ? '仅在价格进入区间并出现缩量企稳时分批执行。' : '当前趋势条件不合格，暂不执行低吸，先等待趋势修复。'}</p>
@@ -1323,6 +1332,9 @@ function renderHistoryAnalysis(s, result){
       <p><b>MACD：</b>DIF ${formatNumber(a.macdDif,3)}；DEA ${formatNumber(a.macdDea,3)}；柱值 ${formatNumber(a.macdHistogram,3)}</p>
       <p><b>布林带：</b>上轨 ${yuan(a.bollUpper)}；中轨 ${yuan(a.bollMiddle)}；下轨 ${yuan(a.bollLower)}</p>
       <p><b>当前放量：</b>${escapeHtml(a.volume)} 当前量比 ${formatNumber(a.volumeRatio)}。</p>
+      <p><b>阶段主力资金：</b>${escapeHtml(a.capitalSetupAssessment?.summary || '阶段主力资金数据不可用，本次不据此调整评分。')}</p>
+      <p><b>底部蓄势结构：</b>${escapeHtml(a.accumulationSetup?.summary || '历史行情不足，暂不能评估五线粘合与三次放量。')} ${a.capitalSetupAssessment?.status ? `<b>综合状态：</b>${escapeHtml(a.capitalSetupAssessment.status)}。` : ''}</p>
+      ${breakoutHtml}
       <p><b>突破 / 支撑：</b>突破确认价 ${yuan(a.breakoutPrice)}；距突破位 ${formatPct(a.distanceToBreakout)}；支撑参考 ${yuan(a.supportPrice)}。</p>
       <p><b>波动风险：</b>${escapeHtml(a.risk || '--')}</p>
       <p><b>是否适合购买：</b>${escapeHtml(a.buyCondition || a.entry)}</p>
@@ -2437,6 +2449,10 @@ function toggleActiveLabelSelection(){
 }
 
 $('refreshAll').onclick = refreshMarket;
+$('backToTop').onclick = () => {
+  window.scrollTo(0, 0);
+  document.querySelectorAll('.market,.right').forEach(panel => { panel.scrollTop = 0; });
+};
 $('refreshLabel').onclick = refreshActiveLabel;
 $('refreshMarketOverview').onclick = () => loadMarketOverview(true);
 $('generateBtn').onclick = generateStockPool;

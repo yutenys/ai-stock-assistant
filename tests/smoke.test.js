@@ -39,6 +39,12 @@ const {
   evaluateRecommendationRisk,
   assessRecommendationTimingRisk,
   buildFutureRiskProfile,
+  summarizeFundFlowRows,
+  analyzeAccumulationSetup,
+  analyzeConsolidationBreakout,
+  combineConsolidationBreakout,
+  scoreConsolidationCandidate,
+  applyIndividualCapitalAssessment,
   analyzeHistory,
   mergeQuoteIntoHistory,
   parseReductionPlanWindow,
@@ -172,12 +178,13 @@ test('大盘推荐多因子只使用可验证数据并按板块聚合', () => {
     signal:'偏积极', summary:'近期有可核验创新订单消息。', items:[{ title:'创新订单' }]
   });
   assert.equal(factors.available, 5);
-  assert.equal(factors.total, 9);
+  assert.equal(factors.total, 10);
   assert.ok(Number.isFinite(factors.score));
   assert.equal(factors.sectorProfile.name, '半导体');
   assert.ok(factors.factors.find(item => item.key === 'currentEarnings' && !item.available));
   assert.ok(factors.factors.find(item => item.key === 'annualEarnings' && !item.available));
   assert.ok(factors.factors.find(item => item.key === 'institution' && !item.available));
+  assert.ok(factors.factors.find(item => item.key === 'capitalAccumulation' && !item.available));
 
   const missingValuation = evaluateRecommendationFactors(rows[2], context, { signal:'中性', summary:'', items:[] });
   assert.ok(missingValuation.factors.find(item => item.key === 'valuation' && !item.available));
@@ -242,7 +249,7 @@ test('本轮大盘推荐为空时保留最近成功推荐并刷新行情', () =>
 test('command input uses a focus-hidden recommendation prompt', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
   const css = fs.readFileSync(path.join(__dirname, '..', 'styles.css'), 'utf8');
-  assert.match(html, /<textarea id="commandInput" placeholder="输入你想要搜索的相关内容，会给你生成对应内容的股票推荐"><\/textarea>/);
+  assert.match(html, /<textarea[^>]*id="commandInput"[^>]*placeholder="输入你想要搜索的相关内容，会给你生成对应内容的股票推荐"[^>]*><\/textarea>/);
   assert.match(css, /\.command-row textarea:focus::placeholder\{color:transparent\}/);
 });
 
@@ -440,6 +447,13 @@ test('近三个月行情返回技术分析和观察窗口', { timeout: 30000 }, 
   assert.ok(result.analysis.supportPrice > 0);
   assert.ok(result.analysis.latestTradeDate);
   assert.ok(result.analysis.analyzedAt);
+  assert.ok(result.analysis.accumulationSetup);
+  assert.ok(result.analysis.capitalSetupAssessment);
+  assert.ok(result.analysis.consolidationBreakout);
+  assert.ok(result.analysis.breakoutPotential);
+  assert.match(result.analysis.breakoutPotential.status, /横盘观察|突破蓄势|接近突破|突破确认|结构偏弱|非横盘/);
+  assert.equal(typeof result.fundFlowPeriod?.available, 'boolean');
+  assert.match(result.analysis.capitalSetupAssessment.summary, /主力资金/);
   assert.ok(result.newsContext);
   assert.ok(result.financialAnalysis?.latestReport);
   assert.equal(result.investmentAnalysis?.canslim?.total, 7);
@@ -484,7 +498,9 @@ test('大盘分析返回指数、轮动、资金和涨跌停结构', { timeout: 
   assert.match(result.source, /腾讯全市场行情/);
   assert.ok(result.recommendations.length > 0);
   assert.ok(result.recommendations.every(item => item.breakoutPrice > 0 && item.ma30 > 0));
-  assert.ok(result.recommendations.every(item => ['底部待反弹', '已反弹', '待突破'].includes(item.signal)));
+  assert.ok(result.recommendations.every(item => [
+    '底部待反弹', '已反弹', '待突破', '横盘观察', '突破蓄势', '接近突破', '突破确认'
+  ].includes(item.signal)));
   assert.ok(result.recommendations.every(item => ['消息确认', '消息中性', '消息谨慎'].includes(item.newsLabel)));
   assert.ok(result.recommendations.every(item => Number.isFinite(item.signalScore) && item.reason.includes(item.signal)));
   assert.ok(result.recommendations.every(item => item.industry && item.industry !== '行业待确认'));
@@ -496,15 +512,17 @@ test('大盘分析返回指数、轮动、资金和涨跌停结构', { timeout: 
   assert.equal(result.recommendations.length, result.recommendationCoverage.qualified);
   const finalSignalCounts = result.recommendations.reduce((counts, item) => {
     if (item.signal === '底部待反弹') counts.bottomWaiting += 1;
-    if (item.signal === '已反弹') counts.rebounded += 1;
-    if (item.signal === '待突破') counts.breakout += 1;
+    else if (item.signal === '已反弹') counts.rebounded += 1;
+    else counts.breakout += 1;
     return counts;
   }, { bottomWaiting: 0, rebounded: 0, breakout: 0 });
   assert.deepEqual(result.recommendationCoverage.signals, finalSignalCounts);
   assert.equal(Object.values(result.recommendationCoverage.signals).reduce((sum, count) => sum + count, 0), result.recommendations.length);
   assert.ok(result.recommendations.every(item => item.score === item.signalScore && Number.isFinite(item.technicalScore)));
   assert.ok((result.recommendationCoverage.signals?.breakout || 0) > 0);
-  assert.ok(result.recommendations.slice(0, 10).some(item => item.signal === '待突破'));
+  assert.ok(result.recommendations.slice(0, 10).some(item =>
+    ['待突破', '横盘观察', '突破蓄势', '接近突破', '突破确认'].includes(item.signal)
+  ));
   assert.ok((result.recommendationCoverage.signals?.rebounded || 0) > 0);
   assert.ok(result.recommendationCoverage.scanned > 1000);
   assert.ok(result.recommendationCoverage.analyzed > 24);
@@ -567,6 +585,161 @@ test('阶段深跌后均线与MACD改善可形成已反弹信号', () => {
   assert.ok(analysis.bottomDrawdown <= -18);
   assert.ok(analysis.reboundFromBottom >= 6);
   assert.ok(analysis.ma5 > analysis.ma10);
+});
+
+test('阶段资金流汇总区分主力买入、卖出和净额', () => {
+  const rows = Array.from({ length: 10 }, (_, index) => ({
+    opendate: `2026-08-${String(index + 1).padStart(2, '0')}`,
+    r0_in: '500', r0_out: '300', r0_net: index === 0 ? '-100' : '200', r0_ratio: '2.5'
+  }));
+  const result = summarizeFundFlowRows(rows, 10);
+  assert.equal(result.available, true);
+  assert.equal(result.days, 10);
+  assert.equal(result.mainInflow, 50_000_000);
+  assert.equal(result.mainOutflow, 30_000_000);
+  assert.equal(result.mainNetInflow, 17_000_000);
+  assert.equal(result.positiveDays, 9);
+  assert.equal(result.startDate, '2026-08-01');
+  assert.equal(result.endDate, '2026-08-10');
+});
+
+test('识别底部五线粘合后三次温和放量并开始多头发散', () => {
+  const rows = Array.from({ length: 90 }, (_, index) => {
+    const risingIndex = Math.max(0, index - 59);
+    const close = index < 60 ? 10 : 10 + risingIndex * .045;
+    const surge = [68, 76, 84].includes(index);
+    return {
+      date: `2026-05-${String(index + 1).padStart(2, '0')}`,
+      open: close * .995, close, high: close * 1.015, low: close * .985,
+      volume: surge ? 1_650_000 : 1_000_000, amount: close * (surge ? 1_650_000 : 1_000_000)
+    };
+  });
+  const setup = analyzeAccumulationSetup(rows);
+  assert.equal(setup.passed, true);
+  assert.equal(setup.bullishAlignment, true);
+  assert.equal(setup.notMainWave, true);
+  assert.ok(setup.volumeSurgeCount >= 3);
+  assert.ok(setup.surgePriceRisePct > 0);
+  assert.match(setup.summary, /五线粘合/);
+  assert.match(setup.summary, /3次/);
+
+  const overheated = rows.map((row, index) => index < 70 ? row : ({ ...row, close: row.close * 1.45, high: row.high * 1.45, low: row.low * 1.45 }));
+  assert.equal(analyzeAccumulationSetup(overheated).passed, false);
+});
+
+test('横盘箱体量能试压可识别蓄势和放量突破', () => {
+  const trend = Array.from({ length: 70 }, (_, index) => {
+    const close = 7 + index * .015;
+    return {
+      date: `2026-04-${String(index + 1).padStart(2, '0')}`,
+      open: close - .03, close, high: close + .08, low: close - .08, volume: 1_000_000
+    };
+  });
+  const boxCloses = [8.08, 8.16, 8.11, 8.22, 8.18, 8.28, 8.21, 8.34, 8.30];
+  const box = boxCloses.map((close, index) => ({
+    date: `2026-08-${String(index + 1).padStart(2, '0')}`,
+    open: close - .03, close,
+    high: index === 7 ? 8.58 : close + .10,
+    low: index === 0 ? 8.00 : close - .08,
+    volume: index === 7 ? 1_300_000 : 760_000
+  }));
+  const latest = {
+    date: '2026-08-10', open: 8.31, close: 8.40, high: 8.48, low: 8.25, volume: 900_000
+  };
+  const setup = analyzeConsolidationBreakout([...trend, ...box, latest]);
+  assert.equal(setup.available, true);
+  assert.equal(setup.isConsolidating, true);
+  assert.ok(setup.boxDays >= 7 && setup.boxDays <= 12);
+  assert.ok(['突破蓄势', '接近突破'].includes(setup.status));
+  assert.ok(setup.distanceToBreakoutPct >= 0 && setup.distanceToBreakoutPct <= 4);
+  assert.ok(setup.pressureTestCount >= 1);
+
+  const breakout = analyzeConsolidationBreakout([
+    ...trend, ...box,
+    { ...latest, close: 8.70, high: 8.75, low: 8.40, volume: 1_600_000 }
+  ]);
+  assert.equal(breakout.breakoutConfirmed, true);
+  assert.equal(breakout.status, '突破确认');
+  assert.equal(breakout.boxHigh, 8.58);
+});
+
+test('横盘突破合并阶段资金后统一升级或降级', () => {
+  const technical = {
+    available: true, isConsolidating: true, status: '突破蓄势', technicalScore: 66,
+    boxDays: 9, boxLow: 8, boxHigh: 8.6, rangePct: 7.2, distanceToBreakoutPct: 2.5,
+    pressureTestCount: 1, failedPressureCount: 0, breakoutConfirmed: false,
+    summary: '近9日横盘箱体8.00-8.60元', trigger: '放量收盘突破8.60元', invalidation: '收盘跌破8.00元'
+  };
+  const positive = combineConsolidationBreakout(technical, {
+    available: true, days: 10, mainInflow: 8e8, mainOutflow: 5e8,
+    mainNetInflow: 3e8, netRatio: 23.08, positiveDays: 7
+  });
+  assert.equal(positive.score, 76);
+  assert.equal(positive.status, '接近突破');
+  assert.match(positive.summary, /近10日主力买入/);
+
+  const missing = combineConsolidationBreakout(technical, { available: false, days: 0 });
+  assert.equal(missing.score, 66);
+  assert.equal(missing.status, '突破蓄势');
+  assert.match(missing.summary, /资金数据不足/);
+
+  const negative = combineConsolidationBreakout(technical, {
+    available: true, days: 10, mainInflow: 4e8, mainOutflow: 7e8,
+    mainNetInflow: -3e8, netRatio: -27.27, positiveDays: 3
+  });
+  assert.equal(negative.score, 48);
+  assert.equal(negative.status, '结构偏弱');
+
+  const nonConsolidating = combineConsolidationBreakout({
+    ...technical, isConsolidating: false, status: '非横盘', technicalScore: 42
+  }, {
+    available: true, days: 10, mainInflow: 9e8, mainOutflow: 2e8,
+    mainNetInflow: 7e8, netRatio: 63.64, positiveDays: 9
+  });
+  assert.equal(nonConsolidating.status, '非横盘');
+  assert.equal(nonConsolidating.score, 42);
+  assert.equal(nonConsolidating.flowAdjustment, 0);
+});
+
+test('横盘预筛优先低波动缩量且接近日内高位的股票', () => {
+  const quiet = scoreConsolidationCandidate({
+    amount: 2e8, changePct: .5, snapshotVolumeRatio: .8,
+    turnoverRate: 3, price: 8.3, high: 8.45
+  });
+  const volatile = scoreConsolidationCandidate({
+    amount: 2e8, changePct: 8, snapshotVolumeRatio: 3,
+    turnoverRate: 15, price: 8.3, high: 8.45
+  });
+  assert.ok(quiet > volatile);
+  assert.ok(quiet > 0);
+});
+
+test('个股分析结合阶段主力资金评估蓄势强弱', () => {
+  const technical = {
+    score: 70,
+    verdict: '可关注',
+    buyCondition: '等待技术突破后再评估。',
+    tradePlan: { enabled: true },
+    accumulationSetup: { passed: true, summary: '五线粘合后多头发散，三次温和放量价格抬高' }
+  };
+  const positive = applyIndividualCapitalAssessment(technical, {
+    available: true, days: 10, mainInflow: 8e8, mainOutflow: 5e8,
+    mainNetInflow: 3e8, netRatio: 23.08, positiveDays: 7
+  });
+  assert.equal(positive.score, 76);
+  assert.equal(positive.capitalSetupAssessment.status, '蓄势增强');
+  assert.match(positive.capitalSetupAssessment.summary, /近10日主力买入/);
+  assert.equal(positive.tradePlan.enabled, true);
+
+  const negative = applyIndividualCapitalAssessment(technical, {
+    available: true, days: 10, mainInflow: 4e8, mainOutflow: 7e8,
+    mainNetInflow: -3e8, netRatio: -27.27, positiveDays: 3
+  });
+  assert.equal(negative.score, 62);
+  assert.equal(negative.capitalSetupAssessment.status, '资金未确认');
+  assert.equal(negative.verdict, '等待确认');
+  assert.equal(negative.tradePlan.enabled, false);
+  assert.match(negative.buyCondition, /持续净流出/);
 });
 
 test('低价高估值弱反弹股票不会进入大盘推荐', { timeout: 60000 }, async () => {

@@ -12,16 +12,14 @@
     <header class="hero">
       <div>
         <h1>股票观察助手</h1>
-        <p>A股行业与产业链：需求命令 → 产业链分区 → 重点关注池 → 标签管理 → 刷新行情</p>
         <small id="lastUpdated"></small>
       </div>
-      <button id="refreshAll" class="primary">刷新实际行情</button>
     </header>
 
     <section class="command-box card">
       <label>需求命令</label>
       <div class="command-row">
-        <textarea id="commandInput" placeholder="输入你想要搜索的相关内容，会给你生成对应内容的股票推荐"></textarea>
+        <textarea id="commandInput" rows="1" placeholder="输入你想要搜索的相关内容，会给你生成对应内容的股票推荐"></textarea>
         <button id="generateBtn" class="primary">生成/更新股票池</button>
       </div>
     </section>
@@ -52,7 +50,8 @@
       <section class="left">
         <div class="toolbar">
           <div class="toolbar-left">
-            <input id="searchInput" placeholder="搜索名称 / 代码 / 产业 / 状态" />
+            <input id="searchInput" aria-label="线上股票搜索" placeholder="线上股票搜索：名称 / 代码 / 产业 / 状态" />
+            <button id="refreshAll" class="primary">刷新实际行情</button>
             <button id="cardView">卡牌</button>
             <button id="tableView">列表</button>
           </div>
@@ -151,6 +150,7 @@
     <button id="pinLabelStock" role="menuitem">置顶</button>
     <button id="removeLabelStock" class="danger-text" role="menuitem">从当前标签删除</button>
   </div>
+  <button id="backToTop" class="back-to-top" type="button" title="回到顶部" aria-label="回到顶部">↑</button>
   <script src="renderer.js"></script>
 </body>
 </html>
