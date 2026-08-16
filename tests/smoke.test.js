@@ -39,6 +39,7 @@ const {
   recommendationSignalFamily,
   restoreCachedMarketRecommendations,
   evaluateRecommendationRisk,
+  summarizeNews,
   assessRecommendationTimingRisk,
   buildFutureRiskProfile,
   summarizeFundFlowRows,
@@ -55,6 +56,46 @@ const {
   settleWithConcurrency
 } = require('../main.js');
 Module._load = originalLoad;
+
+test('实时消息按发布时间、相关性和风险强度加权', () => {
+  const now = '2026-08-16T12:00:00Z';
+  const positive = summarizeNews([
+    { title:'贵州茅台业绩预增并发布回购计划', summary:'盈利增长', publishedAt:'2026-08-16T08:00:00Z', source:'测试源' }
+  ], '', { subject:'贵州茅台', code:'600519', now, fetchedAt:now });
+  assert.equal(positive.signal, '偏积极');
+  assert.equal(positive.freshness, '实时资讯');
+  assert.ok(positive.factorScore > 50);
+  assert.match(positive.summary, /消息获取截至.*最新相关资讯.*时效加权判断偏积极/);
+
+  const negative = summarizeNews([
+    { title:'贵州茅台收到立案调查并被处罚', summary:'公司提示风险', publishedAt:'2026-08-16T10:00:00Z', source:'测试源' },
+    { title:'贵州茅台上月订单增长', summary:'', publishedAt:'2026-07-20T10:00:00Z', source:'测试源' }
+  ], '', { subject:'贵州茅台', code:'600519', now, fetchedAt:now });
+  assert.equal(negative.signal, '偏谨慎');
+  assert.ok(negative.factorScore < 50);
+});
+
+test('无关消息不参与个股判断，过期或缓存利好不充当实时确认', () => {
+  const now = '2026-08-16T12:00:00Z';
+  const irrelevant = summarizeNews([
+    { title:'宁德时代重大合同落地', summary:'订单增长', publishedAt:'2026-08-16T10:00:00Z' }
+  ], '', { subject:'贵州茅台', code:'600519', now, fetchedAt:now });
+  assert.equal(irrelevant.signal, '中性');
+  assert.equal(irrelevant.available, false);
+
+  const old = summarizeNews([
+    { title:'贵州茅台重大合同落地并回购', summary:'', publishedAt:'2026-07-27T10:00:00Z' }
+  ], '', { subject:'贵州茅台', code:'600519', now, fetchedAt:now });
+  assert.equal(old.signal, '中性');
+  assert.equal(old.freshness, '较早资讯');
+
+  const stale = summarizeNews([
+    { title:'贵州茅台业绩预增并回购', summary:'盈利增长', publishedAt:'2026-08-16T10:00:00Z' }
+  ], '', { subject:'贵州茅台', code:'600519', now, fetchedAt:now, stale:true });
+  assert.equal(stale.signal, '中性');
+  assert.equal(stale.factorScore, 50);
+  assert.match(stale.summary, /沿用缓存.*不作为买入确认/);
+});
 
 test('单股行情解析保留估值、换手和盘口指标', () => {
   const columns = Array(88).fill('');
