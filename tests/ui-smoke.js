@@ -70,7 +70,7 @@ app.whenReady().then(async () => {
       volume: '近5日平均成交量高于20日均量，量能偏活跃。',
       volumeRatio: 1.43, volume5Ratio: 1.31,
       breakoutPrice: 7.40, supportPrice: 6.20, distanceToBreakout: 2.10,
-      score: request?.force ? 82 : 76, verdict: '等待确认', risk: '波动率偏高，ATR14为0.26元。',
+      score: request?.force ? 82 : 76, verdict: '可关注', risk: '波动率偏高，ATR14为0.26元。',
       maAlignment: 'MA5/10/20/30/60多头排列',
       accumulationSetup: {
         passed: true, bullishAlignment: true, diverging: true, notMainWave: true,
@@ -98,7 +98,7 @@ app.whenReady().then(async () => {
         trigger:'放量收盘突破8.60元，成交量达到20日均量1.5-4.0倍',
         invalidation:'收盘跌破8.00元，或放量冲高回落后连续两日未收复箱顶'
       },
-      buyCondition: '等待放量突破7.40元且收盘站稳，当前不宜无条件追价。',
+      buyCondition: '支撑有效且阶段资金持续净流入时，可分批低吸。',
       entryAssessment: {
         allowed:true, status:'震荡洗盘，可分批低吸', tone:'positive', setupType:'sideways-washout',
         summary:'近9日维持6.20-7.40元箱体，近5日量能压缩至20日均量的0.83倍，价格反复震荡但未破箱底，偏向缩量洗盘。近10日阶段主力净流入3.00亿，资金与量价结构相互确认。消息面偏积极，大盘环境偏强。',
@@ -106,7 +106,7 @@ app.whenReady().then(async () => {
         evidence:['现价7.25元','箱体6.20-7.40元','量能压缩比0.83','近10日阶段主力净流入3.00亿','消息面偏积极','大盘环境偏强']
       },
       newsImpact: '消息面偏积极，但需等待量价确认。',
-      combinedConclusion: '等待确认（技术评分76/100）。等待放量突破7.40元且收盘站稳。消息面偏积极，但需等待量价确认。',
+      combinedConclusion: `可关注（技术评分${request?.force ? 82 : 76}/100）。支撑有效且阶段资金持续净流入时，可分批低吸。消息面偏积极。`,
       entry: '未来3-5个交易日回踩MA10后企稳，或放量突破7.40元再确认。',
       exit: '收盘连续2日跌破MA20，或跌破6.20元止损；接近8.00元留意止盈。',
       tradePlan: {
@@ -872,9 +872,11 @@ app.whenReady().then(async () => {
     && state.scoreConsistencyState.cardText.includes('消息确认\n¥11.08')
     && !state.scoreConsistencyState.cardText.includes('\n中药\n')
     && state.scoreConsistencyState.cardText.includes('CANSLIM 81 · 6/7维')
-    && state.scoreConsistencyState.detailScore === '84'
-    && state.scoreConsistencyState.detailScoreLabel === '推荐评分 / 100'
-    && state.scoreConsistencyState.detailText.includes('推荐评分84/100')
+    && state.scoreConsistencyState.detailScore === '82'
+    && state.scoreConsistencyState.detailScoreLabel === '当前技术评分 / 100'
+    && state.scoreConsistencyState.detailText.includes('技术评分82/100')
+    && state.scoreConsistencyState.detailText.includes('大盘推荐快照：')
+    && state.scoreConsistencyState.detailText.includes('推荐评分 84 / 100')
     && state.scoreConsistencyState.detailText.includes('CANSLIM 与价值质量分析')
     && state.scoreConsistencyState.detailText.includes('2026一季报')
     && state.scoreConsistencyState.detailText.includes('暂不计算DCF或目标价')

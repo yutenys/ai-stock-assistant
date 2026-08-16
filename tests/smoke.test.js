@@ -34,7 +34,9 @@ const {
   buildRecommendationFactorContext,
   evaluateRecommendationFactors,
   resolveRecommendationIndustry,
+  recommendationIndustryGroupKey,
   groupRecommendationsByIndustry,
+  recommendationSignalFamily,
   restoreCachedMarketRecommendations,
   evaluateRecommendationRisk,
   assessRecommendationTimingRisk,
@@ -203,9 +205,16 @@ test('大盘推荐多因子只使用可验证数据并按板块聚合', () => {
   assert.equal(resolveRecommendationIndustry({ code:'4', factorAnalysis:{ sectorProfile:{ name:'电力设备' } } }), '电力设备');
   assert.equal(resolveRecommendationIndustry({ code:'5', sector:'中药' }), '中药');
   assert.equal(resolveRecommendationIndustry({ code:'6', industry:'行业待确认' }, new Map([['6',{industry:'白酒'}]])), '白酒');
+  assert.equal(recommendationIndustryGroupKey({ code:'600001', industry:'行业待确认' }), '未分类-600001');
+  assert.equal(recommendationIndustryGroupKey({ code:'600002', industry:'行业待确认' }), '未分类-600002');
+  const unknownContext = buildRecommendationFactorContext([
+    { code:'600001', industry:'行业待确认', price:10, changePct:1 },
+    { code:'600002', industry:'行业待确认', price:12, changePct:-1 }
+  ]);
+  assert.equal(unknownContext.sectorProfiles.size, 2);
 });
 
-test('大盘推荐仅在解禁接口网络失败时降分保留未确认候选', () => {
+test('大盘推荐在风险接口失败但没有已核验风险时降分保留候选', () => {
   const item = { code: '600001', score: 80, signalScore: 80, reason: '待突破。' };
   const unverified = evaluateRecommendationRisk(item, {
     status: 'unknown', summary: '限售解禁数据未确认',
@@ -221,10 +230,12 @@ test('大盘推荐仅在解禁接口网络失败时降分保留未确认候选',
     status: 'risk', summary: '未来半年存在减持计划',
     st: { status: 'clear' }, reduction: { status: 'risk' }, unlock: { status: 'clear' }, errors: []
   }).status, 'rejected');
-  assert.equal(evaluateRecommendationRisk(item, {
+  const allUnknown = evaluateRecommendationRisk(item, {
     status: 'unknown', summary: '减持计划数据未确认',
     st: { status: 'clear' }, reduction: { status: 'unknown' }, unlock: { status: 'unknown' }, errors: []
-  }).status, 'unknown');
+  });
+  assert.equal(allUnknown.status, 'unverified');
+  assert.equal(allUnknown.item.signalScore, 66);
 });
 
 test('本轮大盘推荐为空时保留最近成功推荐并刷新行情', () => {
@@ -243,7 +254,7 @@ test('本轮大盘推荐为空时保留最近成功推荐并刷新行情', () =>
   assert.match(result.recommendations[0].reason, /综合入场：数据待补充/);
   assert.equal(result.recommendationCoverage.cachedFallback, true);
   assert.equal(result.recommendationCoverage.qualified, 1);
-  assert.deepEqual(result.recommendationCoverage.signals, { bottomWaiting:0, rebounded:0, breakout:1 });
+  assert.deepEqual(result.recommendationCoverage.signals, { bottomWaiting:0, rebounded:0, breakout:1, structure:0, other:0 });
 
   const fresh = { recommendations:[{code:'600002'}] };
   assert.equal(restoreCachedMarketRecommendations(fresh, cached, []), false);
@@ -515,11 +526,9 @@ test('大盘分析返回指数、轮动、资金和涨跌停结构', { timeout: 
   }));
   assert.equal(result.recommendations.length, result.recommendationCoverage.qualified);
   const finalSignalCounts = result.recommendations.reduce((counts, item) => {
-    if (item.signal === '底部待反弹') counts.bottomWaiting += 1;
-    else if (item.signal === '已反弹') counts.rebounded += 1;
-    else counts.breakout += 1;
+    counts[recommendationSignalFamily(item.signal)] += 1;
     return counts;
-  }, { bottomWaiting: 0, rebounded: 0, breakout: 0 });
+  }, { bottomWaiting: 0, rebounded: 0, breakout: 0, structure: 0, other: 0 });
   assert.deepEqual(result.recommendationCoverage.signals, finalSignalCounts);
   assert.equal(Object.values(result.recommendationCoverage.signals).reduce((sum, count) => sum + count, 0), result.recommendations.length);
   assert.ok(result.recommendations.every(item => item.score === item.signalScore && Number.isFinite(item.technicalScore)));
@@ -605,9 +614,22 @@ test('阶段资金流汇总区分主力买入、卖出和净额', () => {
   assert.equal(result.mainInflow, 50_000_000);
   assert.equal(result.mainOutflow, 30_000_000);
   assert.equal(result.mainNetInflow, 17_000_000);
+  assert.equal(result.grossFlowsAvailable, true);
   assert.equal(result.positiveDays, 9);
   assert.equal(result.startDate, '2026-08-01');
   assert.equal(result.endDate, '2026-08-10');
+});
+
+test('新浪新版阶段资金净额按元处理且缺失买卖分项时不伪造为零', () => {
+  const result = summarizeFundFlowRows([
+    { opendate:'2026-08-14', r0_net:'-43094586.95', r0_ratio:'-0.09390522' },
+    { opendate:'2026-08-13', r0_net:'27837323.49', r0_ratio:'0.03976190' }
+  ], 10);
+  assert.equal(result.mainInflow, null);
+  assert.equal(result.mainOutflow, null);
+  assert.equal(result.grossFlowsAvailable, false);
+  assert.ok(Math.abs(result.mainNetInflow - -15_257_263.46) < .01);
+  assert.ok(result.netRatio < 0);
 });
 
 test('识别底部五线粘合后三次温和放量并开始多头发散', () => {
@@ -843,7 +865,8 @@ test('个股分析结合阶段主力资金评估蓄势强弱', () => {
     available: true, days: 10, mainInflow: 8e8, mainOutflow: 5e8,
     mainNetInflow: 3e8, netRatio: 23.08, positiveDays: 7
   });
-  assert.equal(positive.score, 76);
+  assert.equal(positive.score, 70);
+  assert.equal(positive.capitalAdjustedScore, 76);
   assert.equal(positive.capitalSetupAssessment.status, '蓄势增强');
   assert.match(positive.capitalSetupAssessment.summary, /近10日主力买入/);
   assert.equal(positive.tradePlan.enabled, true);
@@ -853,7 +876,8 @@ test('个股分析结合阶段主力资金评估蓄势强弱', () => {
     available: true, days: 10, mainInflow: 4e8, mainOutflow: 7e8,
     mainNetInflow: -3e8, netRatio: -27.27, positiveDays: 3
   });
-  assert.equal(negative.score, 62);
+  assert.equal(negative.score, 70);
+  assert.equal(negative.capitalAdjustedScore, 62);
   assert.equal(negative.capitalSetupAssessment.status, '资金未确认');
   assert.equal(negative.verdict, '等待确认');
   assert.equal(negative.tradePlan.enabled, false);
@@ -875,6 +899,17 @@ test('个股分析结合阶段主力资金评估蓄势强弱', () => {
   assert.equal(bottomAccumulation.entryAssessment.allowed, true);
   assert.equal(bottomAccumulation.entryAssessment.status, '底部吸筹，可分批低吸');
   assert.match(bottomAccumulation.entryAssessment.summary, /阶段主力净流入/);
+  assert.equal(bottomAccumulation.verdict, '可关注');
+  assert.match(bottomAccumulation.buyCondition, /可在支撑有效前提下分批低吸/);
+  assert.equal(bottomAccumulation.tradePlan.enabled, true);
+});
+
+test('推荐信号统计区分突破形态与吸筹洗盘形态', () => {
+  assert.equal(recommendationSignalFamily('待突破'), 'breakout');
+  assert.equal(recommendationSignalFamily('突破确认'), 'breakout');
+  assert.equal(recommendationSignalFamily('底部吸筹'), 'structure');
+  assert.equal(recommendationSignalFamily('震荡洗盘'), 'structure');
+  assert.equal(recommendationSignalFamily('已反弹'), 'rebounded');
 });
 
 test('消息面和大盘环境会调整个股及大盘推荐入场结论', () => {

@@ -236,9 +236,11 @@ function renderMarketOverview(result){
   const signals = recommendations.reduce((counts, item) => {
     if(item.signal === '底部待反弹') counts.bottomWaiting += 1;
     else if(item.signal === '已反弹') counts.rebounded += 1;
-    else counts.breakout += 1;
+    else if(['底部吸筹','震荡洗盘'].includes(item.signal)) counts.structure += 1;
+    else if(['待突破','横盘观察','突破蓄势','接近突破','突破确认'].includes(item.signal)) counts.breakout += 1;
+    else counts.other += 1;
     return counts;
-  }, {bottomWaiting:0, rebounded:0, breakout:0});
+  }, {bottomWaiting:0, rebounded:0, breakout:0, structure:0, other:0});
   const riskCoverage = Number.isFinite(Number(coverage.riskChecked))
     ? `；未来半年风险核验 ${coverage.riskChecked} 只，排除 ${coverage.riskRejected || 0} 只，未确认 ${coverage.riskUnknown || 0} 只${coverage.riskUnverifiedIncluded ? `（降分保留 ${coverage.riskUnverifiedIncluded} 只）` : ''}`
     : '';
@@ -247,8 +249,11 @@ function renderMarketOverview(result){
   if(Number.isFinite(Number(coverage.consolidationCandidates))) structureCounts.push(`横盘候选 ${coverage.consolidationCandidates} 只`);
   if(Number.isFinite(Number(coverage.fundFlowAvailable))) structureCounts.push(`阶段资金可用 ${coverage.fundFlowAvailable} 只`);
   const accumulationCoverage = structureCounts.length ? `；${structureCounts.join('，')}` : '';
+  const unresolvedIndustryCoverage = Number(coverage.industryUnresolved) > 0 ? `，${coverage.industryUnresolved} 只行业待补充` : '';
+  const signalSummary = [`待反弹 ${signals.bottomWaiting}`, `已反弹 ${signals.rebounded}`, `突破类 ${signals.breakout}`, `吸筹/洗盘 ${signals.structure}`];
+  if(signals.other) signalSummary.push(`其他 ${signals.other}`);
   $('marketRecommendationCoverage').textContent = coverage.scanned
-    ? `全市场扫描 ${coverage.scanned} 只，初筛 ${coverage.prefiltered || 0} 只，历史精筛 ${coverage.analyzed || 0} 只，覆盖 ${coverage.industries || 0} 个行业${accumulationCoverage}${riskCoverage}；实际推荐 ${recommendations.length} 只（待反弹 ${signals.bottomWaiting}，已反弹 ${signals.rebounded}，待突破 ${signals.breakout}）${fallbackNote}`
+    ? `全市场扫描 ${coverage.scanned} 只，初筛 ${coverage.prefiltered || 0} 只，历史精筛 ${coverage.analyzed || 0} 只，覆盖 ${coverage.industries || 0} 个已确认行业${unresolvedIndustryCoverage}${accumulationCoverage}${riskCoverage}；实际推荐 ${recommendations.length} 只（${signalSummary.join('，')}）${fallbackNote}`
     : '等待全市场扫描';
   const visibleRecommendations = recommendations.slice(0, 10);
   $('marketRecommendations').innerHTML = visibleRecommendations.length ? groupedRecommendationHtml(visibleRecommendations) : '<div class="market-row"><span>当前未筛出满足条件的候选</span></div>';
@@ -1266,7 +1271,7 @@ function investmentAnalysisHtml(result){
       : '<p><b>财务红旗：</b>当前已获取指标未触发硬性恶化条件；仍不等于财务无风险。</p>';
   return `<section class="investment-framework">
     <h3>CANSLIM 与价值质量分析</h3>
-    <div class="analysis-verdict"><div class="analysis-score"><b>${escapeHtml(canslim?.score ?? '--')}</b><span>CANSLIM / 100</span></div><div><p><b>可验证覆盖：</b>${escapeHtml(canslim?.available ?? 0)}/${escapeHtml(canslim?.total ?? 7)}维，原始得分 ${escapeHtml(canslim?.rawScore ?? '--')}/${escapeHtml(canslim?.availableMax ?? '--')}。</p><p>${escapeHtml(canslim?.note || '缺失项不推测。')}</p></div></div>
+    <div class="analysis-verdict"><div class="analysis-score"><b>${escapeHtml(canslim?.score ?? '--')}</b><span>CANSLIM / 100</span></div><div><p><b>评分口径：</b>${escapeHtml(canslim?.scope || '个股实时分析')}；<b>可验证覆盖：</b>${escapeHtml(canslim?.available ?? 0)}/${escapeHtml(canslim?.total ?? 7)}维，原始得分 ${escapeHtml(canslim?.rawScore ?? '--')}/${escapeHtml(canslim?.availableMax ?? '--')}。</p><p>${escapeHtml(canslim?.note || '缺失项不推测。')}</p></div></div>
     <div class="framework-table-wrap"><table class="framework-table"><thead><tr><th>维度</th><th>得分</th><th>真实数据依据</th></tr></thead><tbody>${dimensionRows || '<tr><td colspan="3">CANSLIM数据不足</td></tr>'}</tbody></table></div>
     <div class="value-summary"><p><b>价值综合分：</b>${escapeHtml(value.score ?? '--')}/100；<b>财务质量：</b>${qualityScore}；<b>估值分：</b>${escapeHtml(value.valuationScore ?? '--')}/100。</p>
       <p><b>PE / PB：</b>${value.pe == null ? '--' : formatNumber(value.pe,1)} / ${value.pb == null ? '--' : formatNumber(value.pb,1)}；<b>质量依据：</b>${escapeHtml(quality.evidence || '财务接口暂时不可用，本次不生成财务质量评分')}。</p>
@@ -1289,13 +1294,14 @@ function renderHistoryAnalysis(s, result){
   const capital = typeof s.mainNetInflow === 'number'
     ? `当前主力流入${metricValue(s.mainInflow, money)}、流出${metricValue(s.mainOutflow, money)}，${s.mainNetInflow >= 0 ? '净流入' : '净流出'}${money(Math.abs(s.mainNetInflow))}${typeof s.mainNetPct === 'number' ? `，净占比${formatPct(s.mainNetPct)}` : ''}。`
     : '当前主力资金接口未返回有效数据，不沿用历史资金值。';
-  const displayedScore = stockAnalysisScore(s) ?? a.score;
   const hasRecommendationScore = s.signalScore !== null && s.signalScore !== '' && Number.isFinite(Number(s.signalScore));
-  const scoreLabel = hasRecommendationScore ? '推荐评分 / 100' : '技术评分 / 100';
-  const conclusion = hasRecommendationScore
-    ? String(a.combinedConclusion || a.summary || '').replace(/技术评分\s*\d+(?:\.\d+)?\s*\/\s*100/g, `推荐评分${displayedScore}/100`)
-    : a.combinedConclusion || a.summary;
-  const displayedVerdict = hasRecommendationScore ? s.verdict || a.verdict : a.verdict;
+  const displayedScore = a.score;
+  const scoreLabel = '当前技术评分 / 100';
+  const conclusion = a.combinedConclusion || a.summary;
+  const displayedVerdict = a.verdict;
+  const recommendationSnapshotHtml = hasRecommendationScore
+    ? `<p><b>大盘推荐快照：</b>${escapeHtml(s.signal || s.marketSignal || '待确认')}，推荐评分 ${escapeHtml(Math.round(Number(s.signalScore)))} / 100，推荐时判断 ${escapeHtml(s.verdict || '等待确认')}。该评分保留用于推荐列表排序，不替代本次个股技术评分。</p>`
+    : '';
   const marketContext = stockMarketContext(s);
   const corporateRisk = result?.riskProfile;
   const reductionText = corporateRisk?.reduction?.status === 'risk'
@@ -1330,7 +1336,7 @@ function renderHistoryAnalysis(s, result){
   box.innerHTML = `<h3>综合实时行情、资金、趋势、消息与大盘分析</h3>
     <div class="analysis-verdict">
       <div class="analysis-score"><b>${escapeHtml(displayedScore ?? '--')}</b><span>${scoreLabel}</span></div>
-      <div><p><b>当前判断：</b>${escapeHtml(displayedVerdict || '等待确认')}</p><p>${escapeHtml(conclusion)}</p></div>
+      <div><p><b>当前判断：</b>${escapeHtml(displayedVerdict || '等待确认')}</p><p>${escapeHtml(conclusion)}</p>${recommendationSnapshotHtml}</div>
     </div>
     <div class="analysis-grid">
       ${entryAssessmentHtml}

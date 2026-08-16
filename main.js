@@ -1153,6 +1153,12 @@ function resolveRecommendationIndustry(item, directoryByCode = null) {
   return value || '行业待确认';
 }
 
+function recommendationIndustryGroupKey(item, directoryByCode = null) {
+  const industry = resolveRecommendationIndustry(item, directoryByCode);
+  const code = String(item?.code || '').slice(-6) || 'unknown';
+  return industry === '行业待确认' ? `未分类-${code}` : industry;
+}
+
 function buildRecommendationFactorContext(items) {
   const rows = (items || []).filter(item => item?.price > 0);
   const up = rows.filter(item => Number(item.changePct) > 0).length;
@@ -1161,18 +1167,19 @@ function buildRecommendationFactorContext(items) {
   const marketScore = clampRecommendationScore(35 + breadthRatio * 50);
   const sectors = new Map();
   rows.forEach(item => {
-    const name = resolveRecommendationIndustry(item);
-    if (!sectors.has(name)) sectors.set(name, []);
-    sectors.get(name).push(item);
+    const key = recommendationIndustryGroupKey(item);
+    if (!sectors.has(key)) sectors.set(key, []);
+    sectors.get(key).push(item);
   });
-  const sectorProfiles = new Map([...sectors.entries()].map(([name, peers]) => {
+  const sectorProfiles = new Map([...sectors.entries()].map(([key, peers]) => {
+    const name = resolveRecommendationIndustry(peers[0]);
     const changes = peers.map(item => finiteNumber(item.changePct)).filter(item => item !== null);
     const amounts = peers.map(item => finiteNumber(item.amount)).filter(item => item !== null);
     const averageChangePct = changes.length ? average(changes) : 0;
     const upRatio = changes.length ? changes.filter(value => value > 0).length / changes.length : .5;
     const score = clampRecommendationScore(50 + averageChangePct * 7 + (upRatio - .5) * 35);
     const label = score >= 72 ? '强势板块' : score >= 58 ? '活跃板块' : score < 42 ? '偏弱板块' : '中性板块';
-    return [name, {
+    return [key, {
       name, count: peers.length, averageChangePct, upRatio,
       amount: amounts.reduce((sum, value) => sum + value, 0), score, label,
       changes, amounts
@@ -1189,7 +1196,10 @@ function formatCapitalAmount(value) {
 function fundFlowPeriodEvidence(flow) {
   if (!flow?.available) return '阶段主力资金数据不可用';
   const direction = flow.mainNetInflow >= 0 ? '净流入' : '净流出';
-  return `近${flow.days}日主力买入${formatCapitalAmount(flow.mainInflow)}、卖出${formatCapitalAmount(flow.mainOutflow)}，${direction}${formatCapitalAmount(flow.mainNetInflow)}，净流入${flow.positiveDays}日`;
+  const gross = flow.grossFlowsAvailable === false || flow.mainInflow == null || flow.mainOutflow == null
+    ? '主力买入/卖出分项暂不可拆分'
+    : `主力买入${formatCapitalAmount(flow.mainInflow)}、卖出${formatCapitalAmount(flow.mainOutflow)}`;
+  return `近${flow.days}日${gross}，${direction}${formatCapitalAmount(flow.mainNetInflow)}，净流入${flow.positiveDays}日`;
 }
 
 function combineConsolidationBreakout(technical, flow) {
@@ -1275,22 +1285,30 @@ function applyIndividualCapitalAssessment(analysis, flow) {
     entryAssessment = { ...entryAssessment, status: '资金未确认', tone: 'warning', summary: `${entryAssessment.summary} 阶段主力资金尚未转为净流入，当前只观察，不执行低吸。` };
   }
   const entryBlockedByFunds = Boolean(analysis.entryAssessment?.allowed && entryAssessment && !entryAssessment.allowed);
-  const verdict = (persistentOutflow || breakoutWeak) && analysis.verdict === '可关注' ? '等待确认' : analysis.verdict;
-  return {
-    ...analysis,
-    score: Math.max(0, Math.min(100, Math.round((analysis.score || 0) + adjustment))),
-    verdict,
-    buyCondition: persistentOutflow
+  const entryAllowed = Boolean(entryAssessment?.allowed);
+  const verdict = entryAllowed ? '可关注'
+    : (persistentOutflow || breakoutWeak || entryBlockedByFunds) && analysis.verdict === '可关注' ? '等待确认' : analysis.verdict;
+  const buyCondition = entryAllowed ? entryAssessment.summary
+    : persistentOutflow
       ? '阶段主力资金持续净流出，暂不执行低吸；等待净流入天数恢复并重新满足原技术条件后再评估。'
       : breakoutWeak
-        ? `横盘结构已经转弱，暂不执行低吸；等待重新站回箱底并修复量价结构后再评估。`
-      : analysis.buyCondition,
-    tradePlan: analysis.tradePlan ? { ...analysis.tradePlan, enabled: persistentOutflow || breakoutWeak || entryBlockedByFunds ? false : analysis.tradePlan.enabled } : analysis.tradePlan,
+        ? '横盘结构已经转弱，暂不执行低吸；等待重新站回箱底并修复量价结构后再评估。'
+        : analysis.buyCondition;
+  return {
+    ...analysis,
+    score: analysis.score,
+    capitalAdjustedScore: Math.max(0, Math.min(100, Math.round((analysis.score || 0) + adjustment))),
+    verdict,
+    buyCondition,
+    tradePlan: analysis.tradePlan ? {
+      ...analysis.tradePlan,
+      enabled: entryAllowed ? true : persistentOutflow || breakoutWeak || entryBlockedByFunds ? false : analysis.tradePlan.enabled
+    } : analysis.tradePlan,
     entryAssessment,
     breakoutPotential,
     capitalSetupAssessment: {
       status, scoreAdjustment: adjustment,
-      summary: `${fundFlowPeriodEvidence(flow)}；${interpretation}。`
+      summary: `阶段主力资金：${fundFlowPeriodEvidence(flow)}；${interpretation}。`
     }
   };
 }
@@ -1326,11 +1344,35 @@ function applyEntryContextAssessment(analysis, { newsContext = null, riskProfile
   } else if (marketWeak && entryAssessment.allowed) {
     entryAssessment = { ...entryAssessment, allowed: false, status: '大盘偏弱，等待确认', tone: 'warning', summary: `${entryAssessment.summary} 市场下跌家数或指数跌幅偏大，暂缓入场。` };
   }
-  return { ...analysis, entryAssessment };
+  const blocked = Boolean(entry.allowed && !entryAssessment.allowed);
+  const verdict = entryAssessment.status === '公司风险' ? '暂不适合介入'
+    : blocked && analysis.verdict === '可关注' ? '等待确认' : analysis.verdict;
+  return {
+    ...analysis,
+    verdict,
+    buyCondition: blocked ? entryAssessment.summary : analysis.buyCondition,
+    tradePlan: blocked && analysis.tradePlan ? { ...analysis.tradePlan, enabled: false } : analysis.tradePlan,
+    entryAssessment
+  };
+}
+
+function buildSupplyDemandScore({ volumeRatio, turnover, amount }) {
+  const volume = finiteNumber(volumeRatio);
+  const turnoverRate = finiteNumber(turnover);
+  const tradedAmount = finiteNumber(amount);
+  const parts = [];
+  if (volume !== null) parts.push(isExplosiveVolume(volume) ? 20 : isControlledVolumeExpansion(volume) ? 88 : volume >= 1 ? 72 : volume >= .7 ? 55 : 35);
+  if (turnoverRate !== null) parts.push(turnoverRate >= 1 && turnoverRate <= 10 ? 78 : turnoverRate > 10 && turnoverRate <= 18 ? 58 : turnoverRate > 18 ? 32 : 52);
+  if (tradedAmount !== null && tradedAmount > 0) parts.push(tradedAmount >= 1e9 ? 88 : tradedAmount >= 3e8 ? 74 : tradedAmount >= 8e7 ? 58 : 35);
+  return {
+    available: parts.length > 0,
+    score: parts.length ? clampRecommendationScore(average(parts)) : null,
+    evidence: `量比${volume !== null ? volume.toFixed(2) : '未提供'}，换手${turnoverRate !== null ? turnoverRate.toFixed(2) + '%' : '未提供'}，成交额${tradedAmount !== null && tradedAmount > 0 ? (tradedAmount / 1e8).toFixed(2) + '亿' : '未提供'}`
+  };
 }
 
 function evaluateRecommendationFactors(item, context, newsContext, financialAnalysis = null) {
-  const sector = context?.sectorProfiles?.get(resolveRecommendationIndustry(item));
+  const sector = context?.sectorProfiles?.get(recommendationIndustryGroupKey(item));
   const factors = [];
   const add = (key, label, score, evidence, available = true) => factors.push({
     key, label, available, score: available ? clampRecommendationScore(score) : null, evidence
@@ -1345,13 +1387,8 @@ function evaluateRecommendationFactors(item, context, newsContext, financialAnal
     valuationParts.length ? `PE ${pe !== null ? pe.toFixed(1) : '未提供'}，PB ${pb !== null ? pb.toFixed(1) : '未提供'}` : '行情接口未提供有效PE/PB', valuationParts.length > 0);
 
   const volumeRatio = finiteNumber(item.analysis?.volumeRatio ?? item.snapshotVolumeRatio);
-  const turnover = finiteNumber(item.turnoverRate);
-  const demandParts = [];
-  if (volumeRatio !== null) demandParts.push(isExplosiveVolume(volumeRatio) ? 20 : isControlledVolumeExpansion(volumeRatio) ? 88 : volumeRatio >= 1 ? 72 : volumeRatio >= .7 ? 55 : 35);
-  if (turnover !== null) demandParts.push(turnover >= 1 && turnover <= 10 ? 78 : turnover > 10 && turnover <= 18 ? 58 : turnover > 18 ? 32 : 52);
-  if (Number(item.amount) > 0) demandParts.push(item.amount >= 1e9 ? 88 : item.amount >= 3e8 ? 74 : item.amount >= 8e7 ? 58 : 35);
-  add('supplyDemand', '供需量能', demandParts.length ? average(demandParts) : 0,
-    `量比${volumeRatio !== null ? volumeRatio.toFixed(2) : '未提供'}，换手${turnover !== null ? turnover.toFixed(2) + '%' : '未提供'}，成交额${Number(item.amount) > 0 ? (item.amount / 1e8).toFixed(2) + '亿' : '未提供'}`, demandParts.length > 0);
+  const demand = buildSupplyDemandScore({ volumeRatio, turnover: item.turnoverRate, amount: item.amount });
+  add('supplyDemand', '供需量能', demand.score || 0, demand.evidence, demand.available);
 
   const flow = item.fundFlowPeriod;
   const flowScore = flow?.available
@@ -1383,6 +1420,7 @@ function evaluateRecommendationFactors(item, context, newsContext, financialAnal
     available: available.length,
     total: factors.length,
     factors,
+    scope: '全市场横截面',
     sectorProfile: sector ? {
       name: sector.name, count: sector.count, averageChangePct: sector.averageChangePct,
       upRatio: sector.upRatio, amount: sector.amount, score: sector.score, label: sector.label
@@ -1405,6 +1443,14 @@ function groupRecommendationsByIndustry(items) {
       return sectorDifference || Number(b[0]?.signalScore || 0) - Number(a[0]?.signalScore || 0);
     })
     .flat();
+}
+
+function recommendationSignalFamily(signal) {
+  if (signal === '底部待反弹') return 'bottomWaiting';
+  if (signal === '已反弹') return 'rebounded';
+  if (['底部吸筹', '震荡洗盘'].includes(signal)) return 'structure';
+  if (['待突破', '横盘观察', '突破蓄势', '接近突破', '突破确认'].includes(signal)) return 'breakout';
+  return 'other';
 }
 
 function restoreCachedMarketRecommendations(result, cachedOverview, marketQuotes = []) {
@@ -1432,11 +1478,9 @@ function restoreCachedMarketRecommendations(result, cachedOverview, marketQuotes
     };
   });
   const signals = result.recommendations.reduce((counts, item) => {
-    if (item.signal === '底部待反弹') counts.bottomWaiting += 1;
-    else if (item.signal === '已反弹') counts.rebounded += 1;
-    else counts.breakout += 1;
+    counts[recommendationSignalFamily(item.signal)] += 1;
     return counts;
-  }, { bottomWaiting: 0, rebounded: 0, breakout: 0 });
+  }, { bottomWaiting: 0, rebounded: 0, breakout: 0, structure: 0, other: 0 });
   result.recommendationCoverage = {
     ...(cachedOverview.recommendationCoverage || {}),
     scanned: marketQuotes.length || cachedOverview.recommendationCoverage?.scanned || 0,
@@ -1477,6 +1521,7 @@ function buildCanslimFromFactors(factorAnalysis) {
     score: availableMax ? clampRecommendationScore(earned / availableMax * 100) : null,
     rawScore: Math.round(earned * 10) / 10,
     availableMax, available: available.length, total: dimensions.length, dimensions,
+    scope: factorAnalysis?.scope || '可验证数据',
     note: '总分仅按可核验维度归一化；缺失维度不按零分处理，也不视为已通过。'
   };
 }
@@ -1485,26 +1530,29 @@ function buildIndividualInvestmentAnalysis({ technical, financial, newsContext, 
   const indices = marketOverview?.indices || [];
   const marketChanges = indices.map(item => finiteNumber(item.changePct)).filter(item => item !== null);
   const averageMarketChange = marketChanges.length ? average(marketChanges) : null;
-  const marketScore = averageMarketChange === null ? null : clampRecommendationScore(55 + averageMarketChange * 12);
-  const supplyParts = [];
-  if (finiteNumber(technical?.volumeRatio) !== null) {
-    const ratio = Number(technical.volumeRatio);
-    supplyParts.push(isExplosiveVolume(ratio) ? 20 : isControlledVolumeExpansion(ratio) ? 88 : ratio >= 1 ? 70 : ratio >= .7 ? 52 : 32);
-  }
-  if (finiteNumber(quote?.turnoverRate) !== null) {
-    const turnover = Number(quote.turnoverRate);
-    supplyParts.push(turnover >= 1 && turnover <= 10 ? 80 : turnover <= 15 ? 62 : 35);
-  }
+  const marketUp = Number(marketOverview?.breadth?.up || 0);
+  const marketDown = Number(marketOverview?.breadth?.down || 0);
+  const marketScore = marketUp + marketDown
+    ? clampRecommendationScore(35 + marketUp / (marketUp + marketDown) * 50)
+    : averageMarketChange === null ? null : clampRecommendationScore(55 + averageMarketChange * 12);
+  const marketEvidence = marketUp + marketDown
+    ? `全市场上涨${marketUp}只、下跌${marketDown}只`
+    : averageMarketChange === null ? '大盘方向数据不可用' : `主要指数平均涨跌${averageMarketChange.toFixed(2)}%`;
+  const supplyDemand = buildSupplyDemandScore({
+    volumeRatio: technical?.volumeRatio,
+    turnover: quote?.turnoverRate,
+    amount: quote?.amount
+  });
   const factors = [
     { key:'currentEarnings', available:Boolean(financial?.current?.available), score:financial?.current?.score ?? null, evidence:financial?.current?.evidence || '季度盈利数据不可用' },
     { key:'annualEarnings', available:Boolean(financial?.annual?.available), score:financial?.annual?.score ?? null, evidence:financial?.annual?.evidence || '年度盈利数据不可用' },
     { key:'catalyst', available:Boolean(newsContext?.items?.length), score:newsContext?.signal === '偏积极' ? 82 : newsContext?.signal === '偏谨慎' ? 25 : 50, evidence:newsContext?.items?.length ? newsContext.summary : '近期可核验消息不可用' },
-    { key:'supplyDemand', available:Boolean(supplyParts.length), score:supplyParts.length ? clampRecommendationScore(average(supplyParts)) : null, evidence:supplyParts.length ? `量比${technical.volumeRatio}，换手率${finiteNumber(quote?.turnoverRate) === null ? '--' : Number(quote.turnoverRate).toFixed(2) + '%'}` : '供需数据不可用' },
+    { key:'supplyDemand', available:supplyDemand.available, score:supplyDemand.score, evidence:supplyDemand.available ? supplyDemand.evidence : '供需数据不可用' },
     { key:'leadership', available:Boolean(technical), score:technical ? clampRecommendationScore(50 + Number(technical.return60 || 0) * 1.5) : null, evidence:technical ? `近60日涨跌${Number(technical.return60 || 0).toFixed(1)}%；个股当日${averageMarketChange === null ? '无法比较大盘' : Number(quote?.changePct || 0) >= averageMarketChange ? '强于或不弱于大盘' : '弱于大盘'}` : '相对强弱数据不可用' },
     { key:'institution', available:false, score:null, evidence:'机构持仓与增减持序列未接入，不推测' },
-    { key:'market', available:marketScore !== null, score:marketScore, evidence:averageMarketChange === null ? '大盘指数数据不可用' : `主要指数平均涨跌${averageMarketChange.toFixed(2)}%` }
+    { key:'market', available:marketScore !== null, score:marketScore, evidence:marketEvidence }
   ];
-  const canslim = buildCanslimFromFactors({ factors });
+  const canslim = buildCanslimFromFactors({ factors, scope: '个股实时分析' });
   const pe = finiteNumber(quote?.peRatio);
   const pb = finiteNumber(quote?.pbRatio);
   const valuationParts = [];
@@ -1527,6 +1575,10 @@ function buildIndividualInvestmentAnalysis({ technical, financial, newsContext, 
 }
 
 function evaluateRecommendationRisk(item, riskProfile) {
+  if (!riskProfile) riskProfile = {
+    status: 'unknown', summary: '未来半年公司风险数据未确认', errors: ['风险核验未返回结果'],
+    st: { status: 'clear' }, reduction: { status: 'unknown' }, unlock: { status: 'unknown' }
+  };
   if (riskProfile.status === 'risk') return { status: 'rejected', item: null };
   if (riskProfile.status === 'clear') {
     return {
@@ -1534,12 +1586,13 @@ function evaluateRecommendationRisk(item, riskProfile) {
       item: { ...item, riskProfile, reason: `${item.reason} ${riskProfile.summary}。` }
     };
   }
-  const unlockQueryFailed = riskProfile.st?.status === 'clear'
-    && riskProfile.reduction?.status === 'clear'
-    && riskProfile.unlock?.status === 'unknown'
-    && (riskProfile.errors || []).some(error => String(error).startsWith('限售解禁查询失败'));
-  if (!unlockQueryFailed) return { status: 'unknown', item: null };
-  const signalScore = Math.max(0, Number(item.signalScore || item.score || 0) - 8);
+  const noVerifiedRisk = riskProfile.st?.status !== 'risk'
+    && !(riskProfile.reduction?.events || []).length
+    && !(riskProfile.unlock?.events || []).length;
+  if (!noVerifiedRisk) return { status: 'unknown', item: null };
+  const missingSources = [riskProfile.reduction?.status, riskProfile.unlock?.status].filter(status => status === 'unknown').length;
+  const penalty = Math.min(14, Math.max(8, missingSources * 7));
+  const signalScore = Math.max(0, Number(item.signalScore || item.score || 0) - penalty);
   return {
     status: 'unverified',
     item: {
@@ -1548,7 +1601,7 @@ function evaluateRecommendationRisk(item, riskProfile) {
       signalScore,
       riskProfile,
       riskUnverified: true,
-      reason: `${item.reason} ${riskProfile.summary}（查询接口暂不可用，已降分保留）。`
+      reason: `${item.reason} ${riskProfile.summary}（风险数据未完整返回，已降${penalty}分保留并标记未确认）。`
     }
   };
 }
@@ -1650,7 +1703,7 @@ async function buildMarketRecommendations(marketQuotes, force = false) {
     const output = [];
     const industryCounts = new Map();
     for (const item of source) {
-      const group = item.industry || `未分类-${item.code}`;
+      const group = recommendationIndustryGroupKey(item);
       if ((industryCounts.get(group) || 0) >= perIndustry) continue;
       industryCounts.set(group, (industryCounts.get(group) || 0) + 1);
       output.push(item);
@@ -1663,7 +1716,7 @@ async function buildMarketRecommendations(marketQuotes, force = false) {
   for (const item of [...selectCandidates(breakoutScreened, 25, 2), ...selectCandidates(consolidationScreened, 25, 2), ...selectCandidates(reboundScreened, 70, 3)]) {
     if (candidateCodes.has(item.code)) continue;
     candidateCodes.add(item.code);
-    const group = item.industry || `未分类-${item.code}`;
+    const group = recommendationIndustryGroupKey(item);
     candidates.push({ ...item, recommendationGroup: group });
     if (candidates.length >= 60) break;
   }
@@ -1741,7 +1794,7 @@ async function buildMarketRecommendations(marketQuotes, force = false) {
     else if (entryAssessment?.setupType === 'sideways-washout') signal = '震荡洗盘';
     item = { ...item, signal };
     const financialAnalysis = financialResult.status === 'fulfilled' ? financialResult.value.analysis : null;
-    let verdict = item.analysis.verdict;
+    let verdict = entryAnalysis.verdict;
     if (newsContext.signal === '偏谨慎' && verdict === '可关注') verdict = '等待确认';
     const distance = item.analysis.distanceToBreakout;
     const ma30Position = item.price >= item.analysis.ma30 ? '站上' : '接近';
@@ -1760,22 +1813,18 @@ async function buildMarketRecommendations(marketQuotes, force = false) {
     const capitalDescription = fundFlowPeriod?.available ? fundFlowPeriodEvidence(fundFlowPeriod) : '阶段主力资金暂未取得，不据此加分';
     const structureReason = entryAssessment?.structureSummary ? `；形态评估：${entryAssessment.structureSummary}` : '';
     const reason = `${item.signal}；${technicalReason}；${capitalDescription}；${sectorDescription}；${newsContext.signal === '偏积极' ? '阶段低点以来存在正向消息催化' : newsContext.signal === '偏谨慎' ? '阶段低点以来存在风险消息，信号降级等待确认' : '阶段低点以来消息面中性'}；综合入场：${entryAssessment?.status || '数据待补充'}，${entryAssessment?.summary || '关键数据不足'}${structureReason}。`;
-    const flowAdjustment = !fundFlowPeriod?.available ? 0
-      : fundFlowPeriod.mainNetInflow > 0 && fundFlowPeriod.positiveDays >= 6 ? 8
-        : fundFlowPeriod.mainNetInflow > 0 ? 4 : fundFlowPeriod.netRatio <= -3 ? -10 : -4;
     const setupAdjustment = item.analysis.accumulationSetup?.passed ? 10 : 0;
-    const horizontalAdjustment = !breakoutPotential.isConsolidating ? 0
-      : breakoutPotential.status === '突破确认' ? 12
-        : breakoutPotential.status === '接近突破' ? 10
-          : breakoutPotential.status === '突破蓄势' ? 7
-            : breakoutPotential.status === '结构偏弱' ? -15 : 2;
+    const technicalBreakout = item.analysis.consolidationBreakout;
+    const horizontalAdjustment = !technicalBreakout?.isConsolidating ? 0
+      : technicalBreakout.status === '突破确认' ? 12
+        : technicalBreakout.status === '接近突破' ? 10
+          : technicalBreakout.status === '突破蓄势' ? 7
+            : technicalBreakout.status === '结构偏弱' ? -15 : 2;
     const rawSignalScore = Math.max(0, Math.min(100, (breakoutSignal ? item.analysis.score : item.analysis.reboundScore)
-      + newsContext.scoreAdjustment + flowAdjustment + setupAdjustment + horizontalAdjustment));
+      + setupAdjustment + horizontalAdjustment));
     const qualityScore = item.quality?.score ?? 100;
     const factorScore = factorAnalysis.score ?? rawSignalScore;
-    const financialScore = financialAnalysis?.score;
-    const signalScore = clampRecommendationScore(rawSignalScore * .45 + qualityScore * .2 + factorScore * .2
-      + (Number.isFinite(financialScore) ? financialScore : factorScore) * .15);
+    const signalScore = clampRecommendationScore(rawSignalScore * .55 + qualityScore * .15 + factorScore * .3);
     return {
       ...item,
       verdict,
@@ -1824,6 +1873,11 @@ async function buildMarketRecommendations(marketQuotes, force = false) {
   riskResults.forEach((result, index) => {
     if (result.status === 'rejected') {
       riskUnknown++;
+      const decision = evaluateRecommendationRisk(qualityRecommendations[index], null);
+      if (decision.item) {
+        riskUnverifiedIncluded++;
+        riskApprovedRecommendations.push(decision.item);
+      }
       return;
     }
     const riskProfile = result.value;
@@ -1833,32 +1887,31 @@ async function buildMarketRecommendations(marketQuotes, force = false) {
     if (decision.status === 'unverified') riskUnverifiedIncluded++;
     if (decision.item) riskApprovedRecommendations.push(decision.item);
   });
-  const recommendationGroups = {
-    待突破: riskApprovedRecommendations.filter(item => !['已反弹', '底部待反弹'].includes(item.signal)).sort((a, b) => b.signalScore - a.signalScore),
-    已反弹: riskApprovedRecommendations.filter(item => item.signal === '已反弹').sort((a, b) => b.signalScore - a.signalScore),
-    底部待反弹: riskApprovedRecommendations.filter(item => item.signal === '底部待反弹').sort((a, b) => b.signalScore - a.signalScore)
-  };
+  const recommendationGroups = ['breakout', 'rebounded', 'bottomWaiting', 'structure', 'other'].reduce((groups, family) => {
+    groups[family] = riskApprovedRecommendations.filter(item => recommendationSignalFamily(item.signal) === family)
+      .sort((a, b) => b.signalScore - a.signalScore);
+    return groups;
+  }, {});
   const balancedRecommendations = [];
   while (Object.values(recommendationGroups).some(group => group.length)) {
-    ['待突破', '已反弹', '底部待反弹'].forEach(signal => {
-      const item = recommendationGroups[signal].shift();
+    ['breakout', 'rebounded', 'bottomWaiting', 'structure', 'other'].forEach(family => {
+      const item = recommendationGroups[family].shift();
       if (item) balancedRecommendations.push(item);
     });
   }
   const groupedRecommendations = groupRecommendationsByIndustry(balancedRecommendations);
   const finalSignals = groupedRecommendations.reduce((counts, item) => {
-    if (item.signal === '底部待反弹') counts.bottomWaiting += 1;
-    else if (item.signal === '已反弹') counts.rebounded += 1;
-    else counts.breakout += 1;
+    counts[recommendationSignalFamily(item.signal)] += 1;
     return counts;
-  }, { bottomWaiting: 0, rebounded: 0, breakout: 0 });
+  }, { bottomWaiting: 0, rebounded: 0, breakout: 0, structure: 0, other: 0 });
   return {
     recommendations: groupedRecommendations,
     coverage: {
       scanned: marketQuotes?.length || 0,
       prefiltered: new Set([...breakoutScreened, ...consolidationScreened, ...reboundScreened].map(item => item.code)).size,
       analyzed: analyzed.length,
-      industries: new Set(analyzed.map(item => item.industry).filter(Boolean)).size,
+      industries: new Set(analyzed.map(item => resolveRecommendationIndustry(item)).filter(industry => industry !== '行业待确认')).size,
+      industryUnresolved: analyzed.filter(item => resolveRecommendationIndustry(item) === '行业待确认').length,
       directoryAvailable: directoryByCode.size > 0,
       historyFailures: historyErrors.length,
       accumulationCandidates: analyzed.filter(item => item.analysis.accumulationSetup?.passed).length,
@@ -2851,24 +2904,48 @@ function buildFinancialAnalysis(quarterRows, annualRows, source = '东方财富F
   };
 }
 
+function normalizeSinaFundAmount(value, multiplier = 1) {
+  const number = finiteNumber(value);
+  if (number === null) return null;
+  return number * multiplier;
+}
+
+function normalizeSinaFundRatio(value) {
+  const number = finiteNumber(value);
+  if (number === null) return null;
+  return Math.abs(number) <= 1 ? number * 100 : number;
+}
+
 function summarizeFundFlowRows(rows, days = 10) {
   const recent = (rows || []).map(row => {
-    const mainInflow = finiteNumber(row.r0_in);
-    const mainOutflow = finiteNumber(row.r0_out);
-    const mainNetInflow = finiteNumber(row.r0_net);
+    const rawInflow = finiteNumber(row.r0_in);
+    const rawOutflow = finiteNumber(row.r0_out);
+    const rawNetInflow = finiteNumber(row.r0_net);
+    const hasGrossFields = rawInflow !== null || rawOutflow !== null;
+    const values = [rawInflow, rawOutflow, rawNetInflow].filter(value => value !== null);
+    const multiplier = hasGrossFields && values.every(value => Math.abs(value) < 1e6) ? 10000 : 1;
+    const mainInflow = normalizeSinaFundAmount(rawInflow, multiplier);
+    const mainOutflow = normalizeSinaFundAmount(rawOutflow, multiplier);
+    const mainNetInflow = normalizeSinaFundAmount(rawNetInflow, multiplier);
     return {
       date: String(row.opendate || row.date || ''),
-      mainInflow: mainInflow == null ? null : Math.abs(mainInflow) * 10000,
-      mainOutflow: mainOutflow == null ? null : Math.abs(mainOutflow) * 10000,
-      mainNetInflow: mainNetInflow == null ? null : mainNetInflow * 10000,
-      mainNetPct: finiteNumber(row.r0_ratio)
+      mainInflow: mainInflow == null ? null : Math.abs(mainInflow),
+      mainOutflow: mainOutflow == null ? null : Math.abs(mainOutflow),
+      mainNetInflow,
+      mainNetPct: normalizeSinaFundRatio(row.r0_ratio)
     };
   }).filter(row => row.date && row.mainNetInflow != null)
     .sort((a, b) => a.date.localeCompare(b.date)).slice(-days);
   if (!recent.length) return { available: false, days: 0, rows: [] };
-  const mainInflow = recent.reduce((sum, row) => sum + (row.mainInflow || 0), 0);
-  const mainOutflow = recent.reduce((sum, row) => sum + (row.mainOutflow || 0), 0);
+  const grossFlowRows = recent.filter(row => row.mainInflow !== null && row.mainOutflow !== null);
+  const grossFlowsAvailable = grossFlowRows.length === recent.length;
+  const mainInflow = grossFlowsAvailable ? grossFlowRows.reduce((sum, row) => sum + row.mainInflow, 0) : null;
+  const mainOutflow = grossFlowsAvailable ? grossFlowRows.reduce((sum, row) => sum + row.mainOutflow, 0) : null;
   const mainNetInflow = recent.reduce((sum, row) => sum + row.mainNetInflow, 0);
+  const ratios = recent.map(row => row.mainNetPct).filter(value => value !== null);
+  const netRatio = grossFlowsAvailable && mainInflow + mainOutflow
+    ? mainNetInflow / (mainInflow + mainOutflow) * 100
+    : ratios.length ? average(ratios) : null;
   return {
     available: true,
     days: recent.length,
@@ -2877,7 +2954,8 @@ function summarizeFundFlowRows(rows, days = 10) {
     mainInflow,
     mainOutflow,
     mainNetInflow,
-    netRatio: mainInflow + mainOutflow ? mainNetInflow / (mainInflow + mainOutflow) * 100 : 0,
+    netRatio,
+    grossFlowsAvailable,
     positiveDays: recent.filter(row => row.mainNetInflow > 0).length,
     rows: recent
   };
@@ -4276,7 +4354,9 @@ module.exports = {
   buildRecommendationFactorContext,
   evaluateRecommendationFactors,
   resolveRecommendationIndustry,
+  recommendationIndustryGroupKey,
   groupRecommendationsByIndustry,
+  recommendationSignalFamily,
   restoreCachedMarketRecommendations,
   evaluateRecommendationRisk,
   assessRecommendationTimingRisk,
