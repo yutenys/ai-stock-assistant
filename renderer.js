@@ -88,6 +88,17 @@ function saveState(){
   }
 }
 
+function favoriteOutcomeRows(){
+  return labels.flatMap(label => (label.stocks || []).map(stock => ({
+    label:label.name,
+    favoriteBasePrice:stock.favoriteBasePrice,
+    favoriteAddedAt:stock.favoriteAddedAt,
+    price:stock.price,
+    signal:stock.marketSignal || stock.signal || stock.type || stock.status,
+    signalScore:stock.signalScore
+  })));
+}
+
 function labelStockSnapshot(stock, existingStock=null){
   const {favoriteBasePrice: ignoredBase, favoriteAddedAt: ignoredTime, ...snapshot} = stock;
   const existingBase = Number(existingStock?.favoriteBasePrice);
@@ -249,11 +260,14 @@ function renderMarketOverview(result){
   if(Number.isFinite(Number(coverage.consolidationCandidates))) structureCounts.push(`横盘候选 ${coverage.consolidationCandidates} 只`);
   if(Number.isFinite(Number(coverage.fundFlowAvailable))) structureCounts.push(`阶段资金可用 ${coverage.fundFlowAvailable} 只`);
   const accumulationCoverage = structureCounts.length ? `；${structureCounts.join('，')}` : '';
+  const outcomeCoverage = coverage.outcomeFeedback?.sampleSize
+    ? `；本地推荐复盘 ${coverage.outcomeFeedback.sampleSize} 条（同批次超额收益，已排除重点关注/personal及不足1天样本）${coverage.outcomeFeedback.marketRisk?.status === 'drawdown' ? '，近期策略处于回撤并已收紧筛选' : ''}`
+    : '';
   const unresolvedIndustryCoverage = Number(coverage.industryUnresolved) > 0 ? `，${coverage.industryUnresolved} 只行业待补充` : '';
   const signalSummary = [`待反弹 ${signals.bottomWaiting}`, `已反弹 ${signals.rebounded}`, `突破类 ${signals.breakout}`, `吸筹/洗盘 ${signals.structure}`];
   if(signals.other) signalSummary.push(`其他 ${signals.other}`);
   $('marketRecommendationCoverage').textContent = coverage.scanned
-    ? `全市场扫描 ${coverage.scanned} 只，初筛 ${coverage.prefiltered || 0} 只，历史精筛 ${coverage.analyzed || 0} 只，覆盖 ${coverage.industries || 0} 个已确认行业${unresolvedIndustryCoverage}${accumulationCoverage}${riskCoverage}；实际推荐 ${recommendations.length} 只（${signalSummary.join('，')}）${fallbackNote}`
+    ? `全市场扫描 ${coverage.scanned} 只，初筛 ${coverage.prefiltered || 0} 只，历史精筛 ${coverage.analyzed || 0} 只，覆盖 ${coverage.industries || 0} 个已确认行业${unresolvedIndustryCoverage}${accumulationCoverage}${riskCoverage}${outcomeCoverage}；实际推荐 ${recommendations.length} 只（${signalSummary.join('，')}）${fallbackNote}`
     : '等待全市场扫描';
   const visibleRecommendations = recommendations.slice(0, 10);
   $('marketRecommendations').innerHTML = visibleRecommendations.length ? groupedRecommendationHtml(visibleRecommendations) : '<div class="market-row"><span>当前未筛出满足条件的候选</span></div>';
@@ -291,7 +305,7 @@ async function loadMarketOverview(force=false, silent=false){
   $('refreshMarketOverview').disabled = true;
   $('refreshMarketOverview').textContent = '刷新中';
   try{
-    const result = await window.stockApi.fetchMarketOverview(force);
+    const result = await window.stockApi.fetchMarketOverview({force, favoriteOutcomes:favoriteOutcomeRows()});
     renderMarketOverview(result);
     if(force && !silent) notify(result.errors?.length ? '大盘数据部分更新，异常项已标注' : '大盘数据已更新', result.errors?.length ? 'warn' : 'success');
     return result;
@@ -1347,6 +1361,7 @@ function renderHistoryAnalysis(s, result){
       <p><b>布林带：</b>上轨 ${yuan(a.bollUpper)}；中轨 ${yuan(a.bollMiddle)}；下轨 ${yuan(a.bollLower)}</p>
       <p><b>当前放量：</b>${escapeHtml(a.volume)} 当前量比 ${formatNumber(a.volumeRatio)}。</p>
       <p><b>阶段主力资金：</b>${escapeHtml(a.capitalSetupAssessment?.summary || '阶段主力资金数据不可用，本次不据此调整评分。')}</p>
+      ${a.historicalOutcomeAssessment?.summary ? `<p><b>本地推荐复盘：</b>${escapeHtml(a.historicalOutcomeAssessment.summary)}</p>` : ''}
       <p><b>底部蓄势结构：</b>${escapeHtml(a.accumulationSetup?.summary || '历史行情不足，暂不能评估五线粘合与三次放量。')} ${a.capitalSetupAssessment?.status ? `<b>综合状态：</b>${escapeHtml(a.capitalSetupAssessment.status)}。` : ''}</p>
       ${breakoutHtml}
       <p><b>突破 / 支撑：</b>突破确认价 ${yuan(a.breakoutPrice)}；距突破位 ${formatPct(a.distanceToBreakout)}；支撑参考 ${yuan(a.supportPrice)}。</p>
@@ -1473,7 +1488,7 @@ async function fetchStockAnalysis(s, force=false){
   if(!window.stockApi?.fetchStockHistory) return null;
   const pendingKey = s.code;
   if(detailHistoryPending.has(pendingKey)) return detailHistoryPending.get(pendingKey);
-  const pending = window.stockApi.fetchStockHistory({code:s.code, name:s.name, force})
+  const pending = window.stockApi.fetchStockHistory({code:s.code, name:s.name, force, favoriteOutcomes:favoriteOutcomeRows()})
     .then(result => {
       detailHistoryCache.set(s.code, result);
       applyAnalysisClassification(s.code);
