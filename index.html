@@ -29,7 +29,10 @@
       <aside id="marketPanel" class="market card">
         <div class="market-head">
           <div><h2>大盘分析</h2><small id="marketUpdated">正在加载...</small></div>
-          <button id="refreshMarketOverview" class="small" title="刷新大盘数据">刷新</button>
+          <div class="market-head-actions">
+            <button id="refreshMarketOverview" class="small" title="刷新大盘数据">刷新</button>
+            <button id="liveNewsView" class="small" title="查看24条实时财经新闻">24新闻</button>
+          </div>
         </div>
         <div id="marketAnalysis" class="market-analysis">正在获取实时市场数据...</div>
         <div id="marketIndices" class="market-indices"></div>
@@ -109,6 +112,19 @@
             </div>
             <div class="market-label-toolbar"><b id="marketRecommendationListTitle">推荐股票</b><button id="toggleMarketStocks" class="small">取消全选</button></div>
             <div id="marketStockChoices" class="market-stock-choices"></div>
+          </div>
+        </div>
+
+        <div id="liveNewsModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="liveNewsModalTitle">
+          <div class="label-modal live-news-modal">
+            <div class="add-panel-head">
+              <div><b id="liveNewsModalTitle">实时新闻详情</b><p id="liveNewsModalMeta"></p></div>
+              <button id="closeLiveNewsModal" class="small live-news-close">关闭</button>
+            </div>
+            <div id="liveNewsModalContent" class="live-news-modal-content"></div>
+            <div class="label-modal-actions">
+              <button id="openLiveNewsOriginal" class="small hidden">打开原文</button>
+            </div>
           </div>
         </div>
 

@@ -27,6 +27,10 @@ let currentViewSource = 'empty';
 let marketOverviewRefreshing = false;
 let latestMarketRecommendations = [];
 let latestMarketOverview = null;
+let liveNewsItems = [];
+let liveNewsMeta = null;
+let liveNewsPage = 0;
+let liveNewsRefreshing = false;
 const detailProfileCache = new Map();
 const detailNewsCache = new Map();
 const detailHistoryCache = new Map();
@@ -36,6 +40,7 @@ const detailChartCache = new Map();
 const detailRequestPending = new Map();
 const activeChartPeriod = new Map();
 const STORAGE_KEY = 'ai-stock-assistant-state-v1';
+const LIVE_NEWS_PAGE_SIZE = 8;
 
 async function settleWithConcurrency(items, limit, task){
   const results = new Array(items.length);
@@ -90,12 +95,14 @@ function saveState(){
 
 function favoriteOutcomeRows(){
   return labels.flatMap(label => (label.stocks || []).map(stock => ({
+    code:stock.code,
     label:label.name,
     favoriteBasePrice:stock.favoriteBasePrice,
     favoriteAddedAt:stock.favoriteAddedAt,
     price:stock.price,
     signal:stock.marketSignal || stock.signal || stock.type || stock.status,
-    signalScore:stock.signalScore
+    signalScore:stock.signalScore,
+    technicalScore:stock.technicalScore
   })));
 }
 
@@ -261,7 +268,7 @@ function renderMarketOverview(result){
   if(Number.isFinite(Number(coverage.fundFlowAvailable))) structureCounts.push(`阶段资金可用 ${coverage.fundFlowAvailable} 只`);
   const accumulationCoverage = structureCounts.length ? `；${structureCounts.join('，')}` : '';
   const outcomeCoverage = coverage.outcomeFeedback?.sampleSize
-    ? `；本地推荐复盘 ${coverage.outcomeFeedback.sampleSize} 条（同批次超额收益，已排除重点关注/personal及不足1天样本）${coverage.outcomeFeedback.marketRisk?.status === 'drawdown' ? '，近期策略处于回撤并已收紧筛选' : ''}`
+    ? `；本地推荐复盘 ${coverage.outcomeFeedback.sampleSize} 条（最近${coverage.outcomeFeedback.recentCohortCount || '--'}个版本，实时行情重算，已排除重点关注/personal及不足1天样本）${coverage.outcomeFeedback.marketRisk?.status === 'drawdown' ? '，近期策略处于回撤并已收紧筛选' : ''}`
     : '';
   const unresolvedIndustryCoverage = Number(coverage.industryUnresolved) > 0 ? `，${coverage.industryUnresolved} 只行业待补充` : '';
   const signalSummary = [`待反弹 ${signals.bottomWaiting}`, `已反弹 ${signals.rebounded}`, `突破类 ${signals.breakout}`, `吸筹/洗盘 ${signals.structure}`];
@@ -292,8 +299,9 @@ function renderMarketOverview(result){
   });
   const errorBox = $('marketError');
   const errors = result.errors || [];
-  errorBox.classList.toggle('hidden', !errors.length);
-  errorBox.textContent = errors.length ? `部分数据异常：${errors.join('；')}` : '';
+  const warnings = result.warnings || [];
+  errorBox.classList.toggle('hidden', !errors.length && !warnings.length);
+  errorBox.textContent = errors.length ? `部分数据异常：${errors.join('；')}` : warnings.length ? `数据提示：${warnings.join('；')}` : '';
   const detailStock = findStockByCode(activeDetailCode);
   const historyResult = detailHistoryCache.get(activeDetailCode);
   if(detailStock && historyResult) renderHistoryAnalysis(detailStock, historyResult);
@@ -307,7 +315,11 @@ async function loadMarketOverview(force=false, silent=false){
   try{
     const result = await window.stockApi.fetchMarketOverview({force, favoriteOutcomes:favoriteOutcomeRows()});
     renderMarketOverview(result);
-    if(force && !silent) notify(result.errors?.length ? '大盘数据部分更新，异常项已标注' : '大盘数据已更新', result.errors?.length ? 'warn' : 'success');
+    if(force && !silent) {
+      const errors = result.errors || [];
+      const warnings = result.warnings || [];
+      notify(errors.length ? '大盘核心数据部分更新失败，详情已标注' : warnings.length ? '大盘数据已更新，部分备用来源已切换' : '大盘数据已更新', errors.length ? 'warn' : warnings.length ? 'info' : 'success');
+    }
     return result;
   }catch(err){
     $('marketError').classList.remove('hidden');
@@ -715,6 +727,94 @@ function tableRow(s){
   return `<tr data-detail-code="${s.code}"><td><input class="stock-check" data-code="${s.code}" type="checkbox" ${checked(s.code)} /></td><td><b>${escapeHtml(s.name)}</b></td><td>${s.code}</td><td>${escapeHtml(s.type)}</td><td>${escapeHtml(s.status)}</td><td>${score ?? '待分析'}</td><td>${yuan(s.price)}</td><td class="${pctClass(s.changePct)}"><b>${formatPct(s.changePct)}</b></td><td>${labelText}<br><button class="small" data-edit-stock-labels="${s.code}">${buttonText}</button></td><td class="reason">${escapeHtml(s.reason)}</td></tr>`;
 }
 
+function renderLiveNewsView(){
+  const totalPages = Math.max(1, Math.ceil(liveNewsItems.length / LIVE_NEWS_PAGE_SIZE));
+  liveNewsPage = Math.max(0, Math.min(liveNewsPage, totalPages - 1));
+  const start = liveNewsPage * LIVE_NEWS_PAGE_SIZE;
+  const rows = liveNewsItems.slice(start, start + LIVE_NEWS_PAGE_SIZE).map((item, index) => {
+    const absoluteIndex = start + index;
+    return `<button class="live-news-row" data-live-news-index="${absoluteIndex}">
+      <span class="live-news-title">${escapeHtml(item.title || item.summary || '--')}</span>
+      <span class="live-news-row-meta"><b>${escapeHtml(item.source || '--')}</b><small>${escapeHtml(item.publishedAt || '--')}</small></span>
+    </button>`;
+  }).join('');
+  const fetchedAt = liveNewsMeta?.fetchedAt ? new Date(liveNewsMeta.fetchedAt).toLocaleString('zh-CN', {hour12:false}) : '--';
+  const status = liveNewsRefreshing ? '刷新中' : liveNewsMeta?.stale ? '缓存' : liveNewsItems.length ? '实时' : '待刷新';
+  return `<section class="portfolio-view live-news-view">
+    <div class="portfolio-head"><div><h2>24小时实时新闻</h2><p>展示金十、财经滚动等公开来源的最新市场消息</p></div><div class="portfolio-head-actions"><button class="small" data-live-news-refresh>${liveNewsRefreshing ? '刷新中' : '刷新'}</button><span>${liveNewsItems.length} 条</span></div></div>
+    <div class="portfolio-summary live-news-summary">
+      <div><span>新闻数量</span><b>${liveNewsItems.length}</b></div><div><span>当前页</span><b>${liveNewsPage + 1}/${totalPages}</b></div>
+      <div><span>状态</span><b>${escapeHtml(status)}</b></div><div><span>更新时间</span><b>${escapeHtml(fetchedAt)}</b></div>
+    </div>
+    <div class="portfolio-batch-toolbar live-news-toolbar"><button class="small" data-live-news-page="prev" ${liveNewsPage <= 0 ? 'disabled' : ''}>上一页</button><button class="small" data-live-news-page="next" ${liveNewsPage >= totalPages - 1 ? 'disabled' : ''}>下一页</button><span>${escapeHtml(liveNewsMeta?.source || '等待获取来源')}</span></div>
+    ${rows ? `<div class="live-news-list">${rows}</div>` : `<div class="portfolio-empty">${liveNewsRefreshing ? '正在获取实时新闻...' : '暂无实时新闻，点击刷新重试。'}</div>`}
+    ${liveNewsMeta?.errors?.length ? `<div class="note inline-note">部分来源异常：${escapeHtml(liveNewsMeta.errors.join('；'))}</div>` : ''}
+  </section>`;
+}
+
+function bindLiveNewsInteractions(root){
+  root.querySelector('[data-live-news-refresh]')?.addEventListener('click', () => refreshLiveNews(true));
+  root.querySelectorAll('[data-live-news-page]').forEach(button => {
+    button.onclick = () => {
+      liveNewsPage += button.dataset.liveNewsPage === 'next' ? 1 : -1;
+      renderStocks();
+    };
+  });
+  root.querySelectorAll('[data-live-news-index]').forEach(row => {
+    row.onclick = () => openLiveNewsModal(Number(row.dataset.liveNewsIndex));
+  });
+}
+
+function openLiveNewsModal(index){
+  const item = liveNewsItems[index];
+  if(!item) return;
+  $('liveNewsModalTitle').textContent = item.title || '实时新闻详情';
+  $('liveNewsModalMeta').textContent = [item.source, item.publishedAt].filter(Boolean).join(' · ');
+  $('liveNewsModalContent').textContent = item.summary || item.title || '暂无完整内容';
+  const link = safeHttpUrl(item.link);
+  const openButton = $('openLiveNewsOriginal');
+  openButton.classList.toggle('hidden', !link);
+  openButton.dataset.liveNewsLink = link;
+  $('liveNewsModal').classList.remove('hidden');
+}
+
+function closeLiveNewsModal(){
+  $('liveNewsModal')?.classList.add('hidden');
+}
+
+async function refreshLiveNews(force=true){
+  if(liveNewsRefreshing || !window.stockApi?.fetchLiveNews) return;
+  liveNewsRefreshing = true;
+  renderStocks();
+  try{
+    const result = await window.stockApi.fetchLiveNews({force, limit:24});
+    liveNewsItems = result.news || [];
+    liveNewsMeta = result;
+    liveNewsPage = 0;
+    notify(result.errors?.length ? `实时新闻已更新 ${liveNewsItems.length} 条，部分来源异常` : `实时新闻已更新 ${liveNewsItems.length} 条`, result.errors?.length ? 'warn' : 'success');
+  }catch(err){
+    liveNewsMeta = {news:liveNewsItems, errors:[err.message || String(err)], fetchedAt:new Date().toISOString(), source:liveNewsMeta?.source || '', stale:true};
+    notify(`实时新闻刷新失败：${err.message || err}`, 'error');
+  }finally{
+    liveNewsRefreshing = false;
+    renderStocks();
+  }
+}
+
+async function openLiveNewsView(){
+  currentViewSource = 'liveNews';
+  activeDetailCode = null;
+  stocks = [];
+  selected.clear();
+  onlineSearchResults = [];
+  searchStatus = '';
+  $('searchInput').value = '';
+  $('addPanel')?.classList.add('hidden');
+  closeStockLabelPanel();
+  renderStocks();
+  await refreshLiveNews(true);
+}
+
 function renderPortfolioView(){
   const holdings = portfolio.filter(position => Number(position.quantity) > 0);
   const holdingMetrics = holdings.map(position => ({position, stock:portfolioStock(position), metrics:portfolioMetrics(position)}));
@@ -814,6 +914,14 @@ function renderStocks(){
   $('selectedCount').textContent = selected.size;
   renderDetailPanel();
   $('simulationView')?.classList.toggle('active', currentViewSource === 'portfolio');
+  $('liveNewsView')?.classList.toggle('active', currentViewSource === 'liveNews');
+  if(currentViewSource === 'liveNews'){
+    $('stockContainer').innerHTML = renderLiveNewsView();
+    bindLiveNewsInteractions($('stockContainer'));
+    renderAddStockList();
+    renderLabels();
+    return;
+  }
   if(currentViewSource === 'portfolio'){
     $('stockContainer').innerHTML = renderPortfolioView();
     bindStockInteractions($('stockContainer'));
@@ -2484,6 +2592,7 @@ $('backToTop').onclick = () => {
 };
 $('refreshLabel').onclick = refreshActiveLabel;
 $('refreshMarketOverview').onclick = () => loadMarketOverview(true);
+$('liveNewsView').onclick = openLiveNewsView;
 $('generateBtn').onclick = generateStockPool;
 $('searchInput').oninput = handleSearchInput;
 if($('selectAll')) $('selectAll').onclick = toggleFilteredSelection;
@@ -2507,6 +2616,14 @@ $('stockLabelPanel').onclick = event => {
 };
 $('marketLabelPanel').onclick = event => {
   if(event.target === event.currentTarget) closeMarketLabelPanel();
+};
+$('liveNewsModal').onclick = event => {
+  if(event.target === event.currentTarget) closeLiveNewsModal();
+};
+$('closeLiveNewsModal').onclick = closeLiveNewsModal;
+$('openLiveNewsOriginal').onclick = event => {
+  const link = event.currentTarget.dataset.liveNewsLink;
+  if(link) window.stockApi?.openExternal?.(link);
 };
 $('modalSelectAll').onclick = toggleFilteredSelection;
 $('confirmAdd').onclick = () => {
@@ -2573,6 +2690,7 @@ document.addEventListener('keydown', event => {
   closeLabelStockMenu();
   if(!$('stockLabelPanel')?.classList.contains('hidden')) closeStockLabelPanel();
   if(!$('marketLabelPanel')?.classList.contains('hidden')) closeMarketLabelPanel();
+  if(!$('liveNewsModal')?.classList.contains('hidden')) closeLiveNewsModal();
 });
 window.addEventListener('scroll', closeLabelStockMenu, true);
 

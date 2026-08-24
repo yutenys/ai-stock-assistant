@@ -12,6 +12,7 @@ app.whenReady().then(async () => {
   let profileRequestCount = 0;
   let newsRequestCount = 0;
   let historyRequestCount = 0;
+  let liveNewsRequestCount = 0;
   ipcMain.handle('append-operation-log', async () => true);
   ipcMain.handle('run-industry-workflow', async () => ({
     subject: '中药',
@@ -54,6 +55,21 @@ app.whenReady().then(async () => {
       { title: '次新资讯', link: 'https://example.com/middle', publishedAt: '2026-08-11 10:00:00', source: '测试资讯' }
     ],
     errors: []
+    });
+  });
+  ipcMain.handle('fetch-live-news', async () => {
+    liveNewsRequestCount += 1;
+    return ({
+      news: Array.from({ length: 17 }, (_, index) => ({
+        title: `实时财经新闻${index + 1}`,
+        summary: `第${index + 1}条实时新闻摘要`,
+        link: `https://example.com/live-news-${index + 1}`,
+        publishedAt: `2026-08-12 ${String(13 - Math.floor(index / 3)).padStart(2, '0')}:${String(50 - index).padStart(2, '0')}:00`,
+        source: index % 2 ? '新浪财经滚动' : '金十数据快讯'
+      })),
+      source: `金十数据快讯 + 新浪财经滚动#${liveNewsRequestCount}`,
+      fetchedAt: new Date(2026, 7, 12, 14, 10, liveNewsRequestCount).toISOString(),
+      errors: []
     });
   });
   ipcMain.handle('fetch-stock-history', async (_event, request) => {
@@ -206,6 +222,7 @@ app.whenReady().then(async () => {
     analysis: '三大指数多数上涨，市场情绪偏强；资金集中于半导体、中药。',
     source: '腾讯指数 + 东方财富市场统计',
     fetchedAt: new Date(2026, 7, 12, 13, 30, marketRequestCount).toISOString(),
+    warnings: ['技术形态候选本轮未生成，已回退最近一次成功推荐（13只）'],
     errors: []
     };
   });
@@ -617,6 +634,52 @@ app.whenReady().then(async () => {
     const afterBatchSell = JSON.parse(localStorage.getItem('ai-stock-assistant-state-v1') || '{}').portfolio?.find(item => item.code === '603567')?.quantity;
     return { refreshExists, refreshReady, selectedAll, afterBatchBuy, afterBatchSell };
   })()`);
+  const liveNewsState = await win.webContents.executeJavaScript(`(async () => {
+    document.getElementById('liveNewsView').click();
+    await new Promise(resolve => setTimeout(resolve, 120));
+    const rows = [...document.querySelectorAll('.live-news-row')];
+    const firstPageText = document.getElementById('stockContainer').innerText;
+    const firstTitle = rows[0]?.querySelector('.live-news-title')?.innerText || '';
+    const firstMeta = rows[0]?.querySelector('.live-news-row-meta')?.innerText || '';
+    rows[0]?.click();
+    await new Promise(resolve => setTimeout(resolve, 30));
+    const modalVisible = !document.getElementById('liveNewsModal').classList.contains('hidden');
+    const modalTitle = document.getElementById('liveNewsModalTitle').innerText;
+    const modalContent = document.getElementById('liveNewsModalContent').innerText;
+    const modal = document.querySelector('.live-news-modal');
+    const modalContentEl = document.getElementById('liveNewsModalContent');
+    const closeButton = document.getElementById('closeLiveNewsModal');
+    const closeStyle = getComputedStyle(closeButton);
+    const closeLineHeight = Number.parseFloat(closeStyle.lineHeight) || 20;
+    const closeHeight = closeButton.getBoundingClientRect().height;
+    const modalWidth = Math.round(modal?.getBoundingClientRect().width || 0);
+    const contentScrollable = getComputedStyle(modalContentEl).overflowY === 'auto';
+    document.getElementById('closeLiveNewsModal').click();
+    document.querySelector('[data-live-news-page="next"]').click();
+    await new Promise(resolve => setTimeout(resolve, 30));
+    const secondPageText = document.getElementById('stockContainer').innerText;
+    const secondFirstTitle = document.querySelector('.live-news-row .live-news-title')?.innerText || '';
+    document.querySelector('[data-live-news-refresh]').click();
+    await new Promise(resolve => setTimeout(resolve, 120));
+    return {
+      active:document.getElementById('liveNewsView').classList.contains('active'),
+      countText:document.querySelector('.portfolio-head-actions span')?.innerText || '',
+      rows:rows.length,
+      firstTitle,
+      firstMeta,
+      firstPageText,
+      modalVisible,
+      modalTitle,
+      modalContent,
+      modalWidth,
+      closeNoWrap:closeStyle.whiteSpace === 'nowrap' && closeHeight < closeLineHeight * 2.2,
+      contentScrollable,
+      secondPageText,
+      secondFirstTitle,
+      refreshedSource:document.querySelector('.live-news-toolbar span')?.innerText || '',
+      refreshText:document.querySelector('[data-live-news-refresh]')?.innerText || ''
+    };
+  })()`);
   const scoreConsistencyState = await win.webContents.executeJavaScript(`(async () => {
     const recommendations = [...document.querySelectorAll('[data-market-recommendation]')];
     const card = document.querySelector('[data-market-recommendation="603567"]');
@@ -719,6 +782,7 @@ app.whenReady().then(async () => {
     tableScoreState: ${JSON.stringify(tableScoreState)},
     simulationState: ${JSON.stringify(simulationState)},
     portfolioBatchState: ${JSON.stringify(portfolioBatchState)},
+    liveNewsState: ${JSON.stringify(liveNewsState)},
     scoreConsistencyState: ${JSON.stringify(scoreConsistencyState)},
     marketText: document.getElementById('marketPanel')?.innerText || '',
     marketColorState: {
@@ -835,6 +899,7 @@ app.whenReady().then(async () => {
     && state.detailClickQuoteState.savedChangePct === -0.72;
   const marketUsable = /上证指数|深证成指|创业板指/.test(state.marketText)
     && /板块轮动|半导体|资金|涨停 68|跌停 7|技术形态推荐|一键添加|底部待反弹|已反弹|消息确认|消息面偏积极/.test(state.marketText)
+    && state.marketText.includes('数据提示：技术形态候选本轮未生成')
     && state.marketText.includes('未来半年风险核验 16 只，排除 2 只，未确认 1 只（降分保留 1 只）')
     && state.marketText.includes('横盘候选 5 只')
     && state.marketBatchLabelState.initialAll && state.marketBatchLabelState.afterClear
@@ -887,6 +952,25 @@ app.whenReady().then(async () => {
     && state.marketColorState.down === 'rgb(22, 163, 74)'
     && state.marketColorState.sectorUp === 'rgb(220, 38, 38)'
     && state.marketColorState.sectorDown === 'rgb(22, 163, 74)';
+  const liveNewsUsable = state.liveNewsState.active
+    && state.liveNewsState.countText === '17 条'
+    && state.liveNewsState.rows === 8
+    && state.liveNewsState.firstTitle === '实时财经新闻1'
+    && state.liveNewsState.firstMeta === '金十数据快讯\n2026-08-12 13:50:00'
+    && state.liveNewsState.firstPageText.includes('24小时实时新闻')
+    && state.liveNewsState.firstPageText.includes('1/3')
+    && !state.liveNewsState.firstPageText.includes('新闻\t来源\t时间')
+    && !state.liveNewsState.firstPageText.includes('第1条实时新闻摘要')
+    && state.liveNewsState.modalVisible
+    && state.liveNewsState.modalTitle === '实时财经新闻1'
+    && state.liveNewsState.modalContent === '第1条实时新闻摘要'
+    && state.liveNewsState.modalWidth >= 600
+    && state.liveNewsState.closeNoWrap
+    && state.liveNewsState.contentScrollable
+    && state.liveNewsState.secondPageText.includes('2/3')
+    && state.liveNewsState.secondFirstTitle === '实时财经新闻9'
+    && state.liveNewsState.refreshedSource.includes('#2')
+    && state.liveNewsState.refreshText === '刷新';
   const chartUsable = state.chartState.nonBlank
     && state.chartState.rendered.every(Boolean)
     && state.chartState.interaction.locked === 'true'
@@ -979,8 +1063,8 @@ app.whenReady().then(async () => {
     && state.tableScoreState.includes('底部待反弹')
     && state.tableScoreState.includes('消息确认')
     && !state.tableScoreState.includes('已突破');
-  if (state.title !== '股票观察助手' || state.heading !== state.title || !state.hasApi || !state.stockContainer || state.statusFixed !== 'fixed' || state.focusAfterAdd !== 'searchInput' || state.focusAfterDelete !== 'searchInput' || !inputsUsable || !desktopLayoutUsable || !backToTopUsable || !multiLabelUsable || !detailUsable || !detailClickQuoteUsable || !marketUsable || !chartUsable || !simulationUsable || !labelModalUsable || !labelSortUsable || !labelRenameUsable || !favoriteChangeUsable || !labelListUsable || errors.length) {
-    console.error(JSON.stringify({ state, checks: { inputsUsable, desktopLayoutUsable, backToTopUsable, multiLabelUsable, detailUsable, detailClickQuoteUsable, marketUsable, chartUsable, simulationUsable, labelModalUsable, labelSortUsable, labelRenameUsable, favoriteChangeUsable, labelListUsable }, errors }, null, 2));
+  if (state.title !== '股票观察助手' || state.heading !== state.title || !state.hasApi || !state.stockContainer || state.statusFixed !== 'fixed' || state.focusAfterAdd !== 'searchInput' || state.focusAfterDelete !== 'searchInput' || !inputsUsable || !desktopLayoutUsable || !backToTopUsable || !multiLabelUsable || !detailUsable || !detailClickQuoteUsable || !marketUsable || !liveNewsUsable || !chartUsable || !simulationUsable || !labelModalUsable || !labelSortUsable || !labelRenameUsable || !favoriteChangeUsable || !labelListUsable || errors.length) {
+    console.error(JSON.stringify({ state, checks: { inputsUsable, desktopLayoutUsable, backToTopUsable, multiLabelUsable, detailUsable, detailClickQuoteUsable, marketUsable, liveNewsUsable, chartUsable, simulationUsable, labelModalUsable, labelSortUsable, labelRenameUsable, favoriteChangeUsable, labelListUsable }, errors }, null, 2));
     app.exit(1);
     return;
   }

@@ -9,6 +9,7 @@ contextBridge.exposeInMainWorld('stockApi', {
   fetchStockChart: (request) => ipcRenderer.invoke('fetch-stock-chart', request),
   fetchStockFundFlow: (request) => ipcRenderer.invoke('fetch-stock-fund-flow', request),
   fetchMarketOverview: (force) => ipcRenderer.invoke('fetch-market-overview', force),
+  fetchLiveNews: (request) => ipcRenderer.invoke('fetch-live-news', request),
   fetchCompanyProfile: (stock) => ipcRenderer.invoke('fetch-company-profile', stock),
   openExternal: (url) => ipcRenderer.invoke('open-external-url', url),
   appendLog: (entry) => ipcRenderer.invoke('append-operation-log', entry)

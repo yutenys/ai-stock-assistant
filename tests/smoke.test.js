@@ -37,6 +37,7 @@ const {
   recommendationIndustryGroupKey,
   groupRecommendationsByIndustry,
   recommendationSignalFamily,
+  mergeRecommendationOutcomeQuotes,
   summarizeRecommendationOutcomes,
   calibrateRecommendationWithOutcomes,
   applyOutcomeFeedbackAssessment,
@@ -55,8 +56,11 @@ const {
   applyIndividualCapitalAssessment,
   applyEntryContextAssessment,
   analyzeHistory,
+  buildTradePlan,
   mergeQuoteIntoHistory,
   parseReductionPlanWindow,
+  parseJin10FlashItems,
+  classifyMarketNewsIssues,
   settleWithConcurrency
 } = require('../main.js');
 Module._load = originalLoad;
@@ -99,6 +103,31 @@ test('无关消息不参与个股判断，过期或缓存利好不充当实时�
   assert.equal(stale.signal, '中性');
   assert.equal(stale.factorScore, 50);
   assert.match(stale.summary, /沿用缓存.*不作为买入确认/);
+});
+
+test('金十快讯脚本可解析为大盘实时消息', () => {
+  const script = 'var newest = [{"id":"1","time":"2026-08-20 10:01:00","data":{"title":"","content":"【A股午评：沪指上涨，算力板块走强】金十数据8月20日讯，两市成交放量。","source_link":""},"remark":[{"type":"link","link":"https://xnews.jin10.com/details/1","title":"相关链接"}]},{"id":"2","time":"2026-08-20 09:58:00","data":{"content":"国际原油短线波动。"},"remark":[]}]';
+  const news = parseJin10FlashItems(script);
+  assert.equal(news.length, 1);
+  assert.equal(news[0].source, '金十数据快讯');
+  assert.equal(news[0].publishedAt, '2026-08-20 10:01:00');
+  assert.match(news[0].title, /A股午评/);
+});
+
+test('大盘消息已有可用来源时单源失败只作为提示', () => {
+  const partial = classifyMarketNewsIssues({
+    news: [{ title: 'A股收盘数据' }],
+    errors: ['金十数据快讯失败：read ECONNRESET']
+  });
+  assert.deepEqual(partial.errors, []);
+  assert.deepEqual(partial.warnings, ['市场消息来源切换：金十数据快讯失败：read ECONNRESET']);
+
+  const failed = classifyMarketNewsIssues({
+    news: [],
+    errors: ['全部消息接口不可用']
+  });
+  assert.deepEqual(failed.warnings, []);
+  assert.deepEqual(failed.errors, ['全部消息接口不可用']);
 });
 
 test('单股行情解析保留估值、换手和盘口指标', () => {
@@ -522,6 +551,15 @@ test('近三个月行情返回技术分析和观察窗口', { timeout: 30000 }, 
   const stop = Number((result.analysis.exit.match(/有效跌破([\d.]+)元/) || [])[1]);
   const nearbySupport = Math.min(result.analysis.ma20, result.analysis.ma30, result.analysis.supportPrice);
   assert.ok(stop >= nearbySupport * 0.95 && stop < result.history.at(-1).close);
+});
+
+test('交易计划失效价始终低于低吸区下沿', () => {
+  const plan = buildTradePlan({
+    latestPrice:10, supportPrice:8, resistance:11, rangeHigh:12, recent10Low:9,
+    ma5:9.5, ma10:9.3, ma20:9, ma30:8.8, atr14:.15, volumeRatio:1, verdict:'等待确认'
+  });
+  assert.ok(plan.invalidationPrice < plan.entryLow);
+  assert.ok(plan.stopPct > 0);
 });
 
 test('个股走势返回分时五日日周月五种周期', { timeout: 60000 }, async () => {
@@ -980,6 +1018,78 @@ test('本地推荐复盘排除指定标签和不足一天的样本', () => {
   assert.equal(profile.byScoreBand['55-64'].count, 1);
   assert.equal(profile.excludedCount, 2);
   assert.equal(profile.immatureCount, 1);
+});
+
+test('推荐复盘使用最新行情覆盖收藏旧价', () => {
+  const rows = [
+    { code:'600001', label:'0821盘后', favoriteBasePrice:10, price:10 },
+    { code:'600002', label:'0821盘后', favoriteBasePrice:20, price:19 }
+  ];
+  const merged = mergeRecommendationOutcomeQuotes(rows, [
+    { code:'600001', price:11.5 },
+    { code:'600002', price:null }
+  ]);
+  assert.equal(merged[0].price, 11.5);
+  assert.equal(merged[1].price, 19);
+  assert.equal(rows[0].price, 10);
+});
+
+test('跨周末近期样本不足时按最新推荐版本扩窗', () => {
+  const now = Date.parse('2026-08-24T08:00:00.000Z');
+  const rows = [];
+  const addCohort = (label, count, addedAt, returnPct) => {
+    for (let index = 0; index < count; index++) rows.push({
+      code:`60${String(rows.length).padStart(4, '0')}`,
+      label,
+      favoriteBasePrice:10,
+      price:10 * (1 + returnPct / 100),
+      favoriteAddedAt:addedAt,
+      signal:'待突破',
+      signalScore:75,
+      technicalScore:80
+    });
+  };
+  addCohort('0821盘后', 8, '2026-08-21T07:00:00.000Z', -2.5);
+  addCohort('0820盘后', 11, '2026-08-20T07:00:00.000Z', -2.2);
+  addCohort('0820盘中', 9, '2026-08-20T01:00:00.000Z', -2.8);
+  addCohort('0819盘中', 14, '2026-08-19T02:00:00.000Z', 1);
+  const profile = summarizeRecommendationOutcomes(rows, { now });
+  assert.equal(profile.recentOverall.count, 28);
+  assert.equal(profile.recentCohortCount, 3);
+  assert.equal(profile.recentExtended, true);
+  assert.equal(profile.marketRisk.status, 'drawdown');
+});
+
+test('技术评分历史表现参与推荐校准', () => {
+  const weakTechnical = {count:28, averageReturn:-8.17, medianReturn:-9.24, winRate:11.5, averageExcessReturn:-.7, medianExcessReturn:-.9, outperformRate:38.5};
+  const strongTechnical = {count:25, averageReturn:-2.62, medianReturn:-2.25, winRate:31.4, averageExcessReturn:3.49, medianExcessReturn:2.16, outperformRate:64.7};
+  const profile = {
+    sampleSize:100,
+    byRecentSignal:{}, bySignal:{}, byRecentFamily:{}, byFamily:{},
+    byRecentScoreBand:{}, byScoreBand:{},
+    byRecentTechnicalScoreBand:{'<55':weakTechnical, '75+':strongTechnical},
+    byTechnicalScoreBand:{}, marketRisk:{status:'normal'}
+  };
+  const weak = calibrateRecommendationWithOutcomes({signal:'待突破', signalScore:78, technicalScore:50}, profile);
+  const strong = calibrateRecommendationWithOutcomes({signal:'待突破', signalScore:78, technicalScore:82}, profile);
+  assert.equal(weak.technicalAdjustment, -4);
+  assert.equal(weak.caution, true);
+  assert.equal(strong.technicalAdjustment, 2);
+  assert.match(strong.summary, /技术分75\+.*同批次平均跑赢3\.49%/);
+});
+
+test('跨多个版本的近期信号优先于长期旧样本', () => {
+  const recent = {count:7, cohortCount:3, averageReturn:-3.65, medianReturn:-2.23, winRate:28.6, averageExcessReturn:-1.98, medianExcessReturn:-1.55, outperformRate:42.9};
+  const historical = {count:17, cohortCount:8, averageReturn:-5.41, medianReturn:-2.23, winRate:23.5, averageExcessReturn:-.16, medianExcessReturn:.03, outperformRate:52.9};
+  const result = calibrateRecommendationWithOutcomes({signal:'震荡洗盘', signalScore:78, technicalScore:82}, {
+    sampleSize:100,
+    byRecentSignal:{'震荡洗盘':recent}, bySignal:{'震荡洗盘':historical},
+    byRecentFamily:{}, byFamily:{}, byRecentScoreBand:{}, byScoreBand:{},
+    byRecentTechnicalScoreBand:{}, byTechnicalScoreBand:{}, marketRisk:{status:'drawdown'}
+  });
+  assert.equal(result.recent, true);
+  assert.equal(result.familyAdjustment, -4);
+  assert.match(result.summary, /震荡洗盘近期同类样本7条/);
 });
 
 test('本地累计收益反馈降低弱突破优先级并提高有效反弹优先级', () => {

@@ -1546,6 +1546,44 @@ function recommendationScoreBand(score) {
   return '75+';
 }
 
+function mergeRecommendationOutcomeQuotes(rows, quotes) {
+  const quoteByCode = new Map((Array.isArray(quotes) ? quotes : [])
+    .filter(quote => /^\d{6}$/.test(String(quote?.code || '')) && Number(quote?.price) > 0)
+    .map(quote => [String(quote.code), Number(quote.price)]));
+  return (Array.isArray(rows) ? rows : []).map(row => {
+    const price = quoteByCode.get(String(row?.code || ''));
+    return price ? { ...row, price } : row;
+  });
+}
+
+function selectRecentOutcomeSamples(samples, currentTime, recentDays, minimumCount = 20) {
+  const cutoff = currentTime - recentDays * 864e5;
+  const selected = new Set(samples.filter(row => row.addedAt >= cutoff));
+  let extended = false;
+  if (selected.size < minimumCount) {
+    const cohorts = [...new Set(samples.map(row => row.label))].map(label => ({
+      label,
+      rows: samples.filter(row => row.label === label),
+      addedAt: Math.max(...samples.filter(row => row.label === label).map(row => row.addedAt))
+    })).sort((left, right) => right.addedAt - left.addedAt);
+    for (const cohort of cohorts) {
+      if ([...selected].some(row => row.label === cohort.label)) continue;
+      cohort.rows.forEach(row => selected.add(row));
+      extended = true;
+      if (selected.size >= minimumCount) break;
+    }
+  }
+  const recentSamples = [...selected];
+  return {
+    samples: recentSamples,
+    extended,
+    cohortCount: new Set(recentSamples.map(row => row.label)).size,
+    windowDays: recentSamples.length
+      ? roundMetric(Math.max(...recentSamples.map(row => currentTime - row.addedAt)) / 864e5, 1)
+      : recentDays
+  };
+}
+
 function recommendationOutcomeStats(rows) {
   if (!rows.length) return null;
   const returns = rows.map(row => row.returnPct).sort((a, b) => a - b);
@@ -1555,6 +1593,7 @@ function recommendationOutcomeStats(rows) {
   const excessMedian = excessReturns.length % 2 ? excessReturns[middle] : (excessReturns[middle - 1] + excessReturns[middle]) / 2;
   return {
     count: rows.length,
+    cohortCount: new Set(rows.map(row => row.label).filter(Boolean)).size,
     averageReturn: roundMetric(average(returns), 2),
     medianReturn: roundMetric(median, 2),
     winRate: roundMetric(rows.filter(row => row.returnPct > 0).length / rows.length * 100, 1),
@@ -1564,7 +1603,7 @@ function recommendationOutcomeStats(rows) {
   };
 }
 
-function summarizeRecommendationOutcomes(rows, { now = Date.now(), minimumAgeDays = 1, recentDays = 4 } = {}) {
+function summarizeRecommendationOutcomes(rows, { now = Date.now(), minimumAgeDays = 1, recentDays = 4, minimumRecentSamples = 20 } = {}) {
   const parsedNow = typeof now === 'number' ? now : Date.parse(now);
   const currentTime = Number.isFinite(parsedNow) ? parsedNow : Date.now();
   let excludedCount = 0;
@@ -1595,6 +1634,7 @@ function summarizeRecommendationOutcomes(rows, { now = Date.now(), minimumAgeDay
       signal,
       family: recommendationSignalFamily(signal),
       scoreBand: row?.signalScore === null || row?.signalScore === '' ? '' : recommendationScoreBand(row.signalScore),
+      technicalScoreBand: row?.technicalScore === null || row?.technicalScore === '' ? '' : recommendationScoreBand(row.technicalScore),
       returnPct: (price / base - 1) * 100
     });
   }
@@ -1605,13 +1645,16 @@ function summarizeRecommendationOutcomes(rows, { now = Date.now(), minimumAgeDay
     cohortMedians.set(label, returns.length % 2 ? returns[middle] : (returns[middle - 1] + returns[middle]) / 2);
   }
   const samples = eligible.map(row => ({ ...row, excessReturnPct: row.returnPct - cohortMedians.get(row.label) }));
-  const recentSamples = samples.filter(row => currentTime - row.addedAt <= recentDays * 864e5);
+  const recentSelection = selectRecentOutcomeSamples(samples, currentTime, recentDays, minimumRecentSamples);
+  const recentSamples = recentSelection.samples;
   const byFamily = {};
   const bySignal = {};
   const byScoreBand = {};
+  const byTechnicalScoreBand = {};
   const byRecentFamily = {};
   const byRecentSignal = {};
   const byRecentScoreBand = {};
+  const byRecentTechnicalScoreBand = {};
   for (const family of [...new Set(samples.map(row => row.family))]) {
     byFamily[family] = recommendationOutcomeStats(samples.filter(row => row.family === family));
   }
@@ -1620,6 +1663,9 @@ function summarizeRecommendationOutcomes(rows, { now = Date.now(), minimumAgeDay
   }
   for (const band of [...new Set(samples.map(row => row.scoreBand).filter(Boolean))]) {
     byScoreBand[band] = recommendationOutcomeStats(samples.filter(row => row.scoreBand === band));
+  }
+  for (const band of [...new Set(samples.map(row => row.technicalScoreBand).filter(Boolean))]) {
+    byTechnicalScoreBand[band] = recommendationOutcomeStats(samples.filter(row => row.technicalScoreBand === band));
   }
   for (const family of [...new Set(recentSamples.map(row => row.family))]) {
     byRecentFamily[family] = recommendationOutcomeStats(recentSamples.filter(row => row.family === family));
@@ -1630,14 +1676,20 @@ function summarizeRecommendationOutcomes(rows, { now = Date.now(), minimumAgeDay
   for (const band of [...new Set(recentSamples.map(row => row.scoreBand).filter(Boolean))]) {
     byRecentScoreBand[band] = recommendationOutcomeStats(recentSamples.filter(row => row.scoreBand === band));
   }
+  for (const band of [...new Set(recentSamples.map(row => row.technicalScoreBand).filter(Boolean))]) {
+    byRecentTechnicalScoreBand[band] = recommendationOutcomeStats(recentSamples.filter(row => row.technicalScoreBand === band));
+  }
   const recentOverall = recommendationOutcomeStats(recentSamples);
-  const marketRisk = recentOverall?.count >= 20 && recentOverall.averageReturn <= -3 && recentOverall.winRate < 35
+  const marketRisk = recentOverall?.count >= minimumRecentSamples && recentOverall.averageReturn <= -2 && recentOverall.winRate < 35
     ? { status: 'drawdown', ...recentOverall }
     : { status: 'normal', ...(recentOverall || {}) };
   const profile = {
     sampleSize: samples.length,
     minimumAgeDays,
     recentDays,
+    recentWindowDays: recentSelection.windowDays,
+    recentCohortCount: recentSelection.cohortCount,
+    recentExtended: recentSelection.extended,
     excludedCount,
     immatureCount,
     invalidCount,
@@ -1647,15 +1699,19 @@ function summarizeRecommendationOutcomes(rows, { now = Date.now(), minimumAgeDay
     byFamily,
     bySignal,
     byScoreBand,
+    byTechnicalScoreBand,
     byRecentFamily,
     byRecentSignal,
-    byRecentScoreBand
+    byRecentScoreBand,
+    byRecentTechnicalScoreBand
   };
   profile.signature = JSON.stringify({
     sampleSize: profile.sampleSize,
     marketRisk: marketRisk.status,
+    recentCohorts: profile.recentCohortCount,
     recentSignals: Object.fromEntries(Object.entries(byRecentSignal).map(([key, stats]) => [key, [stats.count, outcomeStatsAdjustment(stats, 8)]])),
-    recentScoreBands: Object.fromEntries(Object.entries(byRecentScoreBand).map(([key, stats]) => [key, [stats.count, outcomeStatsAdjustment(stats, 8)]]))
+    recentScoreBands: Object.fromEntries(Object.entries(byRecentScoreBand).map(([key, stats]) => [key, [stats.count, outcomeStatsAdjustment(stats, 8)]])),
+    recentTechnicalScoreBands: Object.fromEntries(Object.entries(byRecentTechnicalScoreBand).map(([key, stats]) => [key, [stats.count, outcomeStatsAdjustment(stats, 8)]]))
   });
   return profile;
 }
@@ -1664,6 +1720,7 @@ function outcomeStatsAdjustment(stats, minimumCount) {
   if (!stats || Number(stats.count) < minimumCount) return 0;
   if (Number(stats.outperformRate) < 35 && Number(stats.medianExcessReturn) < -.5) return -6;
   if (Number(stats.outperformRate) < 45 && Number(stats.medianExcessReturn) < -.5) return -4;
+  if (Number(stats.outperformRate) < 50 && Number(stats.averageExcessReturn) <= -1 && Number(stats.medianExcessReturn) < -.5) return -4;
   if (Number(stats.outperformRate) >= 65 && Number(stats.medianExcessReturn) >= .5) return 5;
   if (Number(stats.outperformRate) >= 55 && Number(stats.averageExcessReturn) >= 1) return 2;
   return 0;
@@ -1674,38 +1731,56 @@ function signedPercent(value) {
   return `${number >= 0 ? '+' : ''}${number.toFixed(2)}%`;
 }
 
+function hasRecentOutcomeEvidence(stats) {
+  return Number(stats?.count) >= 8
+    || Number(stats?.count) >= 6 && Number(stats?.cohortCount) >= 2;
+}
+
 function calibrateRecommendationWithOutcomes(item, profile) {
   const family = recommendationSignalFamily(item?.signal);
   const recentSignalStats = profile?.byRecentSignal?.[item?.signal];
   const signalStats = profile?.bySignal?.[item?.signal];
   const recentFamilyStats = profile?.byRecentFamily?.[family];
   const allFamilyStats = profile?.byFamily?.[family];
-  const familyStats = Number(recentSignalStats?.count) >= 8 ? recentSignalStats
+  const familyStats = hasRecentOutcomeEvidence(recentSignalStats) ? recentSignalStats
     : Number(signalStats?.count) >= 12 ? signalStats
-      : Number(recentFamilyStats?.count) >= 12 ? recentFamilyStats
+      : hasRecentOutcomeEvidence(recentFamilyStats) ? recentFamilyStats
         : Number(allFamilyStats?.count) >= 12 ? allFamilyStats : null;
   const recent = familyStats === recentSignalStats || familyStats === recentFamilyStats;
   const scoreBand = recommendationScoreBand(item?.signalScore ?? item?.score);
   const recentScoreStats = profile?.byRecentScoreBand?.[scoreBand];
-  const scoreStats = Number(recentScoreStats?.count) >= 8 ? recentScoreStats : profile?.byScoreBand?.[scoreBand] || null;
-  const familyAdjustment = outcomeStatsAdjustment(familyStats, recent ? 8 : 12);
-  const scoreAdjustment = outcomeStatsAdjustment(scoreStats, 8);
-  const adjustment = Math.max(-10, Math.min(8, familyAdjustment + scoreAdjustment));
+  const scoreStats = hasRecentOutcomeEvidence(recentScoreStats) ? recentScoreStats : profile?.byScoreBand?.[scoreBand] || null;
+  const technicalScoreBand = recommendationScoreBand(item?.technicalScore);
+  const recentTechnicalStats = profile?.byRecentTechnicalScoreBand?.[technicalScoreBand];
+  const technicalStats = hasRecentOutcomeEvidence(recentTechnicalStats)
+    ? recentTechnicalStats : profile?.byTechnicalScoreBand?.[technicalScoreBand] || null;
+  const familyAdjustment = outcomeStatsAdjustment(familyStats, recent ? 6 : 12);
+  const scoreAdjustment = outcomeStatsAdjustment(scoreStats, scoreStats === recentScoreStats ? 6 : 8);
+  const technicalAdjustment = outcomeStatsAdjustment(technicalStats, technicalStats === recentTechnicalStats ? 6 : 8);
+  const adjustment = Math.max(-10, Math.min(8, familyAdjustment + scoreAdjustment + technicalAdjustment));
   const familyLabel = { breakout: '突破类', rebounded: '反弹类', bottomWaiting: '待反弹类', structure: '吸筹/洗盘类', other: '其他类' }[family];
   const label = familyStats === recentSignalStats || familyStats === signalStats
     ? item?.signal || '同类信号' : familyLabel;
   const summary = familyStats
     ? `${label}${recent ? '近期' : ''}同类样本${familyStats.count}条，平均累计${signedPercent(familyStats.averageReturn)}，同批次平均${familyStats.averageExcessReturn >= 0 ? '跑赢' : '跑输'}${Math.abs(Number(familyStats.averageExcessReturn)).toFixed(2)}%，超额胜率${Number(familyStats.outperformRate).toFixed(1)}%`
     : '本地同类推荐样本不足，暂不调整';
+  const technicalSummary = technicalStats
+    ? `；技术分${technicalScoreBand}样本${technicalStats.count}条，同批次平均${technicalStats.averageExcessReturn >= 0 ? '跑赢' : '跑输'}${Math.abs(Number(technicalStats.averageExcessReturn)).toFixed(2)}%`
+    : '';
   return {
     family,
     scoreBand,
+    technicalScoreBand,
     adjustment,
-    caution: familyAdjustment < 0,
+    familyAdjustment,
+    scoreAdjustment,
+    technicalAdjustment,
+    caution: familyAdjustment < 0 || technicalAdjustment < 0,
     familyStats,
     scoreStats,
+    technicalStats,
     recent,
-    summary
+    summary: `${summary}${technicalSummary}`
   };
 }
 
@@ -1721,10 +1796,10 @@ function applyOutcomeFeedbackAssessment(analysis, profile) {
       : analysis.reboundSignal === '已反弹' ? '已反弹'
         : analysis.reboundSignal === '底部待反弹' ? '底部待反弹'
           : '待突破';
-  const outcome = calibrateRecommendationWithOutcomes({ signal, signalScore: analysis.score }, profile);
+  const outcome = calibrateRecommendationWithOutcomes({ signal, technicalScore: analysis.score }, profile);
   const strategyDrawdown = profile.marketRisk?.status === 'drawdown';
   const riskSummary = strategyDrawdown
-    ? `最近${profile.recentDays || 4}天成熟推荐${profile.marketRisk.count}条，平均累计${signedPercent(profile.marketRisk.averageReturn)}、胜率${Number(profile.marketRisk.winRate).toFixed(1)}%，处于策略回撤。`
+    ? `最近${profile.recentCohortCount || '--'}个版本成熟推荐${profile.marketRisk.count}条，平均累计${signedPercent(profile.marketRisk.averageReturn)}、胜率${Number(profile.marketRisk.winRate).toFixed(1)}%，处于策略回撤。`
     : '';
   if (!outcome.familyStats && !strategyDrawdown) return { ...analysis, historicalOutcomeAssessment: outcome };
   const currentStrong = Number(analysis.score) >= 70
@@ -1940,20 +2015,78 @@ async function fetchSinaMarketNews() {
   })).filter(item => item.title && item.link)).slice(0, 8);
 }
 
+function parseJin10FlashItems(script, limit = 10) {
+  const match = String(script || '').match(/var\s+newest\s*=\s*(\[[\s\S]*?\])\s*;?\s*$/);
+  if (!match) throw new Error('金十快讯返回格式异常');
+  const rows = JSON.parse(match[1]);
+  const marketPattern = /A股|沪指|深证|创业板|上证指数|大盘|两市|北向资金|主力资金|涨停|跌停|证监会|央行|财政部|降息|加息|关税|人民币/;
+  return sortNewsNewestFirst((Array.isArray(rows) ? rows : []).map(row => {
+    const data = row?.data || {};
+    const remarks = Array.isArray(row?.remark) ? row.remark : [];
+    const content = String(data.content || '').replace(/<[^>]+>/g, '').trim();
+    const prefix = data.title && !content.startsWith(data.title) ? `${data.title} ` : '';
+    const link = remarks.find(item => /^https?:\/\//i.test(item?.link || ''))?.link || data.source_link || '';
+    const symbols = remarks.map(item => `${item.title || ''} ${item.symbol || ''}`).join(' ');
+    return {
+      title: cleanStockName(`${prefix}${content}`).slice(0, 160),
+      link,
+      summary: content.slice(0, 180),
+      publishedAt: row?.time || '',
+      source: '金十数据快讯',
+      symbols
+    };
+  }).filter(item => item.title && marketPattern.test(`${item.title} ${item.summary} ${item.symbols}`))).slice(0, limit)
+    .map(({ symbols, ...item }) => item);
+}
+
+async function fetchJin10MarketNews(limit = 10) {
+  const script = await getText('https://www.jin10.com/flash_newest.js', { Referer: 'https://www.jin10.com/' });
+  return parseJin10FlashItems(script, limit);
+}
+
+function classifyMarketNewsIssues(newsResult) {
+  const issues = (newsResult?.errors || []).filter(Boolean);
+  return newsResult?.news?.length
+    ? { errors: [], warnings: issues.map(issue => `市场消息来源切换：${issue}`) }
+    : { errors: issues, warnings: [] };
+}
+
 async function fetchMarketNews(force = false) {
   const maxAgeMs = 2 * 60 * 1000;
   const combinedKey = 'market-overview-live-news';
   const cached = force ? null : readTimedCache(marketNewsCache, combinedKey, maxAgeMs);
   if (cached) return { ...cached, cached: true };
   const previous = marketNewsCache.get(combinedKey)?.value;
-  const keyword = 'A股 大盘 板块 资金 今日 最新消息';
   const errors = [];
+  const collected = [];
+  const sources = [];
+  const addSource = (news, source) => {
+    if (!news.length) return false;
+    collected.push(...news);
+    sources.push(source);
+    return true;
+  };
+  try {
+    const news = await fetchJin10MarketNews();
+    if (!addSource(news, '金十数据快讯')) errors.push('金十数据快讯搜索为空');
+  } catch (err) {
+    errors.push(`金十数据快讯失败：${err.message || err}`);
+  }
   try {
     const news = await fetchSinaMarketNews();
-    if (news.length) return writeTimedCache(marketNewsCache, combinedKey, { news, source: '新浪财经滚动', fetchedAt: new Date().toISOString(), stale: false, errors });
-    errors.push('新浪财经滚动资讯搜索为空');
+    if (!addSource(news, '新浪财经滚动')) errors.push('新浪财经滚动资讯搜索为空');
   } catch (err) {
     errors.push(`新浪财经滚动资讯失败：${err.message || err}`);
+  }
+  if (collected.length) {
+    const seen = new Set();
+    const news = sortNewsNewestFirst(collected).filter(item => {
+      const key = `${item.title}|${item.link || ''}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }).slice(0, 12);
+    return writeTimedCache(marketNewsCache, combinedKey, { news, source: sources.join(' + '), fetchedAt: new Date().toISOString(), stale: false, errors });
   }
   try {
     const news = await fetchEastmoneyNews(keyword, 'market-overview-news', maxAgeMs, force);
@@ -1971,6 +2104,52 @@ async function fetchMarketNews(force = false) {
   }
   if (previous?.news?.length) return { ...previous, cached: true, stale: true, errors };
   throw new Error(errors.join('；') || '市场资讯接口未返回数据');
+}
+
+async function fetchLiveNews({ force = false, limit = 24 } = {}) {
+  const maxAgeMs = 2 * 60 * 1000;
+  const safeLimit = Math.max(1, Math.min(48, Number(limit) || 24));
+  const cacheKey = `live-news-${safeLimit}`;
+  const cached = force ? null : readTimedCache(marketNewsCache, cacheKey, maxAgeMs);
+  if (cached) return { ...cached, cached: true };
+  const previous = marketNewsCache.get(cacheKey)?.value;
+  const keyword = 'A股 大盘 板块 资金 今日 最新消息';
+  const errors = [];
+  const collected = [];
+  const sources = [];
+  const addSource = (news, source) => {
+    if (!news?.length) return false;
+    collected.push(...news);
+    sources.push(source);
+    return true;
+  };
+  try {
+    if (!addSource(await fetchJin10MarketNews(safeLimit), '金十数据快讯')) errors.push('金十数据快讯搜索为空');
+  } catch (err) {
+    errors.push(`金十数据快讯失败：${err.message || err}`);
+  }
+  try {
+    if (!addSource(await fetchSinaMarketNews(), '新浪财经滚动') && !collected.length) errors.push('新浪财经滚动资讯搜索为空');
+  } catch (err) {
+    if (!collected.length) errors.push(`新浪财经滚动资讯失败：${err.message || err}`);
+  }
+  if (collected.length < safeLimit) {
+    try {
+      if (!addSource(await fetchBingNews(keyword, 'live-news-bing', maxAgeMs, force), 'Bing新闻') && !collected.length) errors.push('Bing新闻搜索为空');
+    } catch (err) {
+      if (!collected.length) errors.push(`Bing资讯失败：${err.message || err}`);
+    }
+  }
+  const seen = new Set();
+  const news = sortNewsNewestFirst(collected).filter(item => {
+    const key = `${item.title}|${item.link || ''}`;
+    if (!item.title || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).slice(0, safeLimit);
+  if (news.length) return writeTimedCache(marketNewsCache, cacheKey, { news, source: sources.join(' + '), fetchedAt: new Date().toISOString(), stale: false, errors });
+  if (previous?.news?.length) return { ...previous, cached: true, stale: true, errors };
+  throw new Error(errors.join('；') || '实时新闻接口未返回数据');
 }
 
 function scoreConsolidationCandidate(item) {
@@ -2158,12 +2337,12 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
     const qualityScore = item.quality?.score ?? 100;
     const factorScore = factorAnalysis.score ?? rawSignalScore;
     const baseSignalScore = clampRecommendationScore(rawSignalScore * .55 + qualityScore * .15 + factorScore * .3);
-    const outcomeResult = calibrateRecommendationWithOutcomes({ signal, signalScore: baseSignalScore }, outcomeProfile);
+    const outcomeResult = calibrateRecommendationWithOutcomes({ signal, signalScore: baseSignalScore, technicalScore: item.analysis.score }, outcomeProfile);
     const strategyRiskAdjustment = outcomeProfile?.marketRisk?.status === 'drawdown' ? -3 : 0;
     const totalOutcomeAdjustment = outcomeResult.adjustment + strategyRiskAdjustment;
     const outcomeCalibration = { ...outcomeResult, strategyRiskAdjustment, totalAdjustment: totalOutcomeAdjustment };
     const signalScore = clampRecommendationScore(baseSignalScore + totalOutcomeAdjustment);
-    if (outcomeCalibration.familyStats) reason += ` 本地推荐复盘：${outcomeCalibration.summary}，本次评分${totalOutcomeAdjustment >= 0 ? '+' : ''}${totalOutcomeAdjustment}分。`;
+    if (outcomeCalibration.familyStats || outcomeCalibration.technicalStats) reason += ` 本地推荐复盘：${outcomeCalibration.summary}，本次评分${totalOutcomeAdjustment >= 0 ? '+' : ''}${totalOutcomeAdjustment}分。`;
     if (strategyRiskAdjustment) reason += ` 最近成熟推荐整体处于回撤，额外降低${Math.abs(strategyRiskAdjustment)}分。`;
     return {
       ...item,
@@ -2229,8 +2408,11 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
     if (decision.status === 'unverified') riskUnverifiedIncluded++;
     if (decision.item) riskApprovedRecommendations.push(decision.item);
   });
+  const finalRiskApprovedRecommendations = riskApprovedRecommendations.filter(item => Number(item.signalScore ?? item.score) >= 65);
+  const riskScoreRejected = riskApprovedRecommendations.length - finalRiskApprovedRecommendations.length;
+  riskUnverifiedIncluded = finalRiskApprovedRecommendations.filter(item => item.riskUnverified).length;
   const recommendationGroups = ['breakout', 'rebounded', 'bottomWaiting', 'structure', 'other'].reduce((groups, family) => {
-    groups[family] = riskApprovedRecommendations.filter(item => recommendationSignalFamily(item.signal) === family)
+    groups[family] = finalRiskApprovedRecommendations.filter(item => recommendationSignalFamily(item.signal) === family)
       .sort((a, b) => b.signalScore - a.signalScore);
     return groups;
   }, {});
@@ -2277,14 +2459,19 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
       riskRejected,
       riskUnknown,
       riskUnverifiedIncluded,
+      riskScoreRejected,
       outcomeFeedback: outcomeProfile?.sampleSize ? {
         sampleSize: outcomeProfile.sampleSize,
         excludedCount: outcomeProfile.excludedCount,
         immatureCount: outcomeProfile.immatureCount,
+        recentCohortCount: outcomeProfile.recentCohortCount,
+        recentWindowDays: outcomeProfile.recentWindowDays,
+        recentExtended: outcomeProfile.recentExtended,
         signature: outcomeProfile.signature,
         marketRisk: outcomeProfile.marketRisk,
         byFamily: outcomeProfile.byFamily,
-        byRecentSignal: outcomeProfile.byRecentSignal
+        byRecentSignal: outcomeProfile.byRecentSignal,
+        byRecentTechnicalScoreBand: outcomeProfile.byRecentTechnicalScoreBand
       } : null,
       factorModel: 'A股适配CANSLIM + 价值质量 + 阶段主力资金 + 底部五线粘合放量 + 横盘箱体突破趋势（缺失项不计分）',
       qualified: groupedRecommendations.length
@@ -2307,8 +2494,11 @@ function marketAnalysis(result) {
   return `市场情绪${sentiment}${up || down ? `，上涨${up}家、下跌${down}家` : ''}。${leaders ? `轮动靠前：${leaders}。` : ''}${funds ? `成交资金活跃板块：${funds}。` : ''}涨停${result.limits?.upCount ?? 0}只、跌停${result.limits?.downCount ?? 0}只。${news}${signalGroups ? `技术形态观察候选——${signalGroups}；仍需等待价格和成交量条件确认。` : '当前未筛出满足条件的技术形态候选。'}`;
 }
 
-async function fetchMarketOverview(force = false, outcomeProfile = null) {
-  const feedbackSignature = outcomeProfile?.signature || '';
+async function fetchMarketOverview(force = false, favoriteOutcomes = []) {
+  const freshCachedQuotes = [...quoteCache.values()].filter(quote => !quote.stale
+    && Date.now() - Date.parse(quote.fetchedAt || '') < 10 * 60 * 1000);
+  let outcomeProfile = summarizeRecommendationOutcomes(mergeRecommendationOutcomeQuotes(favoriteOutcomes, freshCachedQuotes));
+  let feedbackSignature = outcomeProfile.signature;
   const cachedFeedbackSignature = marketOverviewCache?.value?.recommendationCoverage?.outcomeFeedback?.signature || '';
   if (!force && marketOverviewCache && feedbackSignature === cachedFeedbackSignature
     && Date.now() - marketOverviewCache.savedAt < 30 * 1000) return { ...marketOverviewCache.value, cached: true };
@@ -2318,17 +2508,24 @@ async function fetchMarketOverview(force = false, outcomeProfile = null) {
     : previousOverview;
   const recommendationSavedAt = Date.parse(recommendationCache?.recommendationsFetchedAt || recommendationCache?.fetchedAt || '');
   const recommendationFeedbackSignature = recommendationCache?.recommendationCoverage?.outcomeFeedback?.signature || '';
-  const reuseRecommendations = Boolean(!force && recommendationCache?.recommendations?.length
-    && recommendationFeedbackSignature === feedbackSignature
-    && Number.isFinite(recommendationSavedAt)
-    && Date.now() - recommendationSavedAt < 10 * 60 * 1000);
-  const result = { errors: [], fetchedAt: new Date().toISOString() };
+  const result = { errors: [], warnings: [], fetchedAt: new Date().toISOString() };
   const [indicesResult, snapshotResult] = await Promise.allSettled([
     fetchTencentMarketIndices(), fetchTencentMarketSnapshot()
   ]);
   if (indicesResult.status === 'fulfilled' && indicesResult.value.length) result.indices = indicesResult.value;
   else result.errors.push(`指数行情失败：${indicesResult.reason?.message || '返回为空'}`);
   if (snapshotResult.status === 'fulfilled') {
+    const quoteFetchedAt = new Date().toISOString();
+    const outcomeQuotes = snapshotResult.value.quotes.map(quote => ({
+      ...quote, source: '腾讯全市场行情', fetchedAt: quoteFetchedAt, stale: false
+    }));
+    outcomeQuotes.forEach(quote => quoteCache.set(quote.code, quote));
+    outcomeProfile = summarizeRecommendationOutcomes(mergeRecommendationOutcomeQuotes(favoriteOutcomes, outcomeQuotes));
+    feedbackSignature = outcomeProfile.signature;
+    const reuseRecommendations = Boolean(!force && recommendationCache?.recommendations?.length
+      && recommendationFeedbackSignature === feedbackSignature
+      && Number.isFinite(recommendationSavedAt)
+      && Date.now() - recommendationSavedAt < 10 * 60 * 1000);
     result.breadth = snapshotResult.value.breadth;
     result.limits = snapshotResult.value.limits;
     result.activeStocks = snapshotResult.value.activeStocks;
@@ -2354,7 +2551,9 @@ async function fetchMarketOverview(force = false, outcomeProfile = null) {
     else result.errors.push(`技术形态候选分析失败：${recommendationsResult.reason?.message || recommendationsResult.reason}`);
     if (newsResult.status === 'fulfilled') {
       result.newsContext = summarizeNews(newsResult.value.news, '', { ...newsResult.value });
-      result.errors.push(...(newsResult.value.errors || []));
+      const newsIssues = classifyMarketNewsIssues(newsResult.value);
+      result.errors.push(...newsIssues.errors);
+      result.warnings.push(...newsIssues.warnings);
     }
     else result.errors.push(`大盘消息获取失败：${newsResult.reason?.message || newsResult.reason}`);
   } else {
@@ -2368,7 +2567,7 @@ async function fetchMarketOverview(force = false, outcomeProfile = null) {
   result.activeStocks ||= [];
   result.recommendations ||= [];
   const restoredRecommendations = restoreCachedMarketRecommendations(result, previousOverview, snapshotResult.value?.quotes || []);
-  if (restoredRecommendations) result.errors.push(`技术形态候选本轮未生成，已回退最近一次成功推荐（${result.recommendations.length}只）`);
+  if (restoredRecommendations) result.warnings.push(`技术形态候选本轮未生成，已回退最近一次成功推荐（${result.recommendations.length}只）`);
   result.recommendationCoverage ||= { scanned: snapshotResult.value?.quotes?.length || 0, prefiltered: 0, analyzed: 0, industries: 0, directoryAvailable: false };
   result.newsContext ||= summarizeNews([]);
   result.limits ||= { date: '', upCount: 0, downCount: 0, upStocks: [], downStocks: [] };
@@ -2381,6 +2580,7 @@ async function fetchMarketOverview(force = false, outcomeProfile = null) {
         ...previousOverview,
         cached: true,
         cachedFallback: true,
+        warnings: [...new Set([...(previousOverview.warnings || []), ...(result.warnings || [])])],
         errors: [...new Set([...(previousOverview.errors || []), ...result.errors, '本轮大盘接口均不可用，已显示最近一次成功数据'])]
       };
       fallback.recommendations = (fallback.recommendations || []).map(item => ({ ...item, industry: resolveRecommendationIndustry(item) }));
@@ -3996,7 +4196,8 @@ function buildTradePlan({ latestPrice, supportPrice, resistance, rangeHigh, rece
   const volatilityStop = entryAnchor - Math.max(atr * 0.8, entryAnchor * 0.025);
   const eightPercentStop = entryMid * .92;
   const tenDayStop = Number.isFinite(recent10Low) ? recent10Low * .98 : 0;
-  const invalidationPrice = Math.max(0.01, volatilityStop, eightPercentStop, tenDayStop);
+  const invalidationPrice = Math.max(0.01, Math.min(entryLow * .99,
+    Math.max(volatilityStop, eightPercentStop, tenDayStop)));
   const riskPerShare = Math.max(entryMid - invalidationPrice, atr * 0.5);
   const target1 = Math.max(resistance, latestPrice + atr, entryMid + riskPerShare);
   const target2 = Math.max(target1 + atr * 0.8, Math.min(rangeHigh, entryMid + riskPerShare * 2));
@@ -4207,8 +4408,10 @@ function analyzeHistory(history) {
 
 async function fetchStockHistory({ code, name, force = false, favoriteOutcomes = [] }) {
   const cacheKey = String(code || '');
-  const outcomeProfile = summarizeRecommendationOutcomes(favoriteOutcomes);
-  const feedbackSignature = outcomeProfile.signature;
+  const freshCachedQuotes = [...quoteCache.values()].filter(quote => !quote.stale
+    && Date.now() - Date.parse(quote.fetchedAt || '') < 10 * 60 * 1000);
+  let outcomeProfile = summarizeRecommendationOutcomes(mergeRecommendationOutcomeQuotes(favoriteOutcomes, freshCachedQuotes));
+  let feedbackSignature = outcomeProfile.signature;
   const cached = force ? null : readTimedCache(stockHistoryCache, cacheKey, 2 * 60 * 1000);
   if (cached && (cached.feedbackSignature || '') === feedbackSignature) return { ...cached, cached: true };
   const historyErrors = [];
@@ -4242,12 +4445,15 @@ async function fetchStockHistory({ code, name, force = false, favoriteOutcomes =
     if (quoteResult.status === 'rejected') throw quoteResult.reason;
     const liveQuote = quoteResult.value[0];
     if (liveQuote?.price > 0 && liveQuote.tradeDate) {
+      quoteCache.set(cacheKey, liveQuote);
       history = mergeQuoteIntoHistory(history, liveQuote);
       source = `${source || '历史日线'} + 腾讯最新行情`;
     }
   } catch (err) {
     errors.push(`最新行情合并失败：${err.message || err}`);
   }
+  outcomeProfile = summarizeRecommendationOutcomes(mergeRecommendationOutcomeQuotes(favoriteOutcomes, [...quoteCache.values()]));
+  feedbackSignature = outcomeProfile.signature;
   if (history.length < 20) throw new Error(errors.join('；') || '历史行情不足');
   let analysis = analyzeHistory(history);
   const fundFlowPeriod = fundFlowResult.status === 'fulfilled'
@@ -4651,6 +4857,12 @@ ipcMain.handle('fetch-stock-news', async (_event, stock) => {
   return result;
 });
 
+ipcMain.handle('fetch-live-news', async (_event, request) => {
+  const result = await fetchLiveNews(request || {});
+  appendLogLine({ type: result.news.length ? 'success' : 'warn', message: '24小时实时新闻查询完成', detail: { source: result.source, count: result.news.length, errors: result.errors } });
+  return result;
+});
+
 ipcMain.handle('fetch-stock-history', async (_event, stock) => {
   try {
     const result = await fetchStockHistory(stock || {});
@@ -4686,10 +4898,9 @@ ipcMain.handle('fetch-stock-fund-flow', async (_event, request) => {
 
 ipcMain.handle('fetch-market-overview', async (_event, input) => {
   const request = input && typeof input === 'object' ? input : { force: Boolean(input) };
-  const outcomeProfile = summarizeRecommendationOutcomes(request.favoriteOutcomes);
   try {
-    const result = await fetchMarketOverview(Boolean(request.force), outcomeProfile);
-    appendLogLine({ type: result.errors.length ? 'warn' : 'success', message: '大盘实时分析完成', action: 'market_overview', detail: { indices: result.indices.length, sectors: result.sectors.length, recommendations: result.recommendations?.length || 0, recommendationOutcomeSamples: outcomeProfile.sampleSize, news: result.newsContext?.items?.length || 0, turnover: result.turnover, limits: result.limits, source: result.source, errors: result.errors } });
+    const result = await fetchMarketOverview(Boolean(request.force), request.favoriteOutcomes);
+    appendLogLine({ type: result.errors.length ? 'warn' : 'success', message: '大盘实时分析完成', action: 'market_overview', detail: { indices: result.indices.length, sectors: result.sectors.length, recommendations: result.recommendations?.length || 0, recommendationOutcomeSamples: result.recommendationCoverage?.outcomeFeedback?.sampleSize || 0, news: result.newsContext?.items?.length || 0, turnover: result.turnover, limits: result.limits, source: result.source, warnings: result.warnings || [], errors: result.errors } });
     return result;
   } catch (err) {
     appendLogLine({ type: 'error', message: '大盘实时分析失败', action: 'market_overview_failed', stack: err.stack || String(err) });
@@ -4763,6 +4974,7 @@ module.exports = {
   recommendationIndustryGroupKey,
   groupRecommendationsByIndustry,
   recommendationSignalFamily,
+  mergeRecommendationOutcomeQuotes,
   summarizeRecommendationOutcomes,
   calibrateRecommendationWithOutcomes,
   applyOutcomeFeedbackAssessment,
@@ -4781,7 +4993,11 @@ module.exports = {
   applyIndividualCapitalAssessment,
   applyEntryContextAssessment,
   analyzeHistory,
+  buildTradePlan,
   mergeQuoteIntoHistory,
   parseReductionPlanWindow,
+  parseJin10FlashItems,
+  classifyMarketNewsIssues,
+  fetchLiveNews,
   settleWithConcurrency
 };
