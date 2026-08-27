@@ -271,7 +271,10 @@ app.whenReady().then(async () => {
     document.querySelector('#labelStocks [data-detail-code="603567"]').click();
     for(let index = 0; index < 50; index += 1){
       await new Promise(resolve => setTimeout(resolve, 10));
-      if((document.querySelector('[data-quote-source-for="603567"]')?.innerText || '').includes('腾讯实时行情')) break;
+      const card = document.querySelector('#labelStocks [data-detail-code="603567"]')?.innerText || '';
+      const state = JSON.parse(localStorage.getItem('ai-stock-assistant-state-v1') || '{}');
+      const stock = state.labels?.flatMap(label => label.stocks || []).find(item => item.code === '603567');
+      if(card.includes('¥11.08') && stock?.price === 11.08 && stock?.changePct === -0.72) break;
     }
     const after = document.querySelector('#labelStocks [data-detail-code="603567"]')?.innerText || '';
     const saved = JSON.parse(localStorage.getItem('ai-stock-assistant-state-v1') || '{}');

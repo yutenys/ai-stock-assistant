@@ -58,6 +58,7 @@ const {
   analyzeHistory,
   buildTradePlan,
   mergeQuoteIntoHistory,
+  aggregateHistoryPeriod,
   parseReductionPlanWindow,
   parseJin10FlashItems,
   classifyMarketNewsIssues,
@@ -128,6 +129,12 @@ test('大盘消息已有可用来源时单源失败只作为提示', () => {
   });
   assert.deepEqual(failed.warnings, []);
   assert.deepEqual(failed.errors, ['全部消息接口不可用']);
+});
+
+test('大盘消息备用搜索使用已定义关键词', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const body = source.slice(source.indexOf('async function fetchMarketNews'), source.indexOf('async function fetchLiveNews'));
+  assert.match(body, /const keyword = 'A股 大盘 板块 资金 今日 最新消息';/);
 });
 
 test('单股行情解析保留估值、换手和盘口指标', () => {
@@ -553,6 +560,25 @@ test('近三个月行情返回技术分析和观察窗口', { timeout: 30000 }, 
   assert.ok(stop >= nearbySupport * 0.95 && stop < result.history.at(-1).close);
 });
 
+test('日线可聚合为周K和月K备用数据', () => {
+  const rows = [
+    { date:'2026-07-31', open:10, high:11, low:9, close:10.5, volume:100 },
+    { date:'2026-08-03', open:10.6, high:11.2, low:10.2, close:11, volume:120 },
+    { date:'2026-08-07', open:11, high:12, low:10.8, close:11.8, volume:180 },
+    { date:'2026-08-10', open:11.9, high:12.3, low:11.4, close:12, volume:200 }
+  ];
+  const weeks = aggregateHistoryPeriod(rows, 'week');
+  assert.equal(weeks.length, 3);
+  assert.deepEqual(weeks[1], {
+    date:'2026-08-07', open:10.6, high:12, low:10.2, close:11.8, volume:300
+  });
+  const months = aggregateHistoryPeriod(rows, 'month');
+  assert.equal(months.length, 2);
+  assert.deepEqual(months[1], {
+    date:'2026-08-10', open:10.6, high:12.3, low:10.2, close:12, volume:500
+  });
+});
+
 test('交易计划失效价始终低于低吸区下沿', () => {
   const plan = buildTradePlan({
     latestPrice:10, supportPrice:8, resistance:11, rangeHigh:12, recent10Low:9,
@@ -617,7 +643,7 @@ test('大盘分析返回指数、轮动、资金和涨跌停结构', { timeout: 
   assert.equal(Object.values(result.recommendationCoverage.signals).reduce((sum, count) => sum + count, 0), result.recommendations.length);
   assert.ok(result.recommendations.every(item => item.score === item.signalScore && Number.isFinite(item.technicalScore)));
   assert.ok(result.recommendations.every(item => item.signalScore >= 65));
-  assert.ok(result.recommendations.every(item => !(item.outcomeCalibration?.caution && item.technicalScore < 55)));
+  assert.ok(result.recommendations.every(item => item.technicalScore >= 55));
   assert.ok(result.recommendations.every(item => item.entryAssessment?.status));
   assert.ok(result.recommendations.every(item => !['破位', '爆量观察', '结构偏弱', '不宜追高', '公司风险'].includes(item.entryAssessment.status)));
   assert.ok(result.recommendations.every(item => /综合入场/.test(item.reason)));
@@ -625,7 +651,7 @@ test('大盘分析返回指数、轮动、资金和涨跌停结构', { timeout: 
   assert.ok(result.recommendations.slice(0, 10).some(item =>
     ['待突破', '横盘观察', '突破蓄势', '接近突破', '突破确认'].includes(item.signal)
   ));
-  assert.ok((result.recommendationCoverage.signals?.rebounded || 0) > 0);
+  assert.ok((result.recommendationCoverage.signalCandidates?.rebounded || 0) >= (result.recommendationCoverage.signals?.rebounded || 0));
   assert.ok(result.recommendationCoverage.scanned > 1000);
   assert.ok(result.recommendationCoverage.analyzed > 24);
   assert.ok(result.newsContext?.summary);
@@ -1075,7 +1101,7 @@ test('技术评分历史表现参与推荐校准', () => {
   assert.equal(weak.technicalAdjustment, -4);
   assert.equal(weak.caution, true);
   assert.equal(strong.technicalAdjustment, 2);
-  assert.match(strong.summary, /技术分75\+.*同批次平均跑赢3\.49%/);
+  assert.match(strong.summary, /近期技术分75\+样本25条，平均累计-2\.62%，胜率31\.4%，同批次平均跑赢3\.49%/);
 });
 
 test('跨多个版本的近期信号优先于长期旧样本', () => {
@@ -1126,11 +1152,11 @@ test('系统性下跌时按同批次超额收益评价选股而不是把全部�
   assert.match(result.summary, /平均累计-5\.00%.*同批次平均跑赢2\.40%/);
 });
 
-test('历史警示信号只淘汰低技术分候选并统一守住65分门槛', () => {
+test('推荐统一守住65分和55技术分门槛', () => {
   assert.equal(recommendationPassesOutcomeGate({signalScore:64, technicalScore:80, outcomeCalibration:{caution:false}}), false);
   assert.equal(recommendationPassesOutcomeGate({signalScore:80, technicalScore:54, outcomeCalibration:{caution:true}}), false);
   assert.equal(recommendationPassesOutcomeGate({signalScore:80, technicalScore:55, outcomeCalibration:{caution:true}}), true);
-  assert.equal(recommendationPassesOutcomeGate({signalScore:68, technicalScore:42, outcomeCalibration:{caution:false}}), true);
+  assert.equal(recommendationPassesOutcomeGate({signalScore:68, technicalScore:42, outcomeCalibration:{caution:false}}), false);
 });
 
 test('个股分析仅在当前确认不足时采用负向历史反馈降级', () => {
@@ -1162,6 +1188,53 @@ test('个股分析仅在当前确认不足时采用负向历史反馈降级', ()
   assert.equal(strong.entryAssessment.allowed, true);
   assert.equal(strong.tradePlan.enabled, true);
   assert.match(strong.historicalOutcomeAssessment.summary, /当前技术与资金确认较强/);
+});
+
+test('低技术分历史表现显著偏弱时个股结论明确不建议入场', () => {
+  const weakTechnical = {
+    count:129, cohortCount:16, averageReturn:-8.22, medianReturn:-8.05, winRate:5.4,
+    averageExcessReturn:-1.94, medianExcessReturn:-1.24, outperformRate:36.4
+  };
+  const result = applyOutcomeFeedbackAssessment({
+    score:52, capitalAdjustedScore:58, verdict:'可关注',
+    capitalSetupAssessment:{scoreAdjustment:2},
+    entryAssessment:{allowed:false, status:'等待确认', tone:'warning', summary:'价格尚待确认。', evidence:[]},
+    tradePlan:{enabled:true}
+  }, {
+    sampleSize:204,
+    byRecentSignal:{}, bySignal:{}, byRecentFamily:{}, byFamily:{},
+    byRecentScoreBand:{}, byScoreBand:{}, byRecentTechnicalScoreBand:{},
+    byTechnicalScoreBand:{'<55':weakTechnical}, marketRisk:{status:'normal'}
+  });
+  assert.equal(result.entryAssessment.allowed, false);
+  assert.equal(result.entryAssessment.status, '历史同类技术分偏弱，不建议入场');
+  assert.equal(result.tradePlan.enabled, false);
+  assert.match(result.historicalOutcomeAssessment.summary, /技术分<55样本129条，平均累计-8\.22%，胜率5\.4%/);
+});
+
+test('近期跌幅收窄不掩盖低技术分长期风险', () => {
+  const recentWeak = {
+    count:7, cohortCount:5, averageReturn:-.67, medianReturn:-2.27, winRate:14.3,
+    averageExcessReturn:-1.81, medianExcessReturn:-3.83, outperformRate:14.3
+  };
+  const longWeak = {
+    count:130, cohortCount:20, averageReturn:-6.25, medianReturn:-5.82, winRate:10,
+    averageExcessReturn:-2.31, medianExcessReturn:-2.09, outperformRate:34.6
+  };
+  const result = applyOutcomeFeedbackAssessment({
+    score:52, capitalAdjustedScore:58, verdict:'等待确认',
+    capitalSetupAssessment:{scoreAdjustment:2},
+    entryAssessment:{allowed:false, status:'等待确认', tone:'warning', summary:'价格尚待确认。', evidence:[]},
+    tradePlan:{enabled:true}
+  }, {
+    sampleSize:244,
+    byRecentSignal:{}, bySignal:{}, byRecentFamily:{}, byFamily:{},
+    byRecentScoreBand:{}, byScoreBand:{}, byRecentTechnicalScoreBand:{'<55':recentWeak},
+    byTechnicalScoreBand:{'<55':longWeak}, marketRisk:{status:'normal'}
+  });
+  assert.equal(result.entryAssessment.status, '历史同类技术分偏弱，不建议入场');
+  assert.equal(result.tradePlan.enabled, false);
+  assert.match(result.historicalOutcomeAssessment.summary, /近期技术分<55样本7条.*长期技术分<55样本130条/);
 });
 
 test('消息面和大盘环境会调整个股及大盘推荐入场结论', () => {

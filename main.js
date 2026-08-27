@@ -1752,8 +1752,10 @@ function calibrateRecommendationWithOutcomes(item, profile) {
   const scoreStats = hasRecentOutcomeEvidence(recentScoreStats) ? recentScoreStats : profile?.byScoreBand?.[scoreBand] || null;
   const technicalScoreBand = recommendationScoreBand(item?.technicalScore);
   const recentTechnicalStats = profile?.byRecentTechnicalScoreBand?.[technicalScoreBand];
+  const longTermTechnicalStats = profile?.byTechnicalScoreBand?.[technicalScoreBand] || null;
   const technicalStats = hasRecentOutcomeEvidence(recentTechnicalStats)
-    ? recentTechnicalStats : profile?.byTechnicalScoreBand?.[technicalScoreBand] || null;
+    ? recentTechnicalStats : longTermTechnicalStats;
+  const technicalRecent = technicalStats === recentTechnicalStats;
   const familyAdjustment = outcomeStatsAdjustment(familyStats, recent ? 6 : 12);
   const scoreAdjustment = outcomeStatsAdjustment(scoreStats, scoreStats === recentScoreStats ? 6 : 8);
   const technicalAdjustment = outcomeStatsAdjustment(technicalStats, technicalStats === recentTechnicalStats ? 6 : 8);
@@ -1765,7 +1767,10 @@ function calibrateRecommendationWithOutcomes(item, profile) {
     ? `${label}${recent ? '近期' : ''}同类样本${familyStats.count}条，平均累计${signedPercent(familyStats.averageReturn)}，同批次平均${familyStats.averageExcessReturn >= 0 ? '跑赢' : '跑输'}${Math.abs(Number(familyStats.averageExcessReturn)).toFixed(2)}%，超额胜率${Number(familyStats.outperformRate).toFixed(1)}%`
     : '本地同类推荐样本不足，暂不调整';
   const technicalSummary = technicalStats
-    ? `；技术分${technicalScoreBand}样本${technicalStats.count}条，同批次平均${technicalStats.averageExcessReturn >= 0 ? '跑赢' : '跑输'}${Math.abs(Number(technicalStats.averageExcessReturn)).toFixed(2)}%`
+    ? `；${technicalRecent ? '近期' : ''}技术分${technicalScoreBand}样本${technicalStats.count}条，平均累计${signedPercent(technicalStats.averageReturn)}，胜率${Number(technicalStats.winRate).toFixed(1)}%，同批次平均${technicalStats.averageExcessReturn >= 0 ? '跑赢' : '跑输'}${Math.abs(Number(technicalStats.averageExcessReturn)).toFixed(2)}%`
+    : '';
+  const longTermTechnicalSummary = technicalRecent && Number(longTermTechnicalStats?.count) > Number(technicalStats?.count)
+    ? `；长期技术分${technicalScoreBand}样本${longTermTechnicalStats.count}条，平均累计${signedPercent(longTermTechnicalStats.averageReturn)}，胜率${Number(longTermTechnicalStats.winRate).toFixed(1)}%，同批次平均${longTermTechnicalStats.averageExcessReturn >= 0 ? '跑赢' : '跑输'}${Math.abs(Number(longTermTechnicalStats.averageExcessReturn)).toFixed(2)}%`
     : '';
   return {
     family,
@@ -1779,14 +1784,16 @@ function calibrateRecommendationWithOutcomes(item, profile) {
     familyStats,
     scoreStats,
     technicalStats,
+    longTermTechnicalStats,
+    technicalRecent,
     recent,
-    summary: `${summary}${technicalSummary}`
+    summary: `${summary}${technicalSummary}${longTermTechnicalSummary}`
   };
 }
 
 function recommendationPassesOutcomeGate(item) {
   return Number(item?.signalScore) >= 65
-    && !(item?.outcomeCalibration?.caution && Number(item?.technicalScore) < 55);
+    && Number(item?.technicalScore) >= 55;
 }
 
 function applyOutcomeFeedbackAssessment(analysis, profile) {
@@ -1798,30 +1805,41 @@ function applyOutcomeFeedbackAssessment(analysis, profile) {
           : '待突破';
   const outcome = calibrateRecommendationWithOutcomes({ signal, technicalScore: analysis.score }, profile);
   const strategyDrawdown = profile.marketRisk?.status === 'drawdown';
+  const severeTechnicalHistory = outcome.technicalScoreBand === '<55'
+    && [outcome.technicalStats, outcome.longTermTechnicalStats].some(stats => Number(stats?.count) >= 20
+      && Number(stats?.averageReturn) <= -5
+      && Number(stats?.winRate) < 20);
   const riskSummary = strategyDrawdown
     ? `最近${profile.recentCohortCount || '--'}个版本成熟推荐${profile.marketRisk.count}条，平均累计${signedPercent(profile.marketRisk.averageReturn)}、胜率${Number(profile.marketRisk.winRate).toFixed(1)}%，处于策略回撤。`
     : '';
-  if (!outcome.familyStats && !strategyDrawdown) return { ...analysis, historicalOutcomeAssessment: outcome };
+  if (!outcome.familyStats && !outcome.technicalStats && !strategyDrawdown) return { ...analysis, historicalOutcomeAssessment: outcome };
   const currentStrong = Number(analysis.score) >= 70
     && Number(analysis.capitalAdjustedScore ?? analysis.score) >= 70
     && Number(analysis.capitalSetupAssessment?.scoreAdjustment || 0) >= 3;
   const summary = `${outcome.summary}。${riskSummary}${outcome.caution || strategyDrawdown
     ? currentStrong ? '当前技术与资金确认较强，不据此一票否决。' : '当前确认不足，历史结果和策略回撤只作为降级依据，不替代实时行情判断。'
     : '历史结果仅用于辅助判断，不替代实时行情、资金和消息。'}`;
-  if (!((outcome.caution || strategyDrawdown) && analysis.entryAssessment?.allowed && !currentStrong)) {
+  const feedbackGate = (outcome.caution || strategyDrawdown)
+    && analysis.entryAssessment?.allowed && !currentStrong;
+  if (!severeTechnicalHistory && !feedbackGate) {
     return { ...analysis, historicalOutcomeAssessment: { ...outcome, summary } };
   }
+  const preserveCurrentStatus = ['破位', '爆量观察', '结构偏弱', '不宜追高', '公司风险']
+    .includes(analysis.entryAssessment?.status);
   const entryAssessment = {
     ...analysis.entryAssessment,
     allowed: false,
-    status: outcome.caution ? '历史样本偏弱，等待确认' : '策略回撤，等待确认',
+    status: severeTechnicalHistory && !preserveCurrentStatus ? '历史同类技术分偏弱，不建议入场'
+      : feedbackGate ? outcome.caution ? '历史样本偏弱，等待确认' : '策略回撤，等待确认'
+        : analysis.entryAssessment.status,
     tone: 'warning',
     summary: `${analysis.entryAssessment.summary} ${summary}`,
     evidence: [...new Set([...(analysis.entryAssessment.evidence || []), outcome.summary])]
   };
   return {
     ...analysis,
-    verdict: analysis.verdict === '可关注' ? '等待确认' : analysis.verdict,
+    verdict: severeTechnicalHistory ? '暂不适合'
+      : analysis.verdict === '可关注' ? '等待确认' : analysis.verdict,
     buyCondition: entryAssessment.summary,
     tradePlan: analysis.tradePlan ? { ...analysis.tradePlan, enabled: false } : analysis.tradePlan,
     entryAssessment,
@@ -2057,6 +2075,7 @@ async function fetchMarketNews(force = false) {
   const cached = force ? null : readTimedCache(marketNewsCache, combinedKey, maxAgeMs);
   if (cached) return { ...cached, cached: true };
   const previous = marketNewsCache.get(combinedKey)?.value;
+  const keyword = 'A股 大盘 板块 资金 今日 最新消息';
   const errors = [];
   const collected = [];
   const sources = [];
@@ -2298,9 +2317,10 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
     const newsContext = newsResult.status === 'fulfilled'
       ? summarizeNews(newsResult.value.news, windowStart, { subject: item.name, code: item.code, ...newsResult.value })
       : summarizeNews([], windowStart);
-    const entryAnalysis = applyEntryContextAssessment(capitalAnalysis, {
+    const contextualAnalysis = applyEntryContextAssessment(capitalAnalysis, {
       newsContext, marketOverview: marketAssessmentContext
     });
+    const entryAnalysis = applyOutcomeFeedbackAssessment(contextualAnalysis, outcomeProfile);
     const entryAssessment = entryAnalysis.entryAssessment;
     if (entryAssessment?.setupType === 'bottom-accumulation') signal = '底部吸筹';
     else if (entryAssessment?.setupType === 'sideways-washout') signal = '震荡洗盘';
@@ -3806,6 +3826,34 @@ function normalizeHistoryRows(rows) {
   }).filter(row => row.date && row.close != null && row.high != null && row.low != null);
 }
 
+function aggregateHistoryPeriod(rows, period) {
+  const groups = new Map();
+  normalizeHistoryRows(rows).forEach(row => {
+    const date = new Date(`${row.date}T00:00:00Z`);
+    if (!Number.isFinite(date.getTime())) return;
+    if (period === 'week') date.setUTCDate(date.getUTCDate() - (date.getUTCDay() + 6) % 7);
+    const key = period === 'month' ? row.date.slice(0, 7) : date.toISOString().slice(0, 10);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(row);
+  });
+  return [...groups.values()].map(group => {
+    const first = group[0];
+    const last = group.at(-1);
+    const candle = {
+      date: last.date,
+      open: first.open,
+      high: Math.max(...group.map(row => row.high)),
+      low: Math.min(...group.map(row => row.low)),
+      close: last.close,
+      volume: group.reduce((sum, row) => sum + (row.volume || 0), 0)
+    };
+    if (group.some(row => Number.isFinite(row.amount))) {
+      candle.amount = group.reduce((sum, row) => sum + (row.amount || 0), 0);
+    }
+    return candle;
+  });
+}
+
 function mergeQuoteIntoHistory(history, quote) {
   const merged = [...(history || [])];
   if (!quote?.tradeDate || !(quote.price > 0)) return merged;
@@ -3831,9 +3879,10 @@ async function fetchTencentHistory(code, count = 120) {
   return normalizeHistoryRows(data.qfqday || data.day || []);
 }
 
-async function fetchSinaHistory(code) {
+async function fetchSinaHistory(code, count = 66) {
   const symbol = `${marketPrefixOf(code)}${code}`;
-  const text = await getText(`https://quotes.sina.cn/cn/api/jsonp_v2.php/var%20history=/CN_MarketDataService.getKLineData?symbol=${symbol}&scale=240&ma=no&datalen=66`, { Referer: 'https://finance.sina.com.cn/' });
+  const safeCount = Math.max(20, Math.min(1000, Number(count) || 66));
+  const text = await getText(`https://quotes.sina.cn/cn/api/jsonp_v2.php/var%20history=/CN_MarketDataService.getKLineData?symbol=${symbol}&scale=240&ma=no&datalen=${safeCount}`, { Referer: 'https://finance.sina.com.cn/' });
   const jsonText = (text.match(/=\s*\(([\s\S]*?)\);?\s*$/) || [])[1];
   if (!jsonText) throw new Error('新浪日线返回格式异常');
   return normalizeHistoryRows(JSON.parse(jsonText));
@@ -4552,10 +4601,12 @@ async function fetchStockChart({ code, period, force = false }) {
       const data = json?.data?.[symbol] || {};
       rows = normalizeHistoryRows(data[`qfq${frequency}`] || data[frequency] || []).map(row => ({ ...row, time: row.date }));
       source = `腾讯前复权${safePeriod === 'day' ? '日K' : safePeriod === 'week' ? '周K' : '月K'}`;
+      if (rows.length < 10) throw new Error(`${source}返回数据不足`);
     } catch (tencentError) {
-      if (safePeriod !== 'day') throw tencentError;
-      rows = (await fetchSinaHistory(code)).map(row => ({ ...row, time: row.date }));
-      source = '新浪日K（腾讯接口异常后备用）';
+      const dailyRows = await fetchSinaHistory(code, safePeriod === 'day' ? 160 : 800);
+      rows = (safePeriod === 'day' ? dailyRows : aggregateHistoryPeriod(dailyRows, safePeriod))
+        .map(row => ({ ...row, time: row.date }));
+      source = `新浪${safePeriod === 'day' ? '日K' : safePeriod === 'week' ? '日线聚合周K' : '日线聚合月K'}（腾讯接口异常后备用）`;
     }
   }
   const minimumRows = safePeriod === 'minute' ? 1 : 10;
@@ -4995,6 +5046,7 @@ module.exports = {
   analyzeHistory,
   buildTradePlan,
   mergeQuoteIntoHistory,
+  aggregateHistoryPeriod,
   parseReductionPlanWindow,
   parseJin10FlashItems,
   classifyMarketNewsIssues,
