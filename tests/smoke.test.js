@@ -323,7 +323,7 @@ test('本轮大盘推荐为空时保留最近成功推荐并刷新行情', () =>
   const result = { recommendations: [], recommendationCoverage: { scanned: 5892 } };
   const cached = {
     fetchedAt: '2026-08-13T08:00:00.000Z',
-    recommendations: [{ code:'600001', name:'测试股', signal:'待突破', price:10, factorAnalysis:{sectorProfile:{name:'半导体'}} }],
+    recommendations: [{ code:'600001', name:'测试股', signal:'突破确认', signalScore:72, technicalScore:75, price:10, factorAnalysis:{sectorProfile:{name:'半导体'}} }],
     recommendationCoverage: { scanned:5892, prefiltered:400, analyzed:60, industries:40, qualified:1 }
   };
   const restored = restoreCachedMarketRecommendations(result, cached, [{ code:'600001', price:10.8, changePct:2.5, amount:1e8 }]);
@@ -340,6 +340,17 @@ test('本轮大盘推荐为空时保留最近成功推荐并刷新行情', () =>
   const fresh = { recommendations:[{code:'600002'}] };
   assert.equal(restoreCachedMarketRecommendations(fresh, cached, []), false);
   assert.deepEqual(fresh.recommendations, [{code:'600002'}]);
+
+  const obsolete = {
+    fetchedAt: '2026-08-12T08:00:00.000Z',
+    recommendations: [
+      { code:'600003', signal:'待突破', signalScore:90, technicalScore:90 },
+      { code:'600004', signal:'突破确认', signalScore:80, technicalScore:60 }
+    ]
+  };
+  const empty = { recommendations: [] };
+  assert.equal(restoreCachedMarketRecommendations(empty, obsolete, []), false);
+  assert.deepEqual(empty.recommendations, []);
 });
 
 test('command input uses a focus-hidden recommendation prompt', () => {
@@ -643,7 +654,10 @@ test('大盘分析返回指数、轮动、资金和涨跌停结构', { timeout: 
   assert.equal(Object.values(result.recommendationCoverage.signals).reduce((sum, count) => sum + count, 0), result.recommendations.length);
   assert.ok(result.recommendations.every(item => item.score === item.signalScore && Number.isFinite(item.technicalScore)));
   assert.ok(result.recommendations.every(item => item.signalScore >= 65));
-  assert.ok(result.recommendations.every(item => item.technicalScore >= 55));
+  assert.ok(result.recommendations.every(item => item.technicalScore >= 65));
+  assert.ok(result.recommendations.every(item => [
+    '突破确认', '突破蓄势', '接近突破', '底部吸筹', '震荡洗盘'
+  ].includes(item.signal)));
   assert.ok(result.recommendations.every(item => item.entryAssessment?.status));
   assert.ok(result.recommendations.every(item => !['破位', '爆量观察', '结构偏弱', '不宜追高', '公司风险'].includes(item.entryAssessment.status)));
   assert.ok(result.recommendations.every(item => /综合入场/.test(item.reason)));
@@ -1152,11 +1166,13 @@ test('系统性下跌时按同批次超额收益评价选股而不是把全部�
   assert.match(result.summary, /平均累计-5\.00%.*同批次平均跑赢2\.40%/);
 });
 
-test('推荐统一守住65分和55技术分门槛', () => {
-  assert.equal(recommendationPassesOutcomeGate({signalScore:64, technicalScore:80, outcomeCalibration:{caution:false}}), false);
-  assert.equal(recommendationPassesOutcomeGate({signalScore:80, technicalScore:54, outcomeCalibration:{caution:true}}), false);
-  assert.equal(recommendationPassesOutcomeGate({signalScore:80, technicalScore:55, outcomeCalibration:{caution:true}}), true);
-  assert.equal(recommendationPassesOutcomeGate({signalScore:68, technicalScore:42, outcomeCalibration:{caution:false}}), false);
+test('推荐只保留65分以上且结构明确的高技术分候选', () => {
+  assert.equal(recommendationPassesOutcomeGate({signal:'突破确认', signalScore:64, technicalScore:80}), false);
+  assert.equal(recommendationPassesOutcomeGate({signal:'突破确认', signalScore:80, technicalScore:64}), false);
+  assert.equal(recommendationPassesOutcomeGate({signal:'突破确认', signalScore:65, technicalScore:65}), true);
+  assert.equal(recommendationPassesOutcomeGate({signal:'底部吸筹', signalScore:68, technicalScore:75}), true);
+  assert.equal(recommendationPassesOutcomeGate({signal:'待突破', signalScore:82, technicalScore:85}), false);
+  assert.equal(recommendationPassesOutcomeGate({signal:'已反弹', signalScore:82, technicalScore:85}), false);
 });
 
 test('个股分析仅在当前确认不足时采用负向历史反馈降级', () => {
@@ -1235,6 +1251,29 @@ test('近期跌幅收窄不掩盖低技术分长期风险', () => {
   assert.equal(result.entryAssessment.status, '历史同类技术分偏弱，不建议入场');
   assert.equal(result.tradePlan.enabled, false);
   assert.match(result.historicalOutcomeAssessment.summary, /近期技术分<55样本7条.*长期技术分<55样本130条/);
+});
+
+test('技术分55至64历史胜率不足时个股只做观察', () => {
+  const weakMiddle = {
+    count:32, cohortCount:15, averageReturn:.14, medianReturn:-1.3, winRate:40.6,
+    averageExcessReturn:2.12, medianExcessReturn:1.2, outperformRate:65.6
+  };
+  const result = applyOutcomeFeedbackAssessment({
+    score:61, capitalAdjustedScore:67, verdict:'可关注',
+    capitalSetupAssessment:{scoreAdjustment:4},
+    entryAssessment:{allowed:true, status:'可分批入场', tone:'positive', summary:'资金出现承接。', evidence:[]},
+    tradePlan:{enabled:true}
+  }, {
+    sampleSize:247,
+    byRecentSignal:{}, bySignal:{}, byRecentFamily:{}, byFamily:{},
+    byRecentScoreBand:{}, byScoreBand:{}, byRecentTechnicalScoreBand:{},
+    byTechnicalScoreBand:{'55-64':weakMiddle}, marketRisk:{status:'normal'}
+  });
+  assert.equal(result.entryAssessment.allowed, false);
+  assert.equal(result.entryAssessment.status, '历史技术分未达到有效区间，等待确认');
+  assert.equal(result.tradePlan.enabled, false);
+  assert.equal(result.verdict, '等待确认');
+  assert.match(result.historicalOutcomeAssessment.summary, /技术分55-64样本32条，平均累计\+0\.14%，胜率40\.6%/);
 });
 
 test('消息面和大盘环境会调整个股及大盘推荐入场结论', () => {

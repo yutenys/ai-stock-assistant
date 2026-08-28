@@ -1793,7 +1793,8 @@ function calibrateRecommendationWithOutcomes(item, profile) {
 
 function recommendationPassesOutcomeGate(item) {
   return Number(item?.signalScore) >= 65
-    && Number(item?.technicalScore) >= 55;
+    && Number(item?.technicalScore) >= 65
+    && ['突破确认', '突破蓄势', '接近突破', '底部吸筹', '震荡洗盘'].includes(item?.signal);
 }
 
 function applyOutcomeFeedbackAssessment(analysis, profile) {
@@ -1809,6 +1810,9 @@ function applyOutcomeFeedbackAssessment(analysis, profile) {
     && [outcome.technicalStats, outcome.longTermTechnicalStats].some(stats => Number(stats?.count) >= 20
       && Number(stats?.averageReturn) <= -5
       && Number(stats?.winRate) < 20);
+  const middleTechnicalHistory = outcome.technicalScoreBand === '55-64'
+    && [outcome.technicalStats, outcome.longTermTechnicalStats].some(stats => Number(stats?.count) >= 20
+      && (Number(stats?.averageReturn) < .5 || Number(stats?.winRate) < 50));
   const riskSummary = strategyDrawdown
     ? `最近${profile.recentCohortCount || '--'}个版本成熟推荐${profile.marketRisk.count}条，平均累计${signedPercent(profile.marketRisk.averageReturn)}、胜率${Number(profile.marketRisk.winRate).toFixed(1)}%，处于策略回撤。`
     : '';
@@ -1816,12 +1820,13 @@ function applyOutcomeFeedbackAssessment(analysis, profile) {
   const currentStrong = Number(analysis.score) >= 70
     && Number(analysis.capitalAdjustedScore ?? analysis.score) >= 70
     && Number(analysis.capitalSetupAssessment?.scoreAdjustment || 0) >= 3;
-  const summary = `${outcome.summary}。${riskSummary}${outcome.caution || strategyDrawdown
-    ? currentStrong ? '当前技术与资金确认较强，不据此一票否决。' : '当前确认不足，历史结果和策略回撤只作为降级依据，不替代实时行情判断。'
+  const downgradeBasis = strategyDrawdown ? '历史结果和策略回撤' : '历史结果';
+  const summary = `${outcome.summary}。${riskSummary}${outcome.caution || strategyDrawdown || severeTechnicalHistory || middleTechnicalHistory
+    ? currentStrong ? '当前技术与资金确认较强，不据此一票否决。' : `当前确认不足，${downgradeBasis}只作为降级依据，不替代实时行情判断。`
     : '历史结果仅用于辅助判断，不替代实时行情、资金和消息。'}`;
   const feedbackGate = (outcome.caution || strategyDrawdown)
     && analysis.entryAssessment?.allowed && !currentStrong;
-  if (!severeTechnicalHistory && !feedbackGate) {
+  if (!severeTechnicalHistory && !middleTechnicalHistory && !feedbackGate) {
     return { ...analysis, historicalOutcomeAssessment: { ...outcome, summary } };
   }
   const preserveCurrentStatus = ['破位', '爆量观察', '结构偏弱', '不宜追高', '公司风险']
@@ -1830,6 +1835,7 @@ function applyOutcomeFeedbackAssessment(analysis, profile) {
     ...analysis.entryAssessment,
     allowed: false,
     status: severeTechnicalHistory && !preserveCurrentStatus ? '历史同类技术分偏弱，不建议入场'
+      : middleTechnicalHistory && !preserveCurrentStatus ? '历史技术分未达到有效区间，等待确认'
       : feedbackGate ? outcome.caution ? '历史样本偏弱，等待确认' : '策略回撤，等待确认'
         : analysis.entryAssessment.status,
     tone: 'warning',
@@ -1839,6 +1845,7 @@ function applyOutcomeFeedbackAssessment(analysis, profile) {
   return {
     ...analysis,
     verdict: severeTechnicalHistory ? '暂不适合'
+      : middleTechnicalHistory && analysis.verdict === '可关注' ? '等待确认'
       : analysis.verdict === '可关注' ? '等待确认' : analysis.verdict,
     buyCondition: entryAssessment.summary,
     tradePlan: analysis.tradePlan ? { ...analysis.tradePlan, enabled: false } : analysis.tradePlan,
@@ -1849,8 +1856,13 @@ function applyOutcomeFeedbackAssessment(analysis, profile) {
 
 function restoreCachedMarketRecommendations(result, cachedOverview, marketQuotes = []) {
   if ((result.recommendations || []).length || !(cachedOverview?.recommendations || []).length) return false;
+  const eligibleRecommendations = cachedOverview.recommendations.filter(item =>
+    recommendationPassesOutcomeGate(item)
+    && !['破位', '爆量观察', '结构偏弱', '不宜追高', '公司风险'].includes(item.entryAssessment?.status)
+  );
+  if (!eligibleRecommendations.length) return false;
   const quoteByCode = new Map((marketQuotes || []).map(item => [item.code, item]));
-  result.recommendations = cachedOverview.recommendations.map(item => {
+  result.recommendations = eligibleRecommendations.map(item => {
     const quote = quoteByCode.get(item.code);
     const entryAssessment = item.entryAssessment || {
       allowed: false, status: '数据待补充', tone: 'neutral',
