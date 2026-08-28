@@ -69,7 +69,7 @@ app.whenReady().then(async () => {
       })),
       source: `金十数据快讯 + 新浪财经滚动#${liveNewsRequestCount}`,
       fetchedAt: new Date(2026, 7, 12, 14, 10, liveNewsRequestCount).toISOString(),
-      errors: []
+      errors: ['金十连接暂不可用', '财经滚动连接暂不可用']
     });
   });
   ipcMain.handle('fetch-stock-history', async (_event, request) => {
@@ -664,6 +664,10 @@ app.whenReady().then(async () => {
     const secondFirstTitle = document.querySelector('.live-news-row .live-news-title')?.innerText || '';
     document.querySelector('[data-live-news-refresh]').click();
     await new Promise(resolve => setTimeout(resolve, 120));
+    const notice = document.getElementById('statusNotice');
+    const noticeRect = notice.getBoundingClientRect();
+    const commandRect = document.getElementById('commandInput').getBoundingClientRect();
+    const searchRect = document.getElementById('searchInput').getBoundingClientRect();
     return {
       active:document.getElementById('liveNewsView').classList.contains('active'),
       countText:document.querySelector('.portfolio-head-actions span')?.innerText || '',
@@ -680,7 +684,11 @@ app.whenReady().then(async () => {
       secondPageText,
       secondFirstTitle,
       refreshedSource:document.querySelector('.live-news-toolbar span')?.innerText || '',
-      refreshText:document.querySelector('[data-live-news-refresh]')?.innerText || ''
+      refreshText:document.querySelector('[data-live-news-refresh]')?.innerText || '',
+      noticeText:notice.innerText,
+      noticeCentered:Math.abs((noticeRect.left + noticeRect.width / 2) - document.documentElement.clientWidth / 2) < 2,
+      noticePointerEvents:getComputedStyle(notice).pointerEvents,
+      noticeAvoidsControls:noticeRect.bottom <= commandRect.top && noticeRect.bottom <= searchRect.top
     };
   })()`);
   const scoreConsistencyState = await win.webContents.executeJavaScript(`(async () => {
@@ -973,7 +981,11 @@ app.whenReady().then(async () => {
     && state.liveNewsState.secondPageText.includes('2/3')
     && state.liveNewsState.secondFirstTitle === '实时财经新闻9'
     && state.liveNewsState.refreshedSource.includes('#2')
-    && state.liveNewsState.refreshText === '刷新';
+    && state.liveNewsState.refreshText === '刷新'
+    && state.liveNewsState.noticeText === '实时新闻已更新 17 条，2 个来源暂不可用，已自动切换备用来源'
+    && state.liveNewsState.noticeCentered
+    && state.liveNewsState.noticePointerEvents === 'none'
+    && state.liveNewsState.noticeAvoidsControls;
   const chartUsable = state.chartState.nonBlank
     && state.chartState.rendered.every(Boolean)
     && state.chartState.interaction.locked === 'true'

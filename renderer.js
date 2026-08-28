@@ -168,6 +168,7 @@ function notify(message, type='info'){
   const box = $('statusNotice');
   if(box){
     box.textContent = message;
+    box.title = message;
     box.className = `status-notice ${type}`;
     clearTimeout(notify.timer);
     notify.timer = setTimeout(() => box.classList.add('hidden'), 5000);
@@ -748,7 +749,7 @@ function renderLiveNewsView(){
     </div>
     <div class="portfolio-batch-toolbar live-news-toolbar"><button class="small" data-live-news-page="prev" ${liveNewsPage <= 0 ? 'disabled' : ''}>上一页</button><button class="small" data-live-news-page="next" ${liveNewsPage >= totalPages - 1 ? 'disabled' : ''}>下一页</button><span>${escapeHtml(liveNewsMeta?.source || '等待获取来源')}</span></div>
     ${rows ? `<div class="live-news-list">${rows}</div>` : `<div class="portfolio-empty">${liveNewsRefreshing ? '正在获取实时新闻...' : '暂无实时新闻，点击刷新重试。'}</div>`}
-    ${liveNewsMeta?.errors?.length ? `<div class="note inline-note">部分来源异常：${escapeHtml(liveNewsMeta.errors.join('；'))}</div>` : ''}
+    ${liveNewsMeta?.errors?.length ? `<div class="note inline-note">部分来源暂不可用，当前数据已由备用来源提供：${escapeHtml(liveNewsMeta.errors.join('；'))}</div>` : ''}
   </section>`;
 }
 
@@ -791,7 +792,10 @@ async function refreshLiveNews(force=true){
     liveNewsItems = result.news || [];
     liveNewsMeta = result;
     liveNewsPage = 0;
-    notify(result.errors?.length ? `实时新闻已更新 ${liveNewsItems.length} 条，部分来源异常` : `实时新闻已更新 ${liveNewsItems.length} 条`, result.errors?.length ? 'warn' : 'success');
+    const unavailableSources = result.errors?.length || 0;
+    notify(unavailableSources
+      ? `实时新闻已更新 ${liveNewsItems.length} 条，${unavailableSources} 个来源暂不可用，已自动切换备用来源`
+      : `实时新闻已更新 ${liveNewsItems.length} 条`, unavailableSources ? 'info' : 'success');
   }catch(err){
     liveNewsMeta = {news:liveNewsItems, errors:[err.message || String(err)], fetchedAt:new Date().toISOString(), source:liveNewsMeta?.source || '', stale:true};
     notify(`实时新闻刷新失败：${err.message || err}`, 'error');
