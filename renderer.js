@@ -102,7 +102,9 @@ function favoriteOutcomeRows(){
     price:stock.price,
     signal:stock.marketSignal || stock.signal || stock.type || stock.status,
     signalScore:stock.signalScore,
-    technicalScore:stock.technicalScore
+    technicalScore:stock.technicalScore,
+    recommendationModelVersion:stock.recommendationModelVersion || '',
+    recommendationContext:stock.recommendationContext || null
   })));
 }
 
@@ -1600,7 +1602,10 @@ async function fetchStockAnalysis(s, force=false){
   if(!window.stockApi?.fetchStockHistory) return null;
   const pendingKey = s.code;
   if(detailHistoryPending.has(pendingKey)) return detailHistoryPending.get(pendingKey);
-  const pending = window.stockApi.fetchStockHistory({code:s.code, name:s.name, force, favoriteOutcomes:favoriteOutcomeRows()})
+  const pending = window.stockApi.fetchStockHistory({
+    code:s.code, name:s.name, industry:s.industry || s.actualIndustry || '', sector:s.sector || '',
+    force, favoriteOutcomes:favoriteOutcomeRows()
+  })
     .then(result => {
       detailHistoryCache.set(s.code, result);
       applyAnalysisClassification(s.code);

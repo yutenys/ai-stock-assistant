@@ -24,6 +24,7 @@ let boardDirectoryFetchedAt = 0;
 let marketDirectorySavedAt = 0;
 const CONTROLLED_VOLUME_MIN = 1.5;
 const CONTROLLED_VOLUME_MAX = 4;
+const RECOMMENDATION_MODEL_VERSION = '2026-08-31-capital-news-global-v1';
 
 function isControlledVolumeExpansion(value) {
   const ratio = Number(value);
@@ -1393,7 +1394,32 @@ function applyIndividualCapitalAssessment(analysis, flow) {
   };
 }
 
-function applyEntryContextAssessment(analysis, { newsContext = null, riskProfile = null, marketOverview = null, marketNewsContext = null } = {}) {
+async function getTextWithRetry(url, extraHeaders = {}, encoding = 'utf8', retries = 2) {
+  let lastError;
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return await getText(url, extraHeaders, encoding);
+    } catch (err) {
+      lastError = err;
+      if (i < retries) await sleep(400 * (i + 1));
+    }
+  }
+  throw lastError;
+}
+
+function isUSGrowthSensitive(subject) {
+  const text = [subject?.industry, subject?.sector, subject?.name, subject?.company].filter(Boolean).join(' ');
+  return /半导体|芯片|电子|通信|软件|计算机|信息技术|人工智能|AI|算力|服务器|光模块|机器人/.test(text);
+}
+
+function globalMarketRiskAdjustment(overseas, subject) {
+  if (!overseas?.available || overseas.severity === 'low') return 0;
+  const base = Number(overseas.riskAdjustment) || 0;
+  if (isUSGrowthSensitive(subject)) return overseas.severity === 'high' ? Math.min(base, -10) : Math.min(base, -5);
+  return overseas.severity === 'high' ? Math.min(base, -4) : 0;
+}
+
+function applyEntryContextAssessment(analysis, { newsContext = null, riskProfile = null, marketOverview = null, marketNewsContext = null, subject = null } = {}) {
   if (!analysis?.entryAssessment) return analysis;
   const entry = analysis.entryAssessment;
   const evidence = [...(entry.evidence || [])];
@@ -1413,11 +1439,16 @@ function applyEntryContextAssessment(analysis, { newsContext = null, riskProfile
     || up > 0 && up > down * 1.3;
   const marketLabel = marketWeak ? '偏弱' : marketStrong ? '偏强' : '分化';
   evidence.push(`大盘环境${marketLabel}`);
+  const overseas = marketOverview?.overseas;
+  const hasOverseas = Boolean(overseas && overseas.available !== false);
+  if (hasOverseas) evidence.push(overseas.summary);
+  const overseasSummary = hasOverseas ? `，${overseas.summary}` : '';
+  const usGrowthRisk = hasOverseas && overseas.severity === 'high' && isUSGrowthSensitive(subject);
 
   let entryAssessment = {
     ...entry,
     evidence: [...new Set(evidence)],
-    summary: `${entry.summary} 消息面${hasNews ? `${newsSignal}（${newsContext?.freshness || '时效未知'}）` : '暂无可核验资讯'}，大盘环境${marketLabel}。`
+    summary: `${entry.summary} 消息面${hasNews ? `${newsSignal}（${newsContext?.freshness || '时效未知'}）` : '暂无可核验资讯'}，大盘环境${marketLabel}${overseasSummary}。`
   };
   if (riskProfile?.status === 'risk') {
     entryAssessment = { ...entryAssessment, allowed: false, status: '公司风险', tone: 'negative', summary: `${entryAssessment.summary} 未来半年存在已核验公司风险，当前不建议入场。` };
@@ -1427,6 +1458,8 @@ function applyEntryContextAssessment(analysis, { newsContext = null, riskProfile
     entryAssessment = { ...entryAssessment, allowed: false, status: '大盘消息风险待确认', tone: 'warning', summary: `${entryAssessment.summary} 大盘近期风险消息偏多，等待市场宽度和资金重新确认。` };
   } else if (marketWeak && entryAssessment.allowed) {
     entryAssessment = { ...entryAssessment, allowed: false, status: '大盘偏弱，等待确认', tone: 'warning', summary: `${entryAssessment.summary} 市场下跌家数或指数跌幅偏大，暂缓入场。` };
+  } else if (usGrowthRisk && entryAssessment.allowed) {
+    entryAssessment = { ...entryAssessment, allowed: false, status: '美股科技风险待确认', tone: 'warning', summary: `${entryAssessment.summary} 海外科技风险偏高，等待A股价格、量能和阶段资金重新确认。` };
   }
   const blocked = Boolean(entry.allowed && !entryAssessment.allowed);
   const verdict = entryAssessment.status === '公司风险' ? '暂不适合介入'
@@ -1488,8 +1521,9 @@ function evaluateRecommendationFactors(item, context, newsContext, financialAnal
     context?.breadth ? `全市场上涨${context.breadth.up}只、下跌${context.breadth.down}只` : '全市场宽度不可用', Boolean(context?.breadth));
 
   const newsAvailable = Boolean(newsContext?.items?.length);
-  add('catalyst', '成长/创新催化', newsContext?.factorScore ?? (newsContext?.signal === '偏积极' ? 82 : newsContext?.signal === '偏谨慎' ? 25 : 50),
-    newsAvailable ? newsContext.summary : '未获取到可核验的近期消息', newsAvailable);
+  const newsAssessment = assessRecommendationNewsConfirmation(item, newsContext);
+  add('catalyst', '成长/创新催化', newsAssessment.factorScore,
+    newsAvailable ? newsAssessment.evidence : '未获取到可核验的近期消息', newsAvailable);
   add('currentEarnings', 'C 当季盈利', financialAnalysis?.current?.score || 0,
     financialAnalysis?.current?.evidence || '季度EPS/净利润增长序列不可用', Boolean(financialAnalysis?.current?.available));
   add('annualEarnings', 'A 年度盈利', financialAnalysis?.annual?.score || 0,
@@ -1535,6 +1569,89 @@ function recommendationSignalFamily(signal) {
   if (['底部吸筹', '震荡洗盘'].includes(signal)) return 'structure';
   if (['待突破', '横盘观察', '突破蓄势', '接近突破', '突破确认'].includes(signal)) return 'breakout';
   return 'other';
+}
+
+function assessRecommendationNewsConfirmation(item, newsContext = {}) {
+  const signal = newsContext?.signal || '中性';
+  if (signal === '偏谨慎') return {
+    label: '消息谨慎', confirmed: false,
+    factorScore: finiteNumber(newsContext.factorScore) ?? 25,
+    evidence: newsContext.summary || '近期存在风险消息'
+  };
+  if (signal !== '偏积极') return {
+    label: '消息中性', confirmed: false,
+    factorScore: finiteNumber(newsContext.factorScore) ?? 50,
+    evidence: newsContext.summary || '消息面中性'
+  };
+  const flow = item?.fundFlowPeriod;
+  const technicalConfirmed = Number(item?.analysis?.score ?? item?.technicalScore) >= 65;
+  const capitalConfirmed = Boolean(flow?.available && flow.days > 0 && flow.mainNetInflow > 0
+    && Number(flow.netRatio) > 0 && flow.positiveDays >= Math.ceil(flow.days * .6));
+  const confirmed = technicalConfirmed && capitalConfirmed;
+  return {
+    label: confirmed ? '消息确认' : '消息中性',
+    confirmed,
+    factorScore: confirmed ? finiteNumber(newsContext.factorScore) ?? 70 : Math.min(50, finiteNumber(newsContext.factorScore) ?? 50),
+    evidence: confirmed
+      ? `${newsContext.summary || '存在正向消息'} 技术与阶段资金同步确认。`
+      : `${newsContext.summary || '存在正向消息'} 但阶段资金未确认，不将正向标题作为推荐加分依据。`
+  };
+}
+
+function parseTencentGlobalIndices(text) {
+  const symbolCodes = { usDJI: 'DJI', usIXIC: 'IXIC', usINX: 'INX' };
+  return String(text || '').split(/\r?\n/).map(line => {
+    const symbol = (line.match(/^v_([A-Za-z0-9]+)=/) || [])[1] || '';
+    const body = (line.match(/="([\s\S]*?)"/) || [])[1] || '';
+    const cols = body.split('~');
+    const price = finiteNumber(cols[3]);
+    const changePct = finiteNumber(cols[32]);
+    if (!symbolCodes[symbol] || price == null || changePct == null) return null;
+    return {
+      code: symbolCodes[symbol],
+      name: cleanStockName(cols[1]),
+      price,
+      change: finiteNumber(cols[31]),
+      changePct,
+      high: finiteNumber(cols[33]),
+      low: finiteNumber(cols[34]),
+      tradeTime: String(cols[30] || '').trim()
+    };
+  }).filter(Boolean);
+}
+
+function assessGlobalMarketContext(indices, source = '腾讯美股实时行情') {
+  const valid = (indices || []).filter(item => finiteNumber(item?.changePct) !== null);
+  if (!valid.length) return {
+    available: false, indices: [], signal: '数据不足', severity: 'unknown',
+    averageChangePct: null, riskAdjustment: 0, summary: '美股市场数据不可用，本次不据此调整评分', source
+  };
+  const averageChangePct = average(valid.map(item => Number(item.changePct)));
+  const nasdaqChangePct = finiteNumber(valid.find(item => item.code === 'IXIC')?.changePct);
+  const severity = averageChangePct <= -1.2 || nasdaqChangePct !== null && nasdaqChangePct <= -1.8 ? 'high'
+    : averageChangePct <= -.5 || nasdaqChangePct !== null && nasdaqChangePct <= -1 ? 'medium' : 'low';
+  const signal = severity !== 'low' ? '偏弱' : averageChangePct >= .7 && (nasdaqChangePct === null || nasdaqChangePct >= .5) ? '偏强' : '中性';
+  const riskAdjustment = severity === 'high' ? -8 : severity === 'medium' ? -4 : 0;
+  const indexText = valid.map(item => `${item.name}${Number(item.changePct) >= 0 ? '+' : ''}${Number(item.changePct).toFixed(2)}%`).join('、');
+  return {
+    available: true,
+    indices: valid,
+    signal,
+    severity,
+    averageChangePct: Math.round(averageChangePct * 100) / 100,
+    nasdaqChangePct,
+    riskAdjustment,
+    summary: `美股最近交易日${indexText}，三大指数平均${averageChangePct >= 0 ? '上涨' : '下跌'}${Math.abs(averageChangePct).toFixed(2)}%`,
+    source,
+    fetchedAt: new Date().toISOString()
+  };
+}
+
+async function fetchGlobalMarketContext() {
+  const text = await getTextWithRetry('https://qt.gtimg.cn/q=usDJI,usIXIC,usINX', { Referer: 'https://finance.qq.com/' }, 'gb18030', 1);
+  const indices = parseTencentGlobalIndices(text);
+  if (indices.length < 3) throw new Error(`美股指数返回不完整（${indices.length}/3）`);
+  return assessGlobalMarketContext(indices);
 }
 
 function recommendationScoreBand(score) {
@@ -1932,7 +2049,7 @@ function buildCanslimFromFactors(factorAnalysis) {
   };
 }
 
-function buildIndividualInvestmentAnalysis({ technical, financial, newsContext, quote, marketOverview, marketNewsContext = null }) {
+function buildIndividualInvestmentAnalysis({ technical, financial, newsContext, quote, marketOverview, marketNewsContext = null, fundFlowPeriod = null }) {
   const indices = marketOverview?.indices || [];
   const marketChanges = indices.map(item => finiteNumber(item.changePct)).filter(item => item !== null);
   const averageMarketChange = marketChanges.length ? average(marketChanges) : null;
@@ -1942,20 +2059,23 @@ function buildIndividualInvestmentAnalysis({ technical, financial, newsContext, 
     ? clampRecommendationScore(35 + marketUp / (marketUp + marketDown) * 50)
     : averageMarketChange === null ? null : clampRecommendationScore(55 + averageMarketChange * 12);
   const marketNewsAdjustment = marketNewsContext?.signal === '偏积极' ? 5 : marketNewsContext?.signal === '偏谨慎' ? -10 : 0;
-  const marketScore = baseMarketScore === null ? null : clampRecommendationScore(baseMarketScore + marketNewsAdjustment);
+  const overseas = marketOverview?.overseas;
+  const overseasRiskAdjustment = overseas?.available ? Number(overseas.riskAdjustment) || 0 : 0;
+  const marketScore = baseMarketScore === null ? null : clampRecommendationScore(baseMarketScore + marketNewsAdjustment + overseasRiskAdjustment);
   const marketEvidenceBase = marketUp + marketDown
     ? `全市场上涨${marketUp}只、下跌${marketDown}只`
     : averageMarketChange === null ? '大盘方向数据不可用' : `主要指数平均涨跌${averageMarketChange.toFixed(2)}%`;
-  const marketEvidence = `${marketEvidenceBase}${marketNewsContext?.available ? `；实时市场消息${marketNewsContext.signal}` : ''}`;
+  const marketEvidence = `${marketEvidenceBase}${marketNewsContext?.available ? `；实时市场消息${marketNewsContext.signal}` : ''}${overseas?.available ? `；${overseas.summary}` : ''}`;
   const supplyDemand = buildSupplyDemandScore({
     volumeRatio: technical?.volumeRatio,
     turnover: quote?.turnoverRate,
     amount: quote?.amount
   });
+  const newsAssessment = assessRecommendationNewsConfirmation({ analysis:technical, fundFlowPeriod }, newsContext);
   const factors = [
     { key:'currentEarnings', available:Boolean(financial?.current?.available), score:financial?.current?.score ?? null, evidence:financial?.current?.evidence || '季度盈利数据不可用' },
     { key:'annualEarnings', available:Boolean(financial?.annual?.available), score:financial?.annual?.score ?? null, evidence:financial?.annual?.evidence || '年度盈利数据不可用' },
-    { key:'catalyst', available:Boolean(newsContext?.available ?? newsContext?.items?.length), score:newsContext?.factorScore ?? (newsContext?.signal === '偏积极' ? 82 : newsContext?.signal === '偏谨慎' ? 25 : 50), evidence:newsContext?.items?.length ? newsContext.summary : '近期可核验消息不可用' },
+    { key:'catalyst', available:Boolean(newsContext?.available ?? newsContext?.items?.length), score:newsAssessment.factorScore, evidence:newsContext?.items?.length ? newsAssessment.evidence : '近期可核验消息不可用' },
     { key:'supplyDemand', available:supplyDemand.available, score:supplyDemand.score, evidence:supplyDemand.available ? supplyDemand.evidence : '供需数据不可用' },
     { key:'leadership', available:Boolean(technical), score:technical ? clampRecommendationScore(50 + Number(technical.return60 || 0) * 1.5) : null, evidence:technical ? `近60日涨跌${Number(technical.return60 || 0).toFixed(1)}%；个股当日${averageMarketChange === null ? '无法比较大盘' : Number(quote?.changePct || 0) >= averageMarketChange ? '强于或不弱于大盘' : '弱于大盘'}` : '相对强弱数据不可用' },
     { key:'institution', available:false, score:null, evidence:'机构持仓与增减持序列未接入，不推测' },
@@ -2195,7 +2315,7 @@ function scoreConsolidationCandidate(item) {
   return liquidity + stability + quietVolume + nearHigh * 10 + turnoverFit;
 }
 
-async function buildMarketRecommendations(marketQuotes, force = false, outcomeProfile = null) {
+async function buildMarketRecommendations(marketQuotes, force = false, outcomeProfile = null, marketContext = null) {
   const marketAssessmentContext = {
     breadth: (marketQuotes || []).reduce((counts, item) => {
       if (item.changePct > 0) counts.up++;
@@ -2203,7 +2323,8 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
       else counts.flat++;
       return counts;
     }, { up: 0, down: 0, flat: 0 }),
-    indices: []
+    indices: marketContext?.indices || [],
+    overseas: marketContext?.overseas || null
   };
   let directory = [];
   try {
@@ -2330,7 +2451,7 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
       ? summarizeNews(newsResult.value.news, windowStart, { subject: item.name, code: item.code, ...newsResult.value })
       : summarizeNews([], windowStart);
     const contextualAnalysis = applyEntryContextAssessment(capitalAnalysis, {
-      newsContext, marketOverview: marketAssessmentContext
+      newsContext, marketOverview: marketAssessmentContext, subject: item
     });
     const entryAnalysis = applyOutcomeFeedbackAssessment(contextualAnalysis, outcomeProfile);
     const entryAssessment = entryAnalysis.entryAssessment;
@@ -2349,14 +2470,15 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
         ? item.analysis.accumulationSetup.summary
         : `${item.analysis.maAlignment}，现价${ma30Position}MA30（${item.analysis.ma30.toFixed(2)}元）；距20日突破位${distance >= 0 ? '约' + distance.toFixed(2) + '%' : '已突破约' + Math.abs(distance).toFixed(2) + '%'}；近5日量比${item.analysis.volumeRatio.toFixed(2)}`
       : item.analysis.reboundReason;
-    const newsLabel = newsContext.signal === '偏积极' ? '消息确认' : newsContext.signal === '偏谨慎' ? '消息谨慎' : '消息中性';
+    const newsAssessment = assessRecommendationNewsConfirmation(item, newsContext);
+    const newsLabel = newsAssessment.label;
     const factorAnalysis = evaluateRecommendationFactors(item, factorContext, newsContext, financialAnalysis);
     const canslim = buildCanslimFromFactors(factorAnalysis);
     const sectorDescription = factorAnalysis.sectorProfile
       ? `${factorAnalysis.sectorProfile.name}${factorAnalysis.sectorProfile.label}（板块评分${factorAnalysis.sectorProfile.score}）` : '板块强度未确认';
     const capitalDescription = fundFlowPeriod?.available ? fundFlowPeriodEvidence(fundFlowPeriod) : '阶段主力资金暂未取得，不据此加分';
     const structureReason = entryAssessment?.structureSummary ? `；形态评估：${entryAssessment.structureSummary}` : '';
-    let reason = `${item.signal}；${technicalReason}；${capitalDescription}；${sectorDescription}；${newsContext.signal === '偏积极' ? '存在经时效加权的正向消息催化' : newsContext.signal === '偏谨慎' ? '存在近期风险消息，信号降级等待确认' : '消息面时效加权后中性'}（最新${newsContext.latestPublishedAt ? formatNewsTime(newsContext.latestPublishedAt) : '未取得'}，${newsContext.freshness}）；综合入场：${entryAssessment?.status || '数据待补充'}，${entryAssessment?.summary || '关键数据不足'}${structureReason}。`;
+    let reason = `${item.signal}；${technicalReason}；${capitalDescription}；${sectorDescription}；${newsContext.signal === '偏积极' ? newsAssessment.confirmed ? '正向消息已获技术与阶段资金确认' : '存在正向消息但阶段资金未确认，不据此加分' : newsContext.signal === '偏谨慎' ? '存在近期风险消息，信号降级等待确认' : '消息面时效加权后中性'}（最新${newsContext.latestPublishedAt ? formatNewsTime(newsContext.latestPublishedAt) : '未取得'}，${newsContext.freshness}）；综合入场：${entryAssessment?.status || '数据待补充'}，${entryAssessment?.summary || '关键数据不足'}${structureReason}。`;
     const setupAdjustment = item.analysis.accumulationSetup?.passed ? 10 : 0;
     const technicalBreakout = item.analysis.consolidationBreakout;
     const horizontalAdjustment = !technicalBreakout?.isConsolidating ? 0
@@ -2371,11 +2493,13 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
     const baseSignalScore = clampRecommendationScore(rawSignalScore * .55 + qualityScore * .15 + factorScore * .3);
     const outcomeResult = calibrateRecommendationWithOutcomes({ signal, signalScore: baseSignalScore, technicalScore: item.analysis.score }, outcomeProfile);
     const strategyRiskAdjustment = outcomeProfile?.marketRisk?.status === 'drawdown' ? -3 : 0;
-    const totalOutcomeAdjustment = outcomeResult.adjustment + strategyRiskAdjustment;
-    const outcomeCalibration = { ...outcomeResult, strategyRiskAdjustment, totalAdjustment: totalOutcomeAdjustment };
+    const overseasRiskAdjustment = globalMarketRiskAdjustment(marketAssessmentContext.overseas, item);
+    const totalOutcomeAdjustment = outcomeResult.adjustment + strategyRiskAdjustment + overseasRiskAdjustment;
+    const outcomeCalibration = { ...outcomeResult, strategyRiskAdjustment, overseasRiskAdjustment, totalAdjustment: totalOutcomeAdjustment };
     const signalScore = clampRecommendationScore(baseSignalScore + totalOutcomeAdjustment);
     if (outcomeCalibration.familyStats || outcomeCalibration.technicalStats) reason += ` 本地推荐复盘：${outcomeCalibration.summary}，本次评分${totalOutcomeAdjustment >= 0 ? '+' : ''}${totalOutcomeAdjustment}分。`;
     if (strategyRiskAdjustment) reason += ` 最近成熟推荐整体处于回撤，额外降低${Math.abs(strategyRiskAdjustment)}分。`;
+    if (overseasRiskAdjustment) reason += ` ${marketAssessmentContext.overseas.summary}，海外风险降低${Math.abs(overseasRiskAdjustment)}分。`;
     return {
       ...item,
       verdict,
@@ -2400,6 +2524,25 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
       fundFlowPeriod,
       entryAssessment,
       outcomeCalibration,
+      recommendationModelVersion: RECOMMENDATION_MODEL_VERSION,
+      recommendationContext: {
+        evaluatedAt: new Date().toISOString(),
+        capital: fundFlowPeriod?.available ? {
+          available: true, days: fundFlowPeriod.days, mainNetInflow: fundFlowPeriod.mainNetInflow,
+          netRatio: fundFlowPeriod.netRatio, positiveDays: fundFlowPeriod.positiveDays, source: fundFlowPeriod.source
+        } : { available: false },
+        news: {
+          signal: newsContext.signal, label: newsLabel, confirmed: newsAssessment.confirmed,
+          freshness: newsContext.freshness, latestPublishedAt: newsContext.latestPublishedAt, source: newsContext.source
+        },
+        overseas: marketAssessmentContext.overseas?.available ? {
+          available: true, signal: marketAssessmentContext.overseas.signal,
+          severity: marketAssessmentContext.overseas.severity,
+          averageChangePct: marketAssessmentContext.overseas.averageChangePct,
+          nasdaqChangePct: marketAssessmentContext.overseas.nasdaqChangePct,
+          source: marketAssessmentContext.overseas.source
+        } : { available: false }
+      },
       reason,
       newsContext
     };
@@ -2409,7 +2552,7 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
     && recommendationPassesOutcomeGate(item)
     && item.breakoutPotential?.status !== '结构偏弱'
     && !isExplosiveVolume(item.analysis?.volumeRatio)
-    && !['破位', '爆量观察', '结构偏弱', '不宜追高', '公司风险'].includes(item.entryAssessment?.status)
+    && !['破位', '爆量观察', '结构偏弱', '不宜追高', '公司风险', '美股科技风险待确认'].includes(item.entryAssessment?.status)
     && !(item.newsLabel === '消息谨慎' && item.signalScore < 65)
     && !(item.fundFlowPeriod?.available && item.fundFlowPeriod.netRatio <= -3 && item.fundFlowPeriod.positiveDays <= 4)
     && !(item.financialAnalysis?.hardRisks?.length >= 2 && item.financialAnalysis?.score < 45)
@@ -2505,7 +2648,8 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
         byRecentSignal: outcomeProfile.byRecentSignal,
         byRecentTechnicalScoreBand: outcomeProfile.byRecentTechnicalScoreBand
       } : null,
-      factorModel: 'A股适配CANSLIM + 价值质量 + 阶段主力资金 + 底部五线粘合放量 + 横盘箱体突破趋势（缺失项不计分）',
+      modelVersion: RECOMMENDATION_MODEL_VERSION,
+      factorModel: 'A股适配CANSLIM + 价值质量 + 阶段主力资金确认 + 时效消息风险 + 美股风险修正 + 底部吸筹/横盘突破趋势（缺失项不计分）',
       qualified: groupedRecommendations.length
     }
   };
@@ -2519,11 +2663,12 @@ function marketAnalysis(result) {
   const leaders = (result.sectors || []).slice(0, 3).map(item => `${item.name}${item.changePct >= 0 ? '+' : ''}${item.changePct.toFixed(2)}%`).join('、');
   const funds = (result.fundSectors || []).slice(0, 3).map(item => item.name).join('、');
   const news = result.newsContext?.signal ? `消息面经发布时间和相关性加权后${result.newsContext.signal}（${result.newsContext.freshness || '时效未知'}）。` : '';
+  const overseas = result.overseas?.available ? `${result.overseas.summary}，对A股成长方向仅作风险修正，不因美股上涨单独推荐。` : '';
   const signalGroups = Object.entries((result.recommendations || []).reduce((groups, item) => {
     (groups[item.signal || '待突破'] ||= []).push(item.name);
     return groups;
   }, {})).map(([signal, names]) => `${signal}：${names.slice(0, 3).join('、')}`).join('；');
-  return `市场情绪${sentiment}${up || down ? `，上涨${up}家、下跌${down}家` : ''}。${leaders ? `轮动靠前：${leaders}。` : ''}${funds ? `成交资金活跃板块：${funds}。` : ''}涨停${result.limits?.upCount ?? 0}只、跌停${result.limits?.downCount ?? 0}只。${news}${signalGroups ? `技术形态观察候选——${signalGroups}；仍需等待价格和成交量条件确认。` : '当前未筛出满足条件的技术形态候选。'}`;
+  return `市场情绪${sentiment}${up || down ? `，上涨${up}家、下跌${down}家` : ''}。${leaders ? `轮动靠前：${leaders}。` : ''}${funds ? `成交资金活跃板块：${funds}。` : ''}涨停${result.limits?.upCount ?? 0}只、跌停${result.limits?.downCount ?? 0}只。${overseas}${news}${signalGroups ? `技术形态观察候选——${signalGroups}；仍需等待价格和成交量条件确认。` : '当前未筛出满足条件的技术形态候选。'}`;
 }
 
 async function fetchMarketOverview(force = false, favoriteOutcomes = []) {
@@ -2541,11 +2686,19 @@ async function fetchMarketOverview(force = false, favoriteOutcomes = []) {
   const recommendationSavedAt = Date.parse(recommendationCache?.recommendationsFetchedAt || recommendationCache?.fetchedAt || '');
   const recommendationFeedbackSignature = recommendationCache?.recommendationCoverage?.outcomeFeedback?.signature || '';
   const result = { errors: [], warnings: [], fetchedAt: new Date().toISOString() };
-  const [indicesResult, snapshotResult] = await Promise.allSettled([
-    fetchTencentMarketIndices(), fetchTencentMarketSnapshot()
+  const [indicesResult, snapshotResult, overseasResult] = await Promise.allSettled([
+    fetchTencentMarketIndices(), fetchTencentMarketSnapshot(), fetchGlobalMarketContext()
   ]);
   if (indicesResult.status === 'fulfilled' && indicesResult.value.length) result.indices = indicesResult.value;
   else result.errors.push(`指数行情失败：${indicesResult.reason?.message || '返回为空'}`);
+  if (overseasResult.status === 'fulfilled') result.overseas = overseasResult.value;
+  else if (previousOverview?.overseas?.available) {
+    result.overseas = { ...previousOverview.overseas, stale: true };
+    result.warnings.push(`美股行情失败，沿用最近一次成功数据：${overseasResult.reason?.message || overseasResult.reason}`);
+  } else {
+    result.overseas = assessGlobalMarketContext([]);
+    result.warnings.push(`美股行情失败：${overseasResult.reason?.message || overseasResult.reason}`);
+  }
   if (snapshotResult.status === 'fulfilled') {
     const quoteFetchedAt = new Date().toISOString();
     const outcomeQuotes = snapshotResult.value.quotes.map(quote => ({
@@ -2565,7 +2718,9 @@ async function fetchMarketOverview(force = false, favoriteOutcomes = []) {
     result.errors.push(...snapshotResult.value.errors.map(error => `全市场行情部分失败：${error}`));
     const [sectorsResult, recommendationsResult, newsResult] = await Promise.allSettled([
       fetchTencentMarketSectors(snapshotResult.value.quotes),
-      reuseRecommendations ? Promise.resolve(null) : buildMarketRecommendations(snapshotResult.value.quotes, force, outcomeProfile),
+      reuseRecommendations ? Promise.resolve(null) : buildMarketRecommendations(snapshotResult.value.quotes, force, outcomeProfile, {
+        indices: result.indices || [], overseas: result.overseas
+      }),
       fetchMarketNews(force)
     ]);
     if (sectorsResult.status === 'fulfilled') Object.assign(result, sectorsResult.value);
@@ -2592,6 +2747,7 @@ async function fetchMarketOverview(force = false, favoriteOutcomes = []) {
     result.errors.push(`全市场行情失败：${snapshotResult.reason?.message || snapshotResult.reason}`);
   }
   result.indices ||= [];
+  result.overseas ||= assessGlobalMarketContext([]);
   result.breadth ||= { up: 0, down: 0, flat: 0 };
   result.sectors ||= [];
   result.weakSectors ||= [];
@@ -2605,7 +2761,7 @@ async function fetchMarketOverview(force = false, favoriteOutcomes = []) {
   result.limits ||= { date: '', upCount: 0, downCount: 0, upStocks: [], downStocks: [] };
   result.turnover ||= result.indices.slice(0, 2).reduce((sum, item) => sum + (item.amount || 0), 0);
   result.analysis = marketAnalysis(result);
-  result.source = ['腾讯指数', snapshotResult.status === 'fulfilled' ? '腾讯全市场行情' : '', result.sectors.length ? '中证行业指数' : ''].filter(Boolean).join(' + ');
+  result.source = ['腾讯指数', result.overseas.available ? result.overseas.source : '', snapshotResult.status === 'fulfilled' ? '腾讯全市场行情' : '', result.sectors.length ? '中证行业指数' : ''].filter(Boolean).join(' + ');
   if (!result.indices.length && !result.sectors.length) {
     if (previousOverview?.indices?.length || previousOverview?.sectors?.length) {
       const fallback = {
@@ -3565,7 +3721,7 @@ async function fetchSinaFundFlowHistory(code, days = 10, force = false) {
   if (cached) return cached;
   const symbol = `${marketPrefixOf(code)}${code}`;
   const url = `https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/MoneyFlow.ssl_qsfx_zjlrqs?page=1&num=${days}&sort=opendate&asc=0&daima=${symbol}`;
-  const text = await getText(url, { Referer: 'https://finance.sina.com.cn/', Accept: '*/*' });
+  const text = await getTextWithRetry(url, { Referer: 'https://finance.sina.com.cn/', Accept: '*/*' }, 'utf8', 2);
   const rows = JSON.parse(text.slice(text.indexOf('['), text.lastIndexOf(']') + 1));
   const summary = summarizeFundFlowRows(rows, days);
   if (!summary.available) throw new Error('新浪阶段资金流向为空');
@@ -4467,7 +4623,7 @@ function analyzeHistory(history) {
   };
 }
 
-async function fetchStockHistory({ code, name, force = false, favoriteOutcomes = [] }) {
+async function fetchStockHistory({ code, name, industry = '', sector = '', force = false, favoriteOutcomes = [] }) {
   const cacheKey = String(code || '');
   const freshCachedQuotes = [...quoteCache.values()].filter(quote => !quote.stale
     && Date.now() - Date.parse(quote.fetchedAt || '') < 10 * 60 * 1000);
@@ -4476,7 +4632,7 @@ async function fetchStockHistory({ code, name, force = false, favoriteOutcomes =
   const cached = force ? null : readTimedCache(stockHistoryCache, cacheKey, 2 * 60 * 1000);
   if (cached && (cached.feedbackSignature || '') === feedbackSignature) return { ...cached, cached: true };
   const historyErrors = [];
-  const [historyResult, quoteResult, newsResult, riskResult, financialResult, fundFlowResult, marketNewsResult] = await Promise.allSettled([
+  const [historyResult, quoteResult, newsResult, riskResult, financialResult, fundFlowResult, marketNewsResult, marketIndicesResult, overseasResult] = await Promise.allSettled([
     (async () => {
       try {
         const history = await fetchTencentHistory(cacheKey, 120);
@@ -4496,7 +4652,9 @@ async function fetchStockHistory({ code, name, force = false, favoriteOutcomes =
     fetchFutureRiskProfile({ code: cacheKey, name, force: false }),
     fetchStockFinancials({ code: cacheKey, force: false }),
     fetchSinaFundFlowHistory(cacheKey, 10, force),
-    fetchMarketNews(force)
+    fetchMarketNews(force),
+    force ? fetchTencentMarketIndices() : Promise.resolve(marketOverviewCache?.value?.indices || []),
+    force ? fetchGlobalMarketContext() : Promise.resolve(marketOverviewCache?.value?.overseas || assessGlobalMarketContext([]))
   ]);
   const errors = [...historyErrors];
   let history = historyResult.status === 'fulfilled' ? historyResult.value.history : [];
@@ -4537,6 +4695,15 @@ async function fetchStockHistory({ code, name, force = false, favoriteOutcomes =
   } else {
     errors.push(`大盘实时消息分析失败：${marketNewsResult.reason?.message || marketNewsResult.reason}`);
   }
+  if (marketIndicesResult.status === 'rejected') errors.push(`最新大盘指数分析失败：${marketIndicesResult.reason?.message || marketIndicesResult.reason}`);
+  if (overseasResult.status === 'rejected') errors.push(`最新美股环境分析失败：${overseasResult.reason?.message || overseasResult.reason}`);
+  const analysisMarketOverview = {
+    ...(marketOverviewCache?.value || {}),
+    indices: marketIndicesResult.status === 'fulfilled' && marketIndicesResult.value.length
+      ? marketIndicesResult.value : marketOverviewCache?.value?.indices || [],
+    overseas: overseasResult.status === 'fulfilled'
+      ? overseasResult.value : marketOverviewCache?.value?.overseas || assessGlobalMarketContext([])
+  };
   if (newsContext.signal === '偏谨慎' && analysis.verdict === '可关注') analysis.verdict = '等待确认';
   const riskProfile = riskResult.status === 'fulfilled'
     ? riskResult.value
@@ -4550,7 +4717,8 @@ async function fetchStockHistory({ code, name, force = false, favoriteOutcomes =
     analysis.verdict = '等待确认';
   }
   analysis = applyEntryContextAssessment(analysis, {
-    newsContext, riskProfile, marketOverview: marketOverviewCache?.value || null, marketNewsContext
+    newsContext, riskProfile, marketOverview: analysisMarketOverview, marketNewsContext,
+    subject: { code: cacheKey, name, industry, sector }
   });
   analysis = applyOutcomeFeedbackAssessment(analysis, outcomeProfile);
   if (!analysis.entryAssessment?.allowed && analysis.verdict === '可关注'
@@ -4564,11 +4732,12 @@ async function fetchStockHistory({ code, name, force = false, favoriteOutcomes =
   const liveQuote = quoteResult.status === 'fulfilled' ? quoteResult.value[0] : null;
   const investmentAnalysis = buildIndividualInvestmentAnalysis({
     technical: analysis, financial: financialAnalysis, newsContext, quote: liveQuote,
-    marketOverview: marketOverviewCache?.value || null,
-    marketNewsContext
+    marketOverview: analysisMarketOverview,
+    marketNewsContext,
+    fundFlowPeriod
   });
   const breakoutConclusion = analysis.breakoutPotential?.available
-    ? `横盘突破评估：${analysis.breakoutPotential.status}，${analysis.breakoutPotential.trigger}。` : '';
+    ? `横盘突破评估：${analysis.breakoutPotential.status}${analysis.breakoutPotential.trigger ? `，${analysis.breakoutPotential.trigger}` : ''}。` : '';
   analysis.combinedConclusion = `${analysis.verdict}（技术评分${analysis.score}/100，CANSLIM可验证得分${investmentAnalysis.canslim.score ?? '--'}/100）。${analysis.entryAssessment?.summary || analysis.buyCondition}${analysis.capitalSetupAssessment.summary}${breakoutConclusion}个股消息经发布时间与相关性加权后${newsContext.signal}，大盘实时消息${marketNewsContext.signal}；${newsContext.signal === '偏谨慎' || marketNewsContext.signal === '偏谨慎' ? '近期风险信息未充分消化，需降低优先级。' : '暂未发现与技术条件明显冲突的近期风险信息。'}未来半年公司风险：${riskProfile.summary}。`;
   const analyzedAt = new Date().toISOString();
   const latestTradeDate = history.at(-1)?.date || '';
@@ -5033,6 +5202,9 @@ module.exports = {
   buildIndividualInvestmentAnalysis,
   buildRecommendationFactorContext,
   evaluateRecommendationFactors,
+  assessRecommendationNewsConfirmation,
+  parseTencentGlobalIndices,
+  assessGlobalMarketContext,
   resolveRecommendationIndustry,
   recommendationIndustryGroupKey,
   groupRecommendationsByIndustry,

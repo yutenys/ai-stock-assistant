@@ -33,6 +33,9 @@ const {
   buildCanslimFromFactors,
   buildRecommendationFactorContext,
   evaluateRecommendationFactors,
+  assessRecommendationNewsConfirmation,
+  parseTencentGlobalIndices,
+  assessGlobalMarketContext,
   resolveRecommendationIndustry,
   recommendationIndustryGroupKey,
   groupRecommendationsByIndustry,
@@ -104,6 +107,57 @@ test('无关消息不参与个股判断，过期或缓存利好不充当实时�
   assert.equal(stale.signal, '中性');
   assert.equal(stale.factorScore, 50);
   assert.match(stale.summary, /沿用缓存.*不作为买入确认/);
+});
+
+test('正向消息必须由技术和阶段资金共同确认才计入推荐加分', () => {
+  const newsContext = { signal:'偏积极', factorScore:86, summary:'近期存在正向消息。', items:[{title:'业绩预增'}] };
+  const unconfirmed = assessRecommendationNewsConfirmation({
+    analysis:{score:78}, fundFlowPeriod:{available:false}
+  }, newsContext);
+  assert.equal(unconfirmed.label, '消息中性');
+  assert.equal(unconfirmed.confirmed, false);
+  assert.ok(unconfirmed.factorScore <= 50);
+  assert.match(unconfirmed.evidence, /阶段资金未确认/);
+
+  const confirmed = assessRecommendationNewsConfirmation({
+    analysis:{score:78},
+    fundFlowPeriod:{available:true, days:10, mainNetInflow:8e7, netRatio:4.2, positiveDays:7}
+  }, newsContext);
+  assert.equal(confirmed.label, '消息确认');
+  assert.equal(confirmed.confirmed, true);
+  assert.ok(confirmed.factorScore > 55);
+
+  const cautious = assessRecommendationNewsConfirmation({ analysis:{score:90} }, {
+    signal:'偏谨慎', factorScore:22, summary:'近期存在风险消息。', items:[{title:'减持'}]
+  });
+  assert.equal(cautious.label, '消息谨慎');
+  assert.equal(cautious.confirmed, false);
+});
+
+test('美股三大指数可解析并形成不以上涨单独促成买入的风险上下文', () => {
+  const parsed = parseTencentGlobalIndices([
+    'v_usDJI="200~道琼斯~.DJI~53559.99~53569.44~~~~~~~~~~~~~~~~~~~~~~~~~~2026-08-28 16:37:09~-9.45~-0.02~53819.65~53489.41";',
+    'v_usIXIC="200~纳斯达克~.IXIC~26402.42~26541.35~~~~~~~~~~~~~~~~~~~~~~~~~~2026-08-28 17:15:59~-138.93~-0.52~26700.68~26359.27";',
+    'v_usINX="200~标普500~.INX~7711.76~7730.99~~~~~~~~~~~~~~~~~~~~~~~~~~2026-08-28 16:37:00~-19.23~-0.25~7771.48~7700.91";'
+  ].join('\n'));
+  assert.equal(parsed.length, 3);
+  assert.equal(parsed[1].code, 'IXIC');
+  assert.equal(parsed[1].changePct, -0.52);
+
+  const weak = assessGlobalMarketContext([
+    {code:'DJI',name:'道琼斯',changePct:-1.2},
+    {code:'IXIC',name:'纳斯达克',changePct:-2.1},
+    {code:'INX',name:'标普500',changePct:-1.6}
+  ]);
+  assert.equal(weak.signal, '偏弱');
+  assert.equal(weak.severity, 'high');
+  const strong = assessGlobalMarketContext([
+    {code:'DJI',name:'道琼斯',changePct:1.2},
+    {code:'IXIC',name:'纳斯达克',changePct:1.8},
+    {code:'INX',name:'标普500',changePct:1.4}
+  ]);
+  assert.equal(strong.signal, '偏强');
+  assert.equal(strong.riskAdjustment, 0);
 });
 
 test('金十快讯脚本可解析为大盘实时消息', () => {
@@ -528,10 +582,10 @@ test('个股资金汇总返回主力流入流出净额和占比', { timeout: 600
   assert.ok(result.tradeDate);
 });
 
-test('近三个月行情返回技术分析和观察窗口', { timeout: 30000 }, async () => {
+test('近三个月行情返回技术分析和观察窗口', { timeout: 60000 }, async () => {
   const handler = handlers.get('fetch-stock-history');
   assert.equal(typeof handler, 'function');
-  const result = await handler(null, { code: '603567', name: '珍宝岛' });
+  const result = await handler(null, { code: '603567', name: '珍宝岛', industry:'中药', force:true });
   assert.ok(result.history.length >= 50);
   assert.ok(result.analysis.ma20 > 0);
   assert.ok(result.analysis.ma30 > 0);
@@ -565,6 +619,7 @@ test('近三个月行情返回技术分析和观察窗口', { timeout: 30000 }, 
   assert.ok(result.financialAnalysis?.latestReport);
   assert.equal(result.investmentAnalysis?.canslim?.total, 7);
   assert.ok(result.investmentAnalysis?.canslim?.available >= 4);
+  assert.match(result.investmentAnalysis.canslim.dimensions.find(item => item.key === 'M')?.evidence || '', /美股/);
   assert.match(result.investmentAnalysis?.value?.dcf?.evidence || '', /暂不计算DCF|缺少/);
   const stop = Number((result.analysis.exit.match(/有效跌破([\d.]+)元/) || [])[1]);
   const nearbySupport = Math.min(result.analysis.ma20, result.analysis.ma30, result.analysis.supportPrice);
@@ -624,6 +679,8 @@ test('大盘分析返回指数、轮动、资金和涨跌停结构', { timeout: 
   const result = await handler(null, true);
   assert.ok(result.indices.length >= 3);
   assert.ok(result.indices.every(index => index.price > 0));
+  assert.ok(result.overseas.indices.length >= 3);
+  assert.match(result.overseas.source, /腾讯/);
   assert.equal(typeof result.turnover, 'number');
   assert.ok(result.breadth.up + result.breadth.down + result.breadth.flat > 4500);
   assert.ok(result.sectors.length >= 8);
@@ -659,6 +716,10 @@ test('大盘分析返回指数、轮动、资金和涨跌停结构', { timeout: 
     '突破确认', '突破蓄势', '接近突破', '底部吸筹', '震荡洗盘'
   ].includes(item.signal)));
   assert.ok(result.recommendations.every(item => item.entryAssessment?.status));
+  assert.ok(result.recommendations.every(item => item.recommendationModelVersion));
+  assert.ok(result.recommendations.every(item => item.recommendationContext?.capital));
+  assert.ok(result.recommendations.every(item => item.recommendationContext?.news));
+  assert.ok(result.recommendations.every(item => item.recommendationContext?.overseas));
   assert.ok(result.recommendations.every(item => !['破位', '爆量观察', '结构偏弱', '不宜追高', '公司风险'].includes(item.entryAssessment.status)));
   assert.ok(result.recommendations.every(item => /综合入场/.test(item.reason)));
   assert.ok((result.recommendationCoverage.signals?.breakout || 0) > 0);
@@ -1305,6 +1366,18 @@ test('消息面和大盘环境会调整个股及大盘推荐入场结论', () =>
   });
   assert.equal(weakMarket.entryAssessment.allowed, false);
   assert.equal(weakMarket.entryAssessment.status, '大盘偏弱，等待确认');
+
+  const weakUsTech = applyEntryContextAssessment(analysis, {
+    newsContext: { signal:'中性', items:[] }, riskProfile:{status:'clear'},
+    subject:{industry:'半导体'},
+    marketOverview:{
+      breadth:{up:3000,down:1800}, indices:[{changePct:.5}],
+      overseas:{signal:'偏弱',severity:'high',summary:'美股三大指数平均下跌1.63%，纳斯达克下跌2.10%。'}
+    }
+  });
+  assert.equal(weakUsTech.entryAssessment.allowed, false);
+  assert.equal(weakUsTech.entryAssessment.status, '美股科技风险待确认');
+  assert.match(weakUsTech.entryAssessment.summary, /纳斯达克/);
 });
 
 test('低价高估值弱反弹股票不会进入大盘推荐', { timeout: 60000 }, async () => {
