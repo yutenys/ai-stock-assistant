@@ -203,8 +203,9 @@ function recommendationCardHtml(item, selectable=false){
   const industry = recommendationIndustry(item);
   const sectorLabel = item.factorAnalysis?.sectorProfile?.label || '板块待确认';
   const changeClass = Number.isFinite(item.changePct) ? pctClass(item.changePct) : 'neutral';
+  const scoreLabel = item.recommendationTier === '观察候选' ? '观察评分' : '推荐评分';
   const content = `<span class="market-stock-content"><b class="market-stock-head"><span class="market-stock-name">${escapeHtml(item.name)}</span><span class="code">${escapeHtml(item.code)}</span><span class="market-signal ${badgeClass(item.signal)}">${escapeHtml(item.signal || '待突破')}</span><span class="market-signal ${badgeClass(item.newsLabel)}">${escapeHtml(item.newsLabel || '消息中性')}</span><span class="market-current-price">${yuan(item.price)}</span><span class="market-current-change ${changeClass}">${formatPct(item.changePct)}</span></b>
-    <span>${escapeHtml(sectorLabel)} · ${escapeHtml(item.verdict || '等待确认')} · 推荐评分 ${escapeHtml(item.signalScore ?? item.score)} · ${escapeHtml(recommendationCanslimText(item))} · ${escapeHtml(recommendationFactorText(item))} · MA30 ${yuan(item.ma30)} · 突破价 ${yuan(item.breakoutPrice)}</span>
+    <span>${escapeHtml(sectorLabel)} · ${escapeHtml(item.verdict || '等待确认')} · ${scoreLabel} ${escapeHtml(item.signalScore ?? item.score)} · ${escapeHtml(recommendationCanslimText(item))} · ${escapeHtml(recommendationFactorText(item))} · MA30 ${yuan(item.ma30)} · 突破价 ${yuan(item.breakoutPrice)}</span>
     <small>${escapeHtml(item.reason || '')}</small></span>`;
   if(selectable) return `<label class="market-recommendation market-stock-choice" data-market-industry="${escapeHtml(industry)}"><input type="checkbox" data-market-stock-choice="${escapeHtml(item.code)}" checked />${content}</label>`;
   return `<button class="market-recommendation" data-market-recommendation="${escapeHtml(item.code)}" data-market-industry="${escapeHtml(industry)}">${content}</button>`;
@@ -238,10 +239,11 @@ function renderMarketOverview(result){
   $('marketDown').textContent = result.breadth?.down || '--';
   $('marketFlat').textContent = result.breadth?.flat || '--';
   $('marketTurnover').textContent = money(result.turnover);
-  const strong = (result.sectors || []).slice(0, 4).map(item => marketRow(item, formatPct(item.changePct), item.leader ? `领涨 ${item.leader}` : '')).join('');
-  const weak = (result.weakSectors || []).slice(0, 2).map(item => marketRow(item, formatPct(item.changePct), '回落')).join('');
+  const rotationDetail = item => [item.rotationState, Number.isFinite(Number(item.upRatio)) ? `上涨${(Number(item.upRatio) * 100).toFixed(0)}%` : '', item.leader ? `领涨 ${item.leader}` : ''].filter(Boolean).join(' · ');
+  const strong = (result.sectors || []).slice(0, 4).map(item => marketRow(item, formatPct(item.changePct), rotationDetail(item))).join('');
+  const weak = (result.weakSectors || []).slice(0, 2).map(item => marketRow(item, formatPct(item.changePct), rotationDetail(item) || '回落')).join('');
   $('marketSectors').innerHTML = strong + weak || '<div class="market-row"><span>板块轮动暂不可用</span></div>';
-  $('marketFunds').innerHTML = (result.fundSectors || []).slice(0, 5).map(item => marketRow(item, money(item.amount ?? item.mainNet), item.leader ? `代表 ${item.leader}` : '')).join('') || '<div class="market-row"><span>板块成交资金暂不可用</span></div>';
+  $('marketFunds').innerHTML = (result.fundSectors || []).slice(0, 5).map(item => marketRow(item, money(item.amount ?? item.mainNet), rotationDetail(item))).join('') || '<div class="market-row"><span>板块成交资金暂不可用</span></div>';
   const activeStocks = (result.activeStocks || []).slice(0, 6).map(item => `${item.name} ${money(item.amount)}`).join('、');
   $('marketActiveStocks').innerHTML = activeStocks ? `<b>成交活跃个股：</b>${escapeHtml(activeStocks)}` : '';
   const limits = result.limits || {};
@@ -268,16 +270,23 @@ function renderMarketOverview(result){
   const structureCounts = [];
   if(Number.isFinite(Number(coverage.accumulationCandidates))) structureCounts.push(`蓄势结构 ${coverage.accumulationCandidates} 只`);
   if(Number.isFinite(Number(coverage.consolidationCandidates))) structureCounts.push(`横盘候选 ${coverage.consolidationCandidates} 只`);
-  if(Number.isFinite(Number(coverage.fundFlowAvailable))) structureCounts.push(`阶段资金可用 ${coverage.fundFlowAvailable} 只`);
+  if(Number.isFinite(Number(coverage.fundFlowAvailable))) {
+    const capitalDetail = Number.isFinite(Number(coverage.fundFlowDirect))
+      ? `（接口 ${coverage.fundFlowDirect || 0}，量价代理 ${coverage.fundFlowEstimated || 0}）` : '';
+    structureCounts.push(`阶段资金可用 ${coverage.fundFlowAvailable} 只${capitalDetail}`);
+  }
   const accumulationCoverage = structureCounts.length ? `；${structureCounts.join('，')}` : '';
   const outcomeCoverage = coverage.outcomeFeedback?.sampleSize
     ? `；本地推荐复盘 ${coverage.outcomeFeedback.sampleSize} 条（最近${coverage.outcomeFeedback.recentCohortCount || '--'}个版本，实时行情重算，已排除重点关注/personal及不足1天样本）${coverage.outcomeFeedback.marketRisk?.status === 'drawdown' ? '，近期策略处于回撤并已收紧筛选' : ''}`
     : '';
   const unresolvedIndustryCoverage = Number(coverage.industryUnresolved) > 0 ? `，${coverage.industryUnresolved} 只行业待补充` : '';
+  const tierSummary = Number.isFinite(Number(coverage.strictQualified))
+    ? `严格推荐 ${coverage.strictQualified || 0} 只，观察候选 ${coverage.watchQualified || 0} 只；`
+    : '';
   const signalSummary = [`待反弹 ${signals.bottomWaiting}`, `已反弹 ${signals.rebounded}`, `突破类 ${signals.breakout}`, `吸筹/洗盘 ${signals.structure}`];
   if(signals.other) signalSummary.push(`其他 ${signals.other}`);
   $('marketRecommendationCoverage').textContent = coverage.scanned
-    ? `全市场扫描 ${coverage.scanned} 只，初筛 ${coverage.prefiltered || 0} 只，历史精筛 ${coverage.analyzed || 0} 只，覆盖 ${coverage.industries || 0} 个已确认行业${unresolvedIndustryCoverage}${accumulationCoverage}${riskCoverage}${outcomeCoverage}；实际推荐 ${recommendations.length} 只（${signalSummary.join('，')}）${fallbackNote}`
+    ? `全市场扫描 ${coverage.scanned} 只，初筛 ${coverage.prefiltered || 0} 只，历史精筛 ${coverage.analyzed || 0} 只，覆盖 ${coverage.industries || 0} 个已确认行业${unresolvedIndustryCoverage}${accumulationCoverage}${riskCoverage}${outcomeCoverage}；${tierSummary}实际展示 ${recommendations.length} 只（${signalSummary.join('，')}）${fallbackNote}`
     : '等待全市场扫描';
   const visibleRecommendations = recommendations.slice(0, 10);
   $('marketRecommendations').innerHTML = visibleRecommendations.length ? groupedRecommendationHtml(visibleRecommendations) : '<div class="market-row"><span>当前未筛出满足条件的候选</span></div>';

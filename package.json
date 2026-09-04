@@ -1,6 +1,6 @@
 {
   "name": "ai-stock-assistant",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "股票观察助手 Electron 桌面版",
   "main": "main.js",
   "scripts": {
