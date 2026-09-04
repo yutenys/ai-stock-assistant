@@ -26,6 +26,9 @@ let logs = [];
 let currentViewSource = 'empty';
 let marketOverviewRefreshing = false;
 let latestMarketRecommendations = [];
+let latestMarketMomentumRecommendations = [];
+let activeMarketRecommendationTrack = 'stable';
+let marketLabelRecommendations = [];
 let latestMarketOverview = null;
 let liveNewsItems = [];
 let liveNewsMeta = null;
@@ -204,8 +207,9 @@ function recommendationCardHtml(item, selectable=false){
   const sectorLabel = item.factorAnalysis?.sectorProfile?.label || '板块待确认';
   const changeClass = Number.isFinite(item.changePct) ? pctClass(item.changePct) : 'neutral';
   const scoreLabel = item.recommendationTier === '观察候选' ? '观察评分' : '推荐评分';
+  const verdictLabel = item.signal === '强势追踪' ? item.entryAssessment?.status : item.verdict;
   const content = `<span class="market-stock-content"><b class="market-stock-head"><span class="market-stock-name">${escapeHtml(item.name)}</span><span class="code">${escapeHtml(item.code)}</span><span class="market-signal ${badgeClass(item.signal)}">${escapeHtml(item.signal || '待突破')}</span><span class="market-signal ${badgeClass(item.newsLabel)}">${escapeHtml(item.newsLabel || '消息中性')}</span><span class="market-current-price">${yuan(item.price)}</span><span class="market-current-change ${changeClass}">${formatPct(item.changePct)}</span></b>
-    <span>${escapeHtml(sectorLabel)} · ${escapeHtml(item.verdict || '等待确认')} · ${scoreLabel} ${escapeHtml(item.signalScore ?? item.score)} · ${escapeHtml(recommendationCanslimText(item))} · ${escapeHtml(recommendationFactorText(item))} · MA30 ${yuan(item.ma30)} · 突破价 ${yuan(item.breakoutPrice)}</span>
+    <span>${escapeHtml(sectorLabel)} · ${escapeHtml(verdictLabel || '等待确认')} · ${scoreLabel} ${escapeHtml(item.signalScore ?? item.score)} · ${escapeHtml(recommendationCanslimText(item))} · ${escapeHtml(recommendationFactorText(item))} · MA30 ${yuan(item.ma30)} · 突破价 ${yuan(item.breakoutPrice)}</span>
     <small>${escapeHtml(item.reason || '')}</small></span>`;
   if(selectable) return `<label class="market-recommendation market-stock-choice" data-market-industry="${escapeHtml(industry)}"><input type="checkbox" data-market-stock-choice="${escapeHtml(item.code)}" checked />${content}</label>`;
   return `<button class="market-recommendation" data-market-recommendation="${escapeHtml(item.code)}" data-market-industry="${escapeHtml(industry)}">${content}</button>`;
@@ -239,11 +243,17 @@ function renderMarketOverview(result){
   $('marketDown').textContent = result.breadth?.down || '--';
   $('marketFlat').textContent = result.breadth?.flat || '--';
   $('marketTurnover').textContent = money(result.turnover);
-  const rotationDetail = item => [item.rotationState, Number.isFinite(Number(item.upRatio)) ? `上涨${(Number(item.upRatio) * 100).toFixed(0)}%` : '', item.leader ? `领涨 ${item.leader}` : ''].filter(Boolean).join(' · ');
+  const rotationDetail = item => [item.rotationState, Number.isFinite(Number(item.upRatio)) ? `上涨${(Number(item.upRatio) * 100).toFixed(0)}%` : '', item.capitalEstimated === false && Number.isFinite(Number(item.mainNetPct)) ? `净占比${Number(item.mainNetPct) >= 0 ? '+' : ''}${Number(item.mainNetPct).toFixed(2)}%` : '', item.capitalRank ? `资金第${item.capitalRank}` : '', item.leader ? `领涨 ${item.leader}` : ''].filter(Boolean).join(' · ');
   const strong = (result.sectors || []).slice(0, 4).map(item => marketRow(item, formatPct(item.changePct), rotationDetail(item))).join('');
   const weak = (result.weakSectors || []).slice(0, 2).map(item => marketRow(item, formatPct(item.changePct), rotationDetail(item) || '回落')).join('');
   $('marketSectors').innerHTML = strong + weak || '<div class="market-row"><span>板块轮动暂不可用</span></div>';
-  $('marketFunds').innerHTML = (result.fundSectors || []).slice(0, 5).map(item => marketRow(item, money(item.amount ?? item.mainNet), rotationDetail(item))).join('') || '<div class="market-row"><span>板块成交资金暂不可用</span></div>';
+  const hasDirectSectorCapital = (result.fundSectors || []).some(item => item.capitalEstimated === false && Number.isFinite(Number(item.mainNetInflow)));
+  $('marketFundsTitle').textContent = hasDirectSectorCapital ? '板块主力资金' : '板块活跃度（量价估算）';
+  const capitalMeta = result.sectorCapital;
+  $('marketCapitalMeta').textContent = capitalMeta?.direct
+    ? `${capitalMeta.stale ? '缓存回退' : capitalMeta.cached ? '短时缓存' : '实时'} · ${capitalMeta.source || '板块资金接口'}${capitalMeta.fetchedAt ? ` · ${new Date(capitalMeta.fetchedAt).toLocaleTimeString('zh-CN', {hour12:false})}` : ''}`
+    : '未取得真实板块资金，本轮使用全市场涨幅、广度和成交活跃度估算';
+  $('marketFunds').innerHTML = (result.fundSectors || []).slice(0, 5).map(item => marketRow(item, item.capitalEstimated === false ? money(item.mainNetInflow) : `评分 ${Math.round(Number(item.rotationScore || 0))}`, rotationDetail(item))).join('') || '<div class="market-row"><span>板块资金暂不可用</span></div>';
   const activeStocks = (result.activeStocks || []).slice(0, 6).map(item => `${item.name} ${money(item.amount)}`).join('、');
   $('marketActiveStocks').innerHTML = activeStocks ? `<b>成交活跃个股：</b>${escapeHtml(activeStocks)}` : '';
   const limits = result.limits || {};
@@ -253,7 +263,9 @@ function renderMarketOverview(result){
     ${upStocks ? `<div class="market-stocks"><b>涨停代表：</b>${escapeHtml(upStocks)}</div>` : ''}
     ${downStocks ? `<div class="market-stocks"><b>跌停代表：</b>${escapeHtml(downStocks)}</div>` : ''}`;
   const recommendations = result.recommendations || [];
+  const momentumRecommendations = result.momentumRecommendations || [];
   latestMarketRecommendations = recommendations;
+  latestMarketMomentumRecommendations = momentumRecommendations;
   const coverage = result.recommendationCoverage || {};
   const fallbackNote = coverage.cachedFallback ? `；沿用${coverage.cachedAt ? new Date(coverage.cachedAt).toLocaleString('zh-CN', {hour12:false}) : '最近一次'}成功推荐` : '';
   const signals = recommendations.reduce((counts, item) => {
@@ -291,10 +303,30 @@ function renderMarketOverview(result){
   const visibleRecommendations = recommendations.slice(0, 10);
   $('marketRecommendations').innerHTML = visibleRecommendations.length ? groupedRecommendationHtml(visibleRecommendations) : '<div class="market-row"><span>当前未筛出满足条件的候选</span></div>';
   $('addMarketRecommendations').textContent = `查看更多（${recommendations.length}）`;
+  $('addMarketRecommendations').disabled = !recommendations.length;
+  $('marketStableCount').textContent = recommendations.length;
+  const momentumCandidatesKnown = Number.isFinite(Number(coverage.momentumCandidates));
+  const momentumCapitalBasis = capitalMeta?.stale
+    ? `使用${capitalMeta.fetchedAt ? new Date(capitalMeta.fetchedAt).toLocaleString('zh-CN', {hour12:false}) : '最近一次'}真实板块资金缓存与最新个股行情`
+    : '基于实时真实板块主力资金、个股强度、量能、消息面和公司风险';
+  $('marketMomentumCoverage').textContent = coverage.momentumUnavailableReason
+    ? coverage.momentumUnavailableReason
+    : hasDirectSectorCapital && momentumCandidatesKnown
+      ? `${momentumCapitalBasis}筛选 ${coverage.momentumCandidates} 只，展示 ${momentumRecommendations.length} 只；仅跟踪首次缩量回踩，不追涨停或爆量加速。`
+      : hasDirectSectorCapital
+        ? '方案B正在使用最新板块资金重新计算，请稍候刷新。'
+        : '真实板块主力资金暂不可用，本轮不生成强势追踪推荐。';
+  $('marketMomentumRecommendations').innerHTML = momentumRecommendations.length
+    ? groupedRecommendationHtml(momentumRecommendations.slice(0, 8))
+    : '<div class="market-row"><span>当前没有通过真实资金确认的强势追踪候选</span></div>';
+  $('addMarketMomentumRecommendations').textContent = `查看更多（${momentumRecommendations.length}）`;
+  $('addMarketMomentumRecommendations').disabled = !momentumRecommendations.length;
+  $('marketMomentumCount').textContent = momentumRecommendations.length;
+  setMarketRecommendationTrack(activeMarketRecommendationTrack);
   const marketNews = result.newsContext?.items || [];
   $('marketNews').innerHTML = `<div class="market-stocks">${escapeHtml(result.newsContext?.summary || '消息面暂不可用')}</div>${marketNews.slice(0, 5).map(item => `<a class="market-news-row" href="#" data-market-news-link="${escapeHtml(safeHttpUrl(item.link))}">${escapeHtml(item.title)}<span>${escapeHtml(item.source || '')} · ${escapeHtml(item.publishedAt || '')}</span></a>`).join('')}`;
   document.querySelectorAll('[data-market-recommendation]').forEach(button => button.onclick = () => {
-    const item = recommendations.find(candidate => candidate.code === button.dataset.marketRecommendation);
+    const item = [...recommendations, ...momentumRecommendations].find(candidate => candidate.code === button.dataset.marketRecommendation);
     if(!item) return;
     const stock = normalizedMarketRecommendation(item);
     stocks = [stock];
@@ -359,7 +391,7 @@ function describeClickTarget(target){
 }
 
 function badgeClass(v){
-  if(['龙头','已突破','重点关注','消息确认'].includes(v)) return 'b-red';
+  if(['龙头','已突破','重点关注','消息确认','强势追踪'].includes(v)) return 'b-red';
   if(['趋势关注','突破后运行','已反弹'].includes(v)) return 'b-green';
   if(['待突破','等待确认','观察关注','中线关注','底部待反弹'].includes(v)) return 'b-amber';
   if(['待观察','待分析','待刷新','核心候选','产业链候选'].includes(v)) return 'b-blue';
@@ -382,6 +414,17 @@ function closeMarketLabelPanel(){
   $('marketLabelPanel')?.classList.add('hidden');
 }
 
+function setMarketRecommendationTrack(track){
+  activeMarketRecommendationTrack = track === 'momentum' ? 'momentum' : 'stable';
+  const momentum = activeMarketRecommendationTrack === 'momentum';
+  $('marketStablePanel').classList.toggle('hidden', momentum);
+  $('marketMomentumPanel').classList.toggle('hidden', !momentum);
+  $('marketStableTab').classList.toggle('active', !momentum);
+  $('marketMomentumTab').classList.toggle('active', momentum);
+  $('marketStableTab').setAttribute('aria-selected', String(!momentum));
+  $('marketMomentumTab').setAttribute('aria-selected', String(momentum));
+}
+
 function updateMarketStockToggleText(){
   const choices = [...document.querySelectorAll('[data-market-stock-choice]')];
   const allSelected = choices.length > 0 && choices.every(choice => choice.checked);
@@ -401,12 +444,14 @@ function normalizedMarketRecommendation(item){
   };
 }
 
-function openMarketLabelPanel(){
-  if(!latestMarketRecommendations.length){ notify('当前没有可添加的推荐股', 'warn'); return; }
+function openMarketLabelPanel(track = activeMarketRecommendationTrack){
+  const momentum = track === 'momentum';
+  marketLabelRecommendations = momentum ? latestMarketMomentumRecommendations : latestMarketRecommendations;
+  if(!marketLabelRecommendations.length){ notify(`${momentum ? '方案B' : '方案A'}当前没有可添加的推荐股`, 'warn'); return; }
   $('marketLabelPanel').classList.remove('hidden');
   $('newMarketLabelName').value = '';
-  $('marketRecommendationListTitle').innerHTML = `推荐股票 <em>${latestMarketRecommendations.length} 只</em>`;
-  $('marketStockChoices').innerHTML = groupedRecommendationHtml(latestMarketRecommendations, true);
+  $('marketRecommendationListTitle').innerHTML = `${momentum ? '方案B 强势追踪' : '方案A 稳健轮动'}推荐股票 <em>${marketLabelRecommendations.length} 只</em>`;
+  $('marketStockChoices').innerHTML = groupedRecommendationHtml(marketLabelRecommendations, true);
   $('marketLabelChoices').innerHTML = labels.length ? labels.map(label => `<label class="label-choice">
     <input type="checkbox" data-market-target-label="${escapeHtml(label.name)}" />
     <span>${escapeHtml(label.name)}<small class="market-label-count">${label.stocks.length}只</small></span>
@@ -426,7 +471,7 @@ function saveMarketRecommendations(){
   targetLabels.forEach(name => {
     if(!labels.some(label => label.name === name)) labels.push({name, stocks:[]});
   });
-  const selectedStocks = latestMarketRecommendations.filter(item => selectedCodes.has(item.code)).map(normalizedMarketRecommendation);
+  const selectedStocks = marketLabelRecommendations.filter(item => selectedCodes.has(item.code)).map(normalizedMarketRecommendation);
   labels = labels.map(label => {
     if(!targetLabels.has(label.name)) return label;
     const byCode = new Map(label.stocks.map(stock => [stock.code, stock]));
@@ -2618,7 +2663,10 @@ $('openAddPanel').onclick = () => { closeStockLabelPanel(); $('addPanel').classL
 $('closeAddPanel').onclick = () => $('addPanel').classList.add('hidden');
 $('closeStockLabelPanel').onclick = closeStockLabelPanel;
 $('saveStockLabels').onclick = saveStockLabels;
-$('addMarketRecommendations').onclick = openMarketLabelPanel;
+$('marketStableTab').onclick = () => setMarketRecommendationTrack('stable');
+$('marketMomentumTab').onclick = () => setMarketRecommendationTrack('momentum');
+$('addMarketRecommendations').onclick = () => openMarketLabelPanel('stable');
+$('addMarketMomentumRecommendations').onclick = () => openMarketLabelPanel('momentum');
 $('closeMarketLabelPanel').onclick = closeMarketLabelPanel;
 $('toggleMarketStocks').onclick = () => {
   const choices = [...document.querySelectorAll('[data-market-stock-choice]')];

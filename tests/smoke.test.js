@@ -24,6 +24,7 @@ Module._load = function(request, parent, isMain) {
 };
 
 const {
+  SECTOR_CAPITAL_FALLBACK_MAX_AGE_MS,
   normalizeQuoteRow,
   normalizeTencentQuote,
   mapSinaFinancialData,
@@ -33,6 +34,13 @@ const {
   buildCanslimFromFactors,
   buildRecommendationFactorContext,
   buildIndustryRotationFromQuotes,
+  normalizeSectorCapitalRows,
+  mergeSectorCapitalRows,
+  resolveStockRotationProfiles,
+  selectRotationPriorityCandidates,
+  momentumRecommendationDecision,
+  finalizeMomentumRecommendations,
+  canReuseMarketRecommendations,
   evaluateRecommendationFactors,
   assessRecommendationNewsConfirmation,
   parseTencentGlobalIndices,
@@ -77,6 +85,10 @@ const {
   settleWithConcurrency
 } = require('../main.js');
 Module._load = originalLoad;
+
+test('板块主力资金缓存可覆盖周末和盘中接口临时断线', () => {
+  assert.equal(SECTOR_CAPITAL_FALLBACK_MAX_AGE_MS, 72 * 60 * 60 * 1000);
+});
 
 test('实时消息按发布时间、相关性和风险强度加权', () => {
   const now = '2026-08-16T12:00:00Z';
@@ -182,6 +194,87 @@ test('细分行业轮动按涨幅、上涨广度和成交活跃度排序', () =>
   assert.equal(rotation.sectors.at(-1).rotationState, '资金退潮');
   assert.ok(rotation.sectors[0].upRatio > rotation.sectors.at(-1).upRatio);
   assert.ok(rotation.fundSectors[0].amount > 0);
+});
+
+test('板块真实资金优先于成交额估算并保留资金口径', () => {
+  const quotes = Array.from({length:6}, (_, index) => ({
+    code:`60010${index}`, name:`农业股${index}`, industry:'生猪养殖', price:10,
+    changePct:2 + index * .1, amount:2e8 + index * 1e7
+  }));
+  const rotation = buildIndustryRotationFromQuotes(quotes);
+  const merged = mergeSectorCapitalRows(rotation, [{
+    code:'BK1512', name:'生猪养殖', changePct:6.38,
+    mainNetInflow:773908784, mainNetPct:8.82, capitalRank:4,
+    source:'东方财富行业板块资金', fetchedAt:'2026-09-04T06:20:00.000Z'
+  }], quotes);
+  const sector = merged.sectors.find(item => item.name === '生猪养殖');
+  assert.equal(sector.capitalEstimated, false);
+  assert.equal(sector.mainNetInflow, 773908784);
+  assert.equal(sector.mainNetPct, 8.82);
+  assert.equal(sector.capitalRank, 4);
+  assert.match(sector.capitalSource, /东方财富行业板块资金/);
+  assert.equal(merged.fundSectors[0].name, '生猪养殖');
+});
+
+test('东方财富板块资金字段按真实净流入和占比解析', () => {
+  const rows = normalizeSectorCapitalRows([
+    {f12:'BK0433',f14:'农林牧渔',f3:4.16,f20:1324151920000,f62:3118193584,f184:7.93},
+    {f12:'BK1512',f14:'生猪养殖',f3:6.35,f20:460239664000,f62:773903632,f184:8.82}
+  ], 'industry', 'https://82.push2.eastmoney.com', '2026-09-04T06:20:00.000Z');
+  assert.equal(rows[0].mainNetInflow, 3118193584);
+  assert.equal(rows[0].mainNetPct, 7.93);
+  assert.equal(rows[0].boardType, 'industry');
+  assert.equal(rows[0].capitalRank, 1);
+  assert.equal(rows[1].capitalRank, 2);
+  assert.match(rows[0].source, /东方财富行业板块主力资金/);
+});
+
+test('概念板块成员映射到个股并参与轮动判断', () => {
+  const sectors = mergeSectorCapitalRows({sectors:[], weakSectors:[], fundSectors:[]}, [{
+    code:'BK0882', name:'猪肉概念', changePct:5.92,
+    mainNetInflow:1555330704, mainNetPct:9.65, capitalRank:2,
+    memberCodes:['000876', '002714'], source:'东方财富概念板块资金'
+  }], [
+    {code:'000876',name:'新希望',industry:'饲料',price:7.7,changePct:10,amount:1.1e9},
+    {code:'002714',name:'牧原股份',industry:'养殖业',price:40,changePct:5,amount:2e9}
+  ]);
+  const profiles = resolveStockRotationProfiles({code:'000876',industry:'饲料'}, sectors.sectors);
+  assert.equal(profiles[0].name, '猪肉概念');
+  assert.equal(profiles[0].mainNetInflow, 1555330704);
+  assert.equal(profiles[0].capitalEstimated, false);
+});
+
+test('轮动主线候选获得预留名额且负资金板块不被提升', () => {
+  const sectors = [
+    {name:'生猪养殖',rotationScore:92,mainNetInflow:8e8,mainNetPct:8,capitalEstimated:false,memberCodes:['000876','002714']},
+    {name:'弱势行业',rotationScore:80,mainNetInflow:-5e8,mainNetPct:-6,capitalEstimated:false,memberCodes:['600001']}
+  ];
+  const scored = [
+    {code:'000876',industry:'饲料',price:7.7,high:7.8,changePct:5.2,amount:1e9,preliminaryScore:20},
+    {code:'002714',industry:'养殖业',price:40,high:41,changePct:2.2,amount:2e9,preliminaryScore:18},
+    {code:'600001',industry:'弱势行业',price:10,high:10.1,changePct:4,amount:8e8,preliminaryScore:90}
+  ];
+  const selected = selectRotationPriorityCandidates(scored, sectors, {limit:8, perSector:2});
+  assert.deepEqual(selected.map(item => item.code).sort(), ['000876','002714']);
+  assert.ok(selected.every(item => item.rotationProfiles[0].mainNetInflow > 0));
+});
+
+test('强势追踪要求板块资金确认且涨停爆量不允许追高', () => {
+  const base = {
+    code:'000876', name:'新希望', price:7.7, high:7.7, changePct:10,
+    amount:1.1e9, snapshotVolumeRatio:5.01,
+    rotationProfiles:[{name:'猪肉概念',rotationScore:96,mainNetInflow:15e8,mainNetPct:9.65,capitalEstimated:false,capitalRank:2}]
+  };
+  const hot = momentumRecommendationDecision(base);
+  assert.equal(hot.passed, true);
+  assert.equal(hot.entryAssessment.allowed, false);
+  assert.equal(hot.entryAssessment.status, '强势追踪，不追高');
+  assert.match(hot.entryAssessment.summary, /涨停|爆量/);
+  const outflow = momentumRecommendationDecision({
+    ...base, changePct:6, snapshotVolumeRatio:2,
+    rotationProfiles:[{name:'弱势行业',rotationScore:80,mainNetInflow:-2e8,mainNetPct:-3,capitalEstimated:false}]
+  });
+  assert.equal(outflow.passed, false);
 });
 
 test('阶段资金接口不可用时使用明确标注的日线量价资金代理', () => {
@@ -434,6 +527,8 @@ test('本轮大盘推荐为空时保留最近成功推荐并刷新行情', () =>
   assert.match(result.recommendations[0].reason, /综合入场：数据待补充/);
   assert.equal(result.recommendationCoverage.cachedFallback, true);
   assert.equal(result.recommendationCoverage.qualified, 1);
+  assert.equal(result.recommendationCoverage.momentumCandidates, null);
+  assert.match(result.recommendationCoverage.momentumUnavailableReason, /旧模型/);
   assert.deepEqual(result.recommendationCoverage.signals, { bottomWaiting:0, rebounded:0, breakout:1, structure:0, other:0 });
 
   const fresh = { recommendations:[{code:'600002'}] };
@@ -450,6 +545,28 @@ test('本轮大盘推荐为空时保留最近成功推荐并刷新行情', () =>
   const empty = { recommendations: [] };
   assert.equal(restoreCachedMarketRecommendations(empty, obsolete, []), false);
   assert.deepEqual(empty.recommendations, []);
+});
+
+test('旧推荐模型缓存不能复用为双轨推荐结果', () => {
+  const now = Date.parse('2026-09-04T07:05:00.000Z');
+  const oldCache = {
+    recommendations:[{code:'600001'}], momentumRecommendations:[],
+    recommendationsFetchedAt:'2026-09-04T07:01:00.000Z',
+    recommendationCoverage:{modelVersion:'2026-09-03-capital-rotation-v3',outcomeFeedback:{signature:'same'}}
+  };
+  const currentCache = {
+    ...oldCache,
+    recommendationCoverage:{modelVersion:'2026-09-04-sector-capital-dual-v4',directSectorCapital:0,outcomeFeedback:{signature:'same'}}
+  };
+  assert.equal(canReuseMarketRecommendations(oldCache, {feedbackSignature:'same', now}), false);
+  assert.equal(canReuseMarketRecommendations(currentCache, {feedbackSignature:'same', now}), true);
+  assert.equal(canReuseMarketRecommendations(currentCache, {feedbackSignature:'changed', now}), false);
+  assert.equal(canReuseMarketRecommendations(currentCache, {feedbackSignature:'same', now:Date.parse('2026-09-04T06:59:00.000Z')}), false);
+  assert.equal(canReuseMarketRecommendations(currentCache, {feedbackSignature:'same', hasDirectSectorCapital:true, now}), false);
+  assert.equal(canReuseMarketRecommendations({
+    ...currentCache,
+    recommendationCoverage:{...currentCache.recommendationCoverage,directSectorCapital:120}
+  }, {feedbackSignature:'same', hasDirectSectorCapital:true, now}), true);
 });
 
 test('command input uses a focus-hidden recommendation prompt', () => {
@@ -1309,6 +1426,30 @@ test('大盘推荐候选覆盖扩大到120只并保持行业分散', () => {
   assert.ok(candidates.some(item => item.code.startsWith('3')));
 });
 
+test('板块轮动和强势候选优先进入历史精筛且仍保持去重', () => {
+  const rotation = [{code:'000876',industry:'饲料',rotationProfiles:[{name:'猪肉概念'}]}];
+  const momentum = [{code:'002714',industry:'养殖业',rotationProfiles:[{name:'生猪养殖'}]}];
+  const candidates = selectMarketRecommendationCandidates({
+    rotationScreened:rotation,
+    momentumScreened:momentum,
+    breakoutScreened:[...rotation, {code:'600001',industry:'电子'}],
+    consolidationScreened:[], reboundScreened:[]
+  }, 3);
+  assert.deepEqual(candidates.map(item => item.code), ['000876','002714','600001']);
+});
+
+test('强势追踪单独成组并限制每个板块数量', () => {
+  const items = [
+    {code:'1',signalScore:90,momentumDecision:{passed:true,score:92,profile:{name:'猪肉概念'},entryAssessment:{status:'强势追踪，不追高'}}},
+    {code:'2',signalScore:88,momentumDecision:{passed:true,score:90,profile:{name:'猪肉概念'},entryAssessment:{status:'强势追踪，等待首次回踩'}}},
+    {code:'3',signalScore:86,momentumDecision:{passed:true,score:89,profile:{name:'猪肉概念'},entryAssessment:{status:'强势追踪，等待首次回踩'}}},
+    {code:'4',signalScore:84,momentumDecision:{passed:true,score:87,profile:{name:'农业种植'},entryAssessment:{status:'强势追踪，等待首次回踩'}}}
+  ];
+  const result = finalizeMomentumRecommendations(items, 8, 2);
+  assert.deepEqual(result.map(item => item.code), ['1','2','4']);
+  assert.ok(result.every(item => item.signal === '强势追踪' && item.recommendationTier === '强势追踪'));
+});
+
 test('严格推荐不足时补足高质量横盘观察候选但不生成买入结论', () => {
   const strict = {
     code:'600001', signal:'突破确认', signalScore:72, technicalScore:80,
@@ -1527,6 +1668,13 @@ test('消息面和大盘环境会调整个股及大盘推荐入场结论', () =>
   assert.equal(sectorOutflow.entryAssessment.allowed, false);
   assert.equal(sectorOutflow.entryAssessment.status, '板块退潮，等待确认');
   assert.match(sectorOutflow.entryAssessment.summary, /半导体.*资金退潮/);
+
+  const directSectorFlow = applyEntryContextAssessment(analysis, {
+    newsContext:{signal:'中性',items:[]}, riskProfile:{status:'clear'},
+    subject:{industry:'养殖业',rotationProfiles:[{name:'猪肉概念',changePct:5.92,upRatio:.9,rotationScore:91,rotationState:'资金升温',mainNetInflow:1555330704,mainNetPct:9.65,capitalRank:2,capitalEstimated:false}]},
+    marketOverview:{breadth:{up:2600,down:2200},indices:[{changePct:.1}],sectors:[]}
+  });
+  assert.match(directSectorFlow.entryAssessment.summary, /猪肉概念.*主力净流入15\.55亿.*占比\+9\.65%.*资金排名2/);
 });
 
 test('低价高估值弱反弹股票不会进入大盘推荐', { timeout: 60000 }, async () => {

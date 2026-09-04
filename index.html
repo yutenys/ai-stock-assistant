@@ -43,9 +43,22 @@
           <div><b id="marketTurnover">--</b><span>两市成交额</span></div>
         </div>
         <section class="market-section"><h3>板块轮动</h3><div id="marketSectors"></div></section>
-        <section class="market-section"><h3>资金活跃度（成交额）</h3><div id="marketFunds"></div><div id="marketActiveStocks" class="market-stocks"></div></section>
+        <section class="market-section"><h3 id="marketFundsTitle">板块主力资金</h3><div id="marketCapitalMeta" class="market-capital-meta"></div><div id="marketFunds"></div><div id="marketActiveStocks" class="market-stocks"></div></section>
         <section class="market-section"><h3>涨跌停</h3><div id="marketLimits"></div></section>
-        <section class="market-section"><div class="market-section-title"><h3>技术形态推荐</h3><button id="addMarketRecommendations" class="small">查看更多</button></div><div id="marketRecommendationCoverage" class="market-coverage"></div><div id="marketRecommendations"></div></section>
+        <section class="market-section market-recommendation-section">
+          <div class="market-recommendation-tabs" role="tablist" aria-label="推荐方案切换">
+            <button id="marketStableTab" class="market-recommendation-tab active" role="tab" aria-selected="true" aria-controls="marketStablePanel">方案A · 稳健轮动 <span id="marketStableCount">0</span></button>
+            <button id="marketMomentumTab" class="market-recommendation-tab" role="tab" aria-selected="false" aria-controls="marketMomentumPanel">方案B · 强势追踪 <span id="marketMomentumCount">0</span></button>
+          </div>
+          <div id="marketStablePanel" role="tabpanel" aria-labelledby="marketStableTab">
+            <div class="market-section-title"><h3>稳健轮动推荐</h3><button id="addMarketRecommendations" class="small">查看更多</button></div>
+            <div id="marketRecommendationCoverage" class="market-coverage"></div><div id="marketRecommendations"></div>
+          </div>
+          <div id="marketMomentumPanel" class="hidden" role="tabpanel" aria-labelledby="marketMomentumTab">
+            <div class="market-section-title"><h3>强势追踪推荐</h3><button id="addMarketMomentumRecommendations" class="small">查看更多</button></div>
+            <div id="marketMomentumCoverage" class="market-coverage"></div><div id="marketMomentumRecommendations"></div>
+          </div>
+        </section>
         <section class="market-section"><h3>市场消息</h3><div id="marketNews"></div></section>
         <div id="marketError" class="note inline-note hidden"></div>
       </aside>
