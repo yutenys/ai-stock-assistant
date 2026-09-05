@@ -4,24 +4,22 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https:; object-src 'none'; base-uri 'none'; form-action 'none'" />
-  <title>AI股票观察助手</title>
+  <title>股票观察助手</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
   <div class="app">
     <header class="hero">
       <div>
-        <h1>AI股票观察助手</h1>
-        <p>A股行业与产业链：需求命令 → 产业链分区 → 重点关注池 → 标签管理 → 刷新行情</p>
+        <h1>股票观察助手</h1>
         <small id="lastUpdated"></small>
       </div>
-      <button id="refreshAll" class="primary">刷新实际行情</button>
     </header>
 
     <section class="command-box card">
       <label>需求命令</label>
       <div class="command-row">
-        <textarea id="commandInput">查找A股AI整个行业从下游到上游整个产业链相关股票，按照产业类型分区，列出龙头、待突破、已突破、重点关注、待回调、当前价格、最新情况和原因</textarea>
+        <textarea id="commandInput" rows="1" placeholder="输入你想要搜索的相关内容，会给你生成对应内容的股票推荐"></textarea>
         <button id="generateBtn" class="primary">生成/更新股票池</button>
       </div>
     </section>
@@ -31,20 +29,36 @@
       <aside id="marketPanel" class="market card">
         <div class="market-head">
           <div><h2>大盘分析</h2><small id="marketUpdated">正在加载...</small></div>
-          <button id="refreshMarketOverview" class="small" title="刷新大盘数据">刷新</button>
+          <div class="market-head-actions">
+            <button id="refreshMarketOverview" class="small" title="刷新大盘数据">刷新</button>
+            <button id="liveNewsView" class="small" title="查看24条实时财经新闻">24新闻</button>
+          </div>
         </div>
         <div id="marketAnalysis" class="market-analysis">正在获取实时市场数据...</div>
         <div id="marketIndices" class="market-indices"></div>
         <div class="market-stat-grid">
-          <div><b id="marketUp">--</b><span>上涨</span></div>
-          <div><b id="marketDown">--</b><span>下跌</span></div>
+          <div><b id="marketUp">--</b><span class="up">上涨</span></div>
+          <div><b id="marketDown">--</b><span class="down">下跌</span></div>
           <div><b id="marketFlat">--</b><span>平盘</span></div>
           <div><b id="marketTurnover">--</b><span>两市成交额</span></div>
         </div>
         <section class="market-section"><h3>板块轮动</h3><div id="marketSectors"></div></section>
-        <section class="market-section"><h3>资金活跃度（成交额）</h3><div id="marketFunds"></div><div id="marketActiveStocks" class="market-stocks"></div></section>
+        <section class="market-section"><h3 id="marketFundsTitle">板块主力资金</h3><div id="marketCapitalMeta" class="market-capital-meta"></div><div id="marketFunds"></div><div id="marketActiveStocks" class="market-stocks"></div></section>
         <section class="market-section"><h3>涨跌停</h3><div id="marketLimits"></div></section>
-        <section class="market-section"><h3>即将突破观察</h3><div id="marketRecommendationCoverage" class="market-coverage"></div><div id="marketRecommendations"></div></section>
+        <section class="market-section market-recommendation-section">
+          <div class="market-recommendation-tabs" role="tablist" aria-label="推荐方案切换">
+            <button id="marketStableTab" class="market-recommendation-tab active" role="tab" aria-selected="true" aria-controls="marketStablePanel">方案A · 稳健轮动 <span id="marketStableCount">0</span></button>
+            <button id="marketMomentumTab" class="market-recommendation-tab" role="tab" aria-selected="false" aria-controls="marketMomentumPanel">方案B · 强势追踪 <span id="marketMomentumCount">0</span></button>
+          </div>
+          <div id="marketStablePanel" role="tabpanel" aria-labelledby="marketStableTab">
+            <div class="market-section-title"><h3>稳健轮动推荐</h3><button id="addMarketRecommendations" class="small">查看更多</button></div>
+            <div id="marketRecommendationCoverage" class="market-coverage"></div><div id="marketRecommendations"></div>
+          </div>
+          <div id="marketMomentumPanel" class="hidden" role="tabpanel" aria-labelledby="marketMomentumTab">
+            <div class="market-section-title"><h3>强势追踪推荐</h3><button id="addMarketMomentumRecommendations" class="small">查看更多</button></div>
+            <div id="marketMomentumCoverage" class="market-coverage"></div><div id="marketMomentumRecommendations"></div>
+          </div>
+        </section>
         <section class="market-section"><h3>市场消息</h3><div id="marketNews"></div></section>
         <div id="marketError" class="note inline-note hidden"></div>
       </aside>
@@ -52,7 +66,8 @@
       <section class="left">
         <div class="toolbar">
           <div class="toolbar-left">
-            <input id="searchInput" placeholder="搜索名称 / 代码 / 产业 / 状态" />
+            <input id="searchInput" aria-label="线上股票搜索" placeholder="线上股票搜索：名称 / 代码 / 产业 / 状态" />
+            <button id="refreshAll" class="primary">刷新实际行情</button>
             <button id="cardView">卡牌</button>
             <button id="tableView">列表</button>
           </div>
@@ -94,6 +109,38 @@
           </div>
         </div>
 
+        <div id="marketLabelPanel" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="marketLabelTitle">
+          <div class="label-modal market-label-modal">
+            <div class="add-panel-head">
+              <div><b id="marketLabelTitle">全部推荐与一键保存</b><p>先选择或新建标签，再勾选需要保存的推荐股。</p></div>
+              <button id="closeMarketLabelPanel">关闭</button>
+            </div>
+            <div class="market-save-targets">
+              <div class="market-label-toolbar"><b>保存到标签</b></div>
+              <div id="marketLabelChoices" class="label-choice-list"></div>
+              <div class="label-modal-actions market-new-label">
+                <input id="newMarketLabelName" placeholder="新标签名称，可不填" />
+                <button id="saveMarketRecommendations" class="primary">一键保存</button>
+              </div>
+            </div>
+            <div class="market-label-toolbar"><b id="marketRecommendationListTitle">推荐股票</b><button id="toggleMarketStocks" class="small">取消全选</button></div>
+            <div id="marketStockChoices" class="market-stock-choices"></div>
+          </div>
+        </div>
+
+        <div id="liveNewsModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="liveNewsModalTitle">
+          <div class="label-modal live-news-modal">
+            <div class="add-panel-head">
+              <div><b id="liveNewsModalTitle">实时新闻详情</b><p id="liveNewsModalMeta"></p></div>
+              <button id="closeLiveNewsModal" class="small live-news-close">关闭</button>
+            </div>
+            <div id="liveNewsModalContent" class="live-news-modal-content"></div>
+            <div class="label-modal-actions">
+              <button id="openLiveNewsOriginal" class="small hidden">打开原文</button>
+            </div>
+          </div>
+        </div>
+
         <div id="detailPanel" class="detail-panel hidden"></div>
         <div id="stockContainer"></div>
       </section>
@@ -113,6 +160,11 @@
               <button id="deleteSelectedFromLabel" class="danger small hidden">删除选中</button>
             </div>
           </div>
+          <div id="labelSortControls" class="label-sort-controls">
+            <label>评分<select id="labelScoreSort"><option value="none">不排序</option><option value="asc">正序</option><option value="desc">倒序</option></select></label>
+            <label>涨跌幅<select id="labelChangeSort"><option value="none">不排序</option><option value="asc">正序</option><option value="desc">倒序</option></select></label>
+            <label>价格<select id="labelPriceSort"><option value="none">不排序</option><option value="asc">正序</option><option value="desc">倒序</option></select></label>
+          </div>
           <div class="label-actions">
             <button id="selectLabelAll" class="small hidden">全选/反选</button>
           </div>
@@ -127,6 +179,7 @@
     <button id="pinLabelStock" role="menuitem">置顶</button>
     <button id="removeLabelStock" class="danger-text" role="menuitem">从当前标签删除</button>
   </div>
+  <button id="backToTop" class="back-to-top" type="button" title="回到顶部" aria-label="回到顶部">↑</button>
   <script src="renderer.js"></script>
 </body>
 </html>
