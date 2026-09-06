@@ -219,7 +219,7 @@ app.whenReady().then(async () => {
     ],
     momentumRecommendations:[{code:'603151',name:'邦基科技',industry:'饲料',price:18.13,changePct:10.01,signal:'强势追踪',recommendationTier:'强势追踪',newsLabel:'消息中性',signalScore:89,verdict:'等待回踩',entryAssessment:{allowed:false,status:'强势追踪，不追高',summary:'等待首次缩量回踩。'},reason:'强势追踪：猪肉概念主力资金净流入15.55亿，不追高。',momentumDecision:{passed:true,score:89,profile:{name:'猪肉概念'},entryAssessment:{allowed:false,status:'强势追踪，不追高',summary:'等待首次缩量回踩。'}},factorAnalysis:{score:76,available:5,total:7,sectorProfile:{name:'猪肉概念',score:91,label:'资金升温'}}}],
     sectorCapital:{direct:true,source:'东方财富概念板块主力资金',fetchedAt:'2026-08-12T13:30:00.000Z',cached:true,stale:true},
-    recommendationCoverage: { scanned: 5230, prefiltered: 428, analyzed: 60, industries: 42, directoryAvailable: true, consolidationCandidates:5, directSectorCapital:120, rotationCandidates:32, momentumCandidates:18, momentumQualified:1, riskChecked: 16, riskRejected: 2, riskUnknown: 1, riskUnverifiedIncluded: 1, qualified: 13, signals: { bottomWaiting: 3, rebounded: 18, breakout: 12 } },
+    recommendationCoverage: { scanned: 5230, prefiltered: 428, analyzed: 60, fullMarketHistoryCovered:5200, fullMarketCandidates:700, industries: 42, directoryAvailable: true, consolidationCandidates:5, directSectorCapital:120, rotationCandidates:32, momentumCandidates:18, momentumQualified:1, riskChecked: 16, riskRejected: 2, riskUnknown: 1, riskUnverifiedIncluded: 1, qualified: 13, signals: { bottomWaiting: 3, rebounded: 18, breakout: 12 } },
     newsContext: { signal: '偏积极', summary: '政策与行业消息偏积极，仍需结合盘面确认。', items: [{ title: '中药行业最新政策消息', link: 'https://example.com/market-news', publishedAt: '2026-08-12 11:00:00', source: '测试资讯' }] },
     analysis: '三大指数多数上涨，市场情绪偏强；资金集中于半导体、中药。',
     source: '腾讯指数 + 东方财富市场统计',
@@ -931,7 +931,9 @@ app.whenReady().then(async () => {
     && state.detailClickQuoteState.savedChangePct === -0.72;
   const marketUsable = /上证指数|深证成指|创业板指/.test(state.marketText)
     && ['板块轮动','板块主力资金','猪肉概念','15.55亿','稳健轮动推荐','强势追踪推荐','邦基科技','强势追踪，不追高','涨停 68','跌停 7','底部待反弹','已反弹','消息确认','行业消息偏积极'].every(text => state.marketText.includes(text))
-    && state.marketText.includes('真实板块资金缓存')
+    && state.marketText.includes('板块真实资金缓存已过期，本轮不作为强势确认')
+    && state.marketText.includes('本轮在线精筛 60 只')
+    && state.marketText.includes('全量历史 5200 只、历史候选 700 只')
     && state.marketText.includes('数据提示：技术形态候选本轮未生成')
     && state.marketText.includes('未来半年风险核验 16 只，排除 2 只，未确认 1 只（降分保留 1 只）')
     && state.marketText.includes('横盘候选 5 只')

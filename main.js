@@ -26,7 +26,7 @@ let marketDirectorySavedAt = 0;
 const CONTROLLED_VOLUME_MIN = 1.5;
 const CONTROLLED_VOLUME_MAX = 4;
 const SECTOR_CAPITAL_FALLBACK_MAX_AGE_MS = 72 * 60 * 60 * 1000;
-const RECOMMENDATION_MODEL_VERSION = '2026-09-04-sector-capital-dual-v4';
+const RECOMMENDATION_MODEL_VERSION = '2026-09-05-full-universe-v8';
 
 function isControlledVolumeExpansion(value) {
   const ratio = Number(value);
@@ -313,6 +313,8 @@ function requestText(url, timeout = 12000, extraHeaders = {}, encoding = 'utf8',
       }
     }, (res) => {
       const chunks = [];
+      res.on('error', reject);
+      res.on('aborted', () => reject(new Error('行情响应中途断开')));
       if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location && redirectsLeft > 0) {
         const redirectedUrl = new URL(res.headers.location, url).toString();
         res.resume();
@@ -603,7 +605,8 @@ function secidOf(code) {
 }
 
 function finiteNumber(value) {
-  if (value === '' || value == null) return null;
+  if (value == null || !['number','string'].includes(typeof value)
+    || typeof value === 'string' && !value.trim()) return null;
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
 }
@@ -1048,6 +1051,12 @@ function normalizeSectorCapitalName(value) {
   return cleanStockName(value).replace(/[ⅠⅡⅢⅣⅤ]+$/u, '').replace(/[一二三四五]级$/u, '').trim();
 }
 
+function eastmoneyListRows(data) {
+  const rows = data?.diff;
+  if (!rows || typeof rows !== 'object') return [];
+  return (Array.isArray(rows) ? rows : Object.values(rows)).filter(row => row && typeof row === 'object');
+}
+
 function normalizeSectorCapitalRows(rows, boardType, host, fetchedAt = new Date().toISOString()) {
   const typeLabel = boardType === 'concept' ? '概念' : '行业';
   return (rows || []).map(row => ({
@@ -1067,14 +1076,42 @@ function normalizeSectorCapitalRows(rows, boardType, host, fetchedAt = new Date(
 
 async function fetchEastmoneyHostPath(pathname, timeout = 12000) {
   const errors = [];
-  for (const host of ['https://82.push2.eastmoney.com', 'https://push2.eastmoney.com']) {
+  const hosts = ['https://push2.eastmoney.com', 'https://82.push2.eastmoney.com'];
+  const routes = [...hosts.map(host => ({host, path:`/webguest${pathname}`})), ...hosts.map(host => ({host, path:pathname}))];
+  for (const {host, path} of routes) {
     try {
-      return { json:JSON.parse(await requestText(`${host}${pathname}`, timeout)), host, errors };
+      const json = JSON.parse(await requestText(`${host}${path}`, timeout));
+      if (json?.rc !== 0 || !json.data || !json.data.diff) throw new Error('板块接口业务错误或缺少列表数据');
+      return { json, host, errors };
     } catch (err) {
-      errors.push(`${new URL(host).hostname}: ${err.message || err}`);
+      errors.push(`${new URL(host).hostname}${path.split('?')[0]}: ${err.message || err}`);
     }
   }
   throw new Error(errors.join('；') || '东方财富板块接口不可用');
+}
+
+async function fetchEastmoneyListPages(params, timeout, fetchPage = fetchEastmoneyHostPath) {
+  const query = new URLSearchParams(params);
+  query.set('pn', '1');
+  query.set('pz', '100');
+  const first = await fetchPage(`/api/qt/clist/get?${query}`, timeout);
+  const rows = eastmoneyListRows(first.json?.data);
+  const total = finiteNumber(first.json?.data?.total);
+  if (total === null || total < 0 || total > 10000) throw new Error('板块列表总数无效');
+  const pages = Math.ceil(total / 100);
+  const results = await settleWithConcurrency(Array.from({length:Math.max(0, pages - 1)}, (_, i) => i + 2), 3, async page => {
+    const next = new URLSearchParams(query);
+    next.set('pn', String(page));
+    return fetchPage(`/api/qt/clist/get?${next}`, timeout);
+  });
+  for (const result of results) {
+    if (result.status === 'rejected') throw result.reason;
+    rows.push(...eastmoneyListRows(result.value.json?.data));
+    first.errors.push(...result.value.errors);
+  }
+  const unique = [...new Map(rows.filter(row => row.f12).map(row => [String(row.f12), row])).values()];
+  if (unique.length < total) throw new Error(`板块列表不完整：${unique.length}/${total}`);
+  return {...first, rows:unique};
 }
 
 async function fetchSectorCapitalRank(boardType, sortField) {
@@ -1083,8 +1120,8 @@ async function fetchSectorCapitalRank(boardType, sortField) {
     pn:'1', pz:'100', po:'1', np:'1', fltt:'2', invt:'2', fid:sortField,
     fs:boardFilter, fields:'f12,f14,f3,f20,f62,f184', _:String(Date.now())
   });
-  const response = await fetchEastmoneyHostPath(`/api/qt/clist/get?${params}`, 3500);
-  const rows = normalizeSectorCapitalRows(response.json?.data?.diff || [], boardType, response.host);
+  const response = await fetchEastmoneyListPages(params, 3500);
+  const rows = normalizeSectorCapitalRows(response.rows, boardType, response.host);
   if (!rows.length) throw new Error(`东方财富${boardType === 'concept' ? '概念' : '行业'}板块资金返回为空`);
   return { rows, host:response.host, warnings:response.errors };
 }
@@ -1096,9 +1133,7 @@ async function fetchSectorCapitalFlow(force = false) {
   const previous = readDiskCache('sector-capital', SECTOR_CAPITAL_FALLBACK_MAX_AGE_MS);
   const requests = await Promise.allSettled([
     fetchSectorCapitalRank('industry', 'f62'),
-    fetchSectorCapitalRank('industry', 'f3'),
-    fetchSectorCapitalRank('concept', 'f62'),
-    fetchSectorCapitalRank('concept', 'f3')
+    fetchSectorCapitalRank('concept', 'f62')
   ]);
   const warnings = [];
   const byCode = new Map();
@@ -1117,7 +1152,7 @@ async function fetchSectorCapitalFlow(force = false) {
   });
   if (!byCode.size) {
     if (previous?.rows?.length) {
-      const fallback = { ...previous, cached:true, stale:true, warnings:[...(previous.warnings || []), ...warnings] };
+      const fallback = { ...previous, rows:previous.rows.map(row => ({...row, capitalStale:true})), cached:true, stale:true, warnings:[...(previous.warnings || []), ...warnings] };
       sectorCapitalCache = { savedAt:Date.now(), value:fallback };
       return fallback;
     }
@@ -1153,15 +1188,15 @@ async function fetchSectorCapitalFlow(force = false) {
 }
 
 async function fetchSectorBoardMemberCodes(board) {
-  const cacheName = `sector-members-${board.code}`;
+  const cacheName = `sector-members-v2-${board.code}`;
   const cached = readDiskCache(cacheName, 6 * 60 * 60 * 1000);
   if (cached?.length) return cached;
   const params = new URLSearchParams({
     pn:'1', pz:'100', po:'1', np:'1', fltt:'2', invt:'2', fid:'f3',
     fs:`b:${board.code}`, fields:'f12', _:String(Date.now())
   });
-  const response = await fetchEastmoneyHostPath(`/api/qt/clist/get?${params}`, 4000);
-  const codes = [...new Set((response.json?.data?.diff || []).map(row => String(row.f12 || '').slice(-6)).filter(code => /^\d{6}$/.test(code)))];
+  const response = await fetchEastmoneyListPages(params, 4000);
+  const codes = [...new Set(response.rows.map(row => String(row.f12 || '').slice(-6)).filter(code => /^\d{6}$/.test(code)))];
   if (!codes.length) throw new Error(`${board.name}成分返回为空`);
   writeDiskCache(cacheName, codes);
   return codes;
@@ -1189,7 +1224,7 @@ function sectorQuoteStats(memberCodes, marketQuotes) {
 function mergeSectorCapitalRows(rotation, capitalRows, marketQuotes = []) {
   const baseRows = rotation?.sectors || [];
   const baseByName = new Map(baseRows.map(item => [normalizeSectorCapitalName(item.name), item]));
-  const directValues = (capitalRows || []).map(item => finiteNumber(item.mainNetInflow)).filter(value => value !== null);
+  const directValues = (capitalRows || []).filter(item=>!item.capitalStale).map(item => finiteNumber(item.mainNetInflow)).filter(value => value !== null);
   const mergedByName = new Map();
   (capitalRows || []).forEach(row => {
     const name = normalizeSectorCapitalName(row.name);
@@ -1202,7 +1237,7 @@ function mergeSectorCapitalRows(rotation, capitalRows, marketQuotes = []) {
     const stats = memberStats || base;
     const mainNetInflow = finiteNumber(row.mainNetInflow);
     const mainNetPct = finiteNumber(row.mainNetPct);
-    const direct = mainNetInflow !== null;
+    const direct = mainNetInflow !== null && !row.capitalStale;
     const breadthScore = Number.isFinite(Number(stats.upRatio)) ? Number(stats.upRatio) * 100 : 50;
     const changePct = finiteNumber(row.changePct) ?? finiteNumber(stats.changePct) ?? 0;
     const flowRankScore = direct ? percentileScore(directValues, mainNetInflow) : Number(stats.rotationScore || 50);
@@ -1221,11 +1256,11 @@ function mergeSectorCapitalRows(rotation, capitalRows, marketQuotes = []) {
       mainNetInflow,
       mainNetPct,
       capitalRank:Number(row.capitalRank) || null,
-      capitalEstimated:!direct,
+      capitalEstimated:mainNetInflow === null,
       capitalSource:row.source || stats.source || '全市场行业涨幅、上涨广度与成交活跃度',
       capitalFetchedAt:row.fetchedAt || '',
       rotationScore,
-      rotationState:rotationScore >= 72 ? '资金升温' : rotationScore >= 58 ? '轮动活跃' : rotationScore <= 38 ? '资金退潮' : '轮动中性'
+      rotationState:row.capitalStale ? '资金缓存待核验' : rotationScore >= 72 ? '资金升温' : rotationScore >= 58 ? '轮动活跃' : rotationScore <= 38 ? '资金退潮' : '轮动中性'
     });
   });
   baseRows.forEach(row => {
@@ -1243,9 +1278,9 @@ function mergeSectorCapitalRows(rotation, capitalRows, marketQuotes = []) {
   });
   const sectors = [...mergedByName.values()].sort((a, b) => Number(b.rotationScore || 0) - Number(a.rotationScore || 0)
     || Number(b.mainNetInflow || 0) - Number(a.mainNetInflow || 0) || Number(b.changePct || 0) - Number(a.changePct || 0));
-  const directFunds = sectors.filter(item => !item.capitalEstimated && finiteNumber(item.mainNetInflow) !== null)
+  const directFunds = sectors.filter(item => !item.capitalEstimated && !item.capitalStale && finiteNumber(item.mainNetInflow) !== null)
     .sort((a, b) => Number(b.mainNetInflow) - Number(a.mainNetInflow));
-  const estimatedFunds = sectors.filter(item => item.capitalEstimated)
+  const estimatedFunds = sectors.filter(item => item.capitalEstimated || item.capitalStale)
     .sort((a, b) => Number(b.rotationScore || 0) - Number(a.rotationScore || 0));
   const weakSectors = [...sectors].sort((a, b) => {
     const aFlow = finiteNumber(a.mainNetInflow);
@@ -1264,18 +1299,42 @@ function resolveStockRotationProfiles(stock, sectors) {
     if (members.some(member => String(member || '').slice(-6) === code)) return true;
     const sectorName = normalizeSectorCapitalName(sector.name);
     return industry && industry !== '行业待确认' && sectorName === industry;
-  }).sort((a, b) => Number(a.capitalEstimated) - Number(b.capitalEstimated)
+  }).sort((a, b) => Number(Boolean(a.capitalStale)) - Number(Boolean(b.capitalStale))
+    || Number(a.capitalEstimated) - Number(b.capitalEstimated)
     || Number(b.rotationScore || 0) - Number(a.rotationScore || 0)
     || Number(b.mainNetInflow || 0) - Number(a.mainNetInflow || 0));
+}
+
+function annotateSectorRotation(sectors, previous, tradeDate) {
+  const priorByName = new Map((previous?.sectors || []).map(row=>[row.name,row]));
+  return (sectors || []).map(row=>{
+    const prior = priorByName.get(row.name);
+    // Repeated intraday refreshes must not be reported as separate trading days.
+    const baseline = previous?.tradeDate === tradeDate ? prior?.rotationTransition?.baseline
+      : previous?.tradeDate && previous.tradeDate < tradeDate && prior ? {
+        date:previous.tradeDate, score:finiteNumber(prior.rotationScore),
+        mainNetInflow:finiteNumber(prior.mainNetInflow), capitalEstimated:prior.capitalEstimated,
+        capitalStale:Boolean(prior.capitalStale)
+      } : null;
+    const comparable = Boolean(baseline && !row.capitalStale && !baseline.capitalStale
+      && Boolean(row.capitalEstimated) === Boolean(baseline.capitalEstimated)
+      && baseline.score !== null && finiteNumber(row.rotationScore) !== null);
+    const delta = comparable ? roundMetric(row.rotationScore-baseline.score) : null;
+    const state = !comparable ? '轮动持续性待验证'
+      : delta >= 8 ? '较前次升温' : delta <= -8 ? '较前次降温' : '轮动相对稳定';
+    return {...row,rotationTransition:{available:comparable,baseline,delta,state,
+      summary:comparable ? `${row.name}相对${baseline.date}轮动评分变化${delta >= 0 ? '+' : ''}${delta}，${state}（非收益预测）`
+        : `${row.name}缺少同口径跨交易日快照，不能仅凭单日涨幅确认持续轮动`}};
+  });
 }
 
 function selectRotationPriorityCandidates(scored, sectors, options = {}) {
   const limit = Number(options.limit) || 40;
   const perSector = Number(options.perSector) || 4;
   const sectorLimit = Number(options.sectorLimit) || 5;
-  const eligibleSectors = (sectors || []).filter(item => item.capitalEstimated
+  const eligibleSectors = (sectors || []).filter(item => !item.capitalStale && (item.capitalEstimated
     ? Number(item.rotationScore) >= 72
-    : Number(item.mainNetInflow) > 0 && Number(item.mainNetPct || 0) > 0)
+    : Number(item.mainNetInflow) > 0 && Number(item.mainNetPct || 0) > 0))
     .sort((a, b) => Number(a.capitalEstimated) - Number(b.capitalEstimated)
       || Number(b.rotationScore || 0) - Number(a.rotationScore || 0)
       || Number(b.mainNetPct || 0) - Number(a.mainNetPct || 0)
@@ -1300,7 +1359,7 @@ function selectRotationPriorityCandidates(scored, sectors, options = {}) {
 }
 
 function momentumRecommendationDecision(item) {
-  const profile = (item?.rotationProfiles || []).find(row => !row.capitalEstimated && Number(row.mainNetInflow) > 0 && Number(row.mainNetPct) > 0);
+  const profile = (item?.rotationProfiles || []).find(row => !row.capitalEstimated && !row.capitalStale && Number(row.mainNetInflow) > 0 && Number(row.mainNetPct) > 0);
   const nearHigh = Number(item?.high) > 0 ? Number(item.price) / Number(item.high) : 0;
   const changePct = Number(item?.changePct || 0);
   const volumeRatio = Number(item?.snapshotVolumeRatio ?? item?.analysis?.volumeRatio);
@@ -1329,7 +1388,9 @@ function momentumRecommendationDecision(item) {
 }
 
 function newsTimestamp(value) {
-  const text = String(value || '').trim().replace(/^(\d{4}-\d{2}-\d{2})\s+/, '$1T');
+  if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+  let text = String(value || '').trim().replace(/^(\d{4}-\d{2}-\d{2})\s+/, '$1T');
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?$/.test(text)) text += '+08:00';
   const parsed = Date.parse(text);
   return Number.isFinite(parsed) ? parsed : 0;
 }
@@ -1376,23 +1437,31 @@ function summarizeNews(news, sinceDate = '', options = {}) {
   ];
   const seen = new Set();
   const normalized = sortNewsNewestFirst(news || []).filter(item => {
-    const key = `${String(item?.title || '').replace(/\s+/g, '')}|${String(item?.link || '')}`;
-    if (!item?.title || seen.has(key)) return false;
-    seen.add(key);
-    const timestamp = newsTimestamp(item.publishedAt);
-    return !since || timestamp >= since;
+    const timestamp = newsTimestamp(item?.publishedAt);
+    if (timestamp > now || since && timestamp < since) return false;
+    const titleKey = `title:${String(item?.title || '').replace(/\s+/g, '')}`;
+    const linkKey = item?.link ? `link:${item.link}` : '';
+    if (!item?.title || seen.has(titleKey) || linkKey && seen.has(linkKey)) return false;
+    seen.add(titleKey);
+    if (linkKey) seen.add(linkKey);
+    return true;
   }).slice(0, 12).map(item => {
     const text = `${item.title || ''} ${item.summary || ''}`;
     const timestamp = newsTimestamp(item.publishedAt);
     const ageHours = timestamp ? Math.max(0, (now - timestamp) / 36e5) : null;
-    const recencyWeight = ageHours === null ? .15 : ageHours <= 6 ? 1 : ageHours <= 24 ? .9 : ageHours <= 72 ? .7 : ageHours <= 168 ? .4 : ageHours <= 720 ? .18 : .08;
+    const recencyWeight = ageHours === null ? 0 : ageHours <= 6 ? 1 : ageHours <= 24 ? .9 : ageHours <= 72 ? .7 : ageHours <= 168 ? .4 : ageHours <= 720 ? .18 : 0;
     const relevance = !subject && !code ? 1
       : (subject && text.includes(subject)) || (code && text.includes(code)) ? 1 : .12;
-    const denied = /澄清|不实|不存在|未涉及|否认/.test(text);
-    const positive = positiveTerms.filter(([term]) => text.includes(term));
-    const negative = negativeTerms.filter(([term]) => text.includes(term));
+    const clauses = text.split(/[。；;！!？?，,]/);
+    const affirmed = term => clauses.some(clause => {
+      const index = clause.indexOf(term);
+      return index >= 0 && !/(?:否认|不存在|未涉及|未|无|不)[^，。；]{0,6}$/.test(clause.slice(0,index))
+        && !/不实|传闻|取消|终止/.test(clause.slice(index + term.length));
+    });
+    const positive = positiveTerms.filter(([term]) => affirmed(term));
+    const negative = negativeTerms.filter(([term]) => affirmed(term));
     const positiveScore = positive.reduce((sum, [, weight]) => sum + weight, 0);
-    const negativeScore = negative.reduce((sum, [, weight]) => sum + weight, 0) * (denied ? .25 : 1);
+    const negativeScore = negative.reduce((sum, [, weight]) => sum + weight, 0);
     const weightedScore = (positiveScore - negativeScore) * recencyWeight * relevance;
     return {
       ...item, ageHours, recencyWeight, relevance, weightedScore,
@@ -1404,7 +1473,8 @@ function summarizeNews(news, sinceDate = '', options = {}) {
   const relevantItems = normalized.filter(item => item.relevance >= .5);
   const rawScore = relevantItems.reduce((sum, item) => sum + item.weightedScore, 0);
   let signal = rawScore >= 1.2 ? '偏积极' : rawScore <= -1.2 ? '偏谨慎' : '中性';
-  if (stale && signal === '偏积极') signal = '中性';
+  const recentPositive = relevantItems.some(item => item.ageHours !== null && item.ageHours <= 72 && item.weightedScore > 0);
+  if ((stale || !recentPositive) && signal === '偏积极') signal = '中性';
   const positive = [...new Set(relevantItems.flatMap(item => item.positiveTerms))];
   const negative = [...new Set(relevantItems.flatMap(item => item.negativeTerms))];
   const latestTimestamp = relevantItems.map(item => newsTimestamp(item.publishedAt)).filter(Boolean).sort((a, b) => b - a)[0] || 0;
@@ -1412,8 +1482,8 @@ function summarizeNews(news, sinceDate = '', options = {}) {
   const latestAgeHours = latestTimestamp ? Math.max(0, (now - latestTimestamp) / 36e5) : null;
   const freshness = stale ? '缓存数据' : latestAgeHours === null ? '发布时间未知' : latestAgeHours <= 24 ? '实时资讯' : latestAgeHours <= 72 ? '近期资讯' : '较早资讯';
   const available = relevantItems.length > 0;
-  const factorScore = available ? clampRecommendationScore(stale && rawScore > 0 ? 50 : 50 + rawScore * 9) : null;
-  const scoreAdjustment = !available || stale && rawScore > 0 ? 0 : Math.max(-16, Math.min(8, Math.round(rawScore * (rawScore < 0 ? 4 : 2))));
+  const factorScore = available ? clampRecommendationScore((stale || !recentPositive) && rawScore > 0 ? 50 : 50 + rawScore * 9) : null;
+  const scoreAdjustment = !available || (stale || !recentPositive) && rawScore > 0 ? 0 : Math.max(-16, Math.min(8, Math.round(rawScore * (rawScore < 0 ? 4 : 2))));
   const asOf = formatNewsTime(fetchedAt) || formatNewsTime(now);
   const latest = latestPublishedAt ? `${formatNewsTime(latestPublishedAt)}（${newsAgeLabel(latestAgeHours)}）` : '发布时间未知';
   const sourceLabel = options.source ? `，来源${options.source}` : '';
@@ -1497,8 +1567,8 @@ function assessReboundQuality(item) {
   const timingRisk = assessRecommendationTimingRisk(item);
   score -= timingRisk.penalty;
   reasons.push(...timingRisk.reasons);
-  const pe = Number(item.peRatio);
-  const pb = Number(item.pbRatio);
+  const pe = finiteNumber(item.peRatio);
+  const pb = finiteNumber(item.pbRatio);
   if (item.price < 3) { score -= 60; reasons.push('股价低于3元'); }
   else if (item.price < 5) { score -= 12; reasons.push('低价股波动风险'); }
   if ((item.amount || 0) < 8e7) { score -= 18; reasons.push('成交活跃度不足'); }
@@ -1523,8 +1593,8 @@ function assessBreakoutQuality(item) {
   const timingRisk = assessRecommendationTimingRisk(item);
   score -= timingRisk.penalty;
   reasons.push(...timingRisk.reasons);
-  const pe = Number(item.peRatio);
-  const pb = Number(item.pbRatio);
+  const pe = finiteNumber(item.peRatio);
+  const pb = finiteNumber(item.pbRatio);
   if (item.price < 3) { score -= 60; reasons.push('股价低于3元'); }
   else if (item.price < 5) { score -= 10; reasons.push('低价股波动风险'); }
   if ((item.amount || 0) < 8e7) { score -= 18; reasons.push('成交活跃度不足'); }
@@ -1619,6 +1689,33 @@ function fundFlowPeriodEvidence(flow) {
   return `近${flow.days}日${gross}，${direction}${formatCapitalAmount(flow.mainNetInflow)}，净流入${flow.positiveDays}日`;
 }
 
+function analyzeCapitalWindows(flow, tradeDate = '') {
+  const byDate = new Map();
+  for (const row of flow?.rows || []) {
+    const date = dateOnly(row?.date);
+    if (date && finiteNumber(row.mainNetInflow) !== null && (!tradeDate || date <= tradeDate)) byDate.set(date,row);
+  }
+  const rows = [...byDate].sort(([a],[b])=>a.localeCompare(b)).map(([date,row])=>({...row,date})).slice(-10);
+  const endDate = rows.at(-1)?.date || flow?.endDate || '';
+  const stale = Boolean(flow?.stale || tradeDate && endDate && endDate !== tradeDate);
+  if (!flow?.available || flow.estimated || !rows.length) return {
+    available:false, stale, weakening:false, confirmed:false,
+    summary:flow?.estimated ? '量价估算不作为真实主力资金确认' : '多周期资金数据不足'
+  };
+  const net = count => rows.length >= count ? rows.slice(-count).reduce((sum,row)=>sum+Number(row.mainNetInflow),0) : null;
+  const latestNet = net(1), net3 = net(3), net10 = net(10);
+  const latestRatio = finiteNumber(rows.at(-1).mainNetPct);
+  const recentOutDays = rows.slice(-3).filter(row=>row.mainNetInflow < 0).length;
+  const weakening = !stale && (latestNet < 0 && latestRatio !== null && latestRatio <= -3
+    || net3 !== null && net3 < 0 && recentOutDays >= 2);
+  const confirmed = !stale && !weakening && net3 !== null && net3 > 0 && latestNet > 0;
+  const signedNet = value => value === null ? '数据不足' : `${value < 0 ? '-' : '+'}${formatCapitalAmount(value)}`;
+  return {
+    available:true, stale, endDate, latestNet, latestRatio, net3, net10, recentOutDays, weakening, confirmed,
+    summary:`资金截至${endDate}，最近1日净额${signedNet(latestNet)}、3日${signedNet(net3)}、10日${signedNet(net10)}；${stale ? '与行情日期不同步，暂停资金确认' : weakening ? '近期资金转弱，累计净流入不能覆盖短期流出风险' : confirmed ? '短期资金方向一致' : '资金方向尚未同步'}`
+  };
+}
+
 function combineConsolidationBreakout(technical, flow) {
   if (!technical?.available) return {
     ...(technical || {}), available: false, status: technical?.status || '数据不足', score: 0,
@@ -1630,11 +1727,13 @@ function combineConsolidationBreakout(technical, flow) {
     flowAdjustment: 0,
     flowAvailable: false
   };
-  const flowAvailable = Boolean(flow?.available && flow.days);
-  const persistentOutflow = flowAvailable && flow.mainNetInflow < 0
-    && flow.netRatio <= -3 && flow.positiveDays <= Math.floor(flow.days * .4);
+  const windows = analyzeCapitalWindows(flow, technical.tradeDate);
+  const flowAvailable = Boolean(flow?.available && flow.days && !windows.stale);
+  const persistentOutflow = flowAvailable && (windows.weakening || flow.mainNetInflow < 0
+    && flow.netRatio <= -3 && flow.positiveDays <= Math.floor(flow.days * .4));
   const flowAdjustment = !flowAvailable ? 0
-    : flow.mainNetInflow > 0 && flow.positiveDays >= Math.ceil(flow.days * .6) ? 10
+    : persistentOutflow ? -18 : windows.available && !windows.confirmed ? 0
+      : flow.mainNetInflow > 0 && flow.positiveDays >= Math.ceil(flow.days * .6) ? 10
       : flow.mainNetInflow > 0 ? 5 : persistentOutflow ? -18 : -8;
   const score = clampRecommendationScore(technical.technicalScore + flowAdjustment);
   const status = technical.status === '结构偏弱' || persistentOutflow ? '结构偏弱'
@@ -1650,19 +1749,21 @@ function combineConsolidationBreakout(technical, flow) {
 
 function applyIndividualCapitalAssessment(analysis, flow) {
   const setup = analysis?.accumulationSetup || { passed: false, summary: '蓄势结构数据不足' };
-  const available = Boolean(flow?.available && flow.days);
+  const capitalWindows = analyzeCapitalWindows(flow, analysis.tradeDate);
+  const available = Boolean(flow?.available && flow.days && !capitalWindows.stale);
   const directFlow = available && !flow.estimated;
   const strongFlow = directFlow && flow.mainNetInflow > 0
-    && flow.positiveDays >= Math.ceil(flow.days * .6);
-  const persistentOutflow = available && flow.mainNetInflow < 0
-    && flow.netRatio <= (flow.estimated ? -6 : -3) && flow.positiveDays <= Math.floor(flow.days * .4);
+    && (!capitalWindows.available || capitalWindows.confirmed) && flow.positiveDays >= Math.ceil(flow.days * .6);
+  const persistentOutflow = available && (capitalWindows.weakening || flow.mainNetInflow < 0
+    && flow.netRatio <= (flow.estimated ? -6 : -3) && flow.positiveDays <= Math.floor(flow.days * .4));
   const rawAdjustment = !available ? 0
-    : flow.mainNetInflow > 0 && flow.positiveDays >= Math.ceil(flow.days * .6) ? 6
+    : persistentOutflow ? -8 : capitalWindows.available && !capitalWindows.confirmed ? 0
+      : flow.mainNetInflow > 0 && flow.positiveDays >= Math.ceil(flow.days * .6) ? 6
       : flow.mainNetInflow > 0 ? 3 : persistentOutflow ? -8 : -4;
   const adjustment = flow?.estimated ? Math.round(rawAdjustment * .5) : rawAdjustment;
   const status = !available ? '资金数据不足'
     : flow.estimated ? flow.mainNetInflow > 0 ? '量价资金改善' : persistentOutflow ? '量价资金偏弱' : '量价资金待确认'
-    : setup.passed && adjustment >= 6 ? '蓄势增强'
+    : capitalWindows.weakening ? '资金偏弱' : setup.passed && adjustment >= 6 ? '蓄势增强'
       : setup.passed && flow.mainNetInflow <= 0 ? '资金未确认'
         : setup.passed ? '形态成立'
           : persistentOutflow ? '资金偏弱' : flow.mainNetInflow > 0 ? '资金改善' : '等待确认';
@@ -1672,7 +1773,7 @@ function applyIndividualCapitalAssessment(analysis, flow) {
         : status === '资金偏弱' ? '阶段资金持续净流出，暂不支持低吸计划'
           : status === '资金改善' ? '阶段资金转强，但五线与三次放量结构尚未完整成立'
             : status === '资金数据不足' ? '本次不使用资金数据调整评分' : '资金与形态均需继续确认';
-  const breakoutPotential = combineConsolidationBreakout(analysis.consolidationBreakout, flow);
+  const breakoutPotential = combineConsolidationBreakout({...analysis.consolidationBreakout, tradeDate:analysis.tradeDate}, flow);
   const breakoutWeak = breakoutPotential.status === '结构偏弱';
   let entryAssessment = analysis.entryAssessment;
   if (entryAssessment && (persistentOutflow || breakoutWeak)) {
@@ -1706,25 +1807,30 @@ function applyIndividualCapitalAssessment(analysis, flow) {
   } else if (entryAssessment?.lowBuyCandidate && available && flow.mainNetInflow <= 0) {
     entryAssessment = { ...entryAssessment, status: '资金未确认', tone: 'warning', summary: `${entryAssessment.summary} 阶段主力资金尚未转为净流入，当前只观察，不执行低吸。` };
   }
+  if (entryAssessment && (capitalWindows.available || capitalWindows.stale)) {
+    entryAssessment = {...entryAssessment, summary:`${entryAssessment.summary} ${capitalWindows.summary}。`};
+    if (capitalWindows.stale) entryAssessment = {...entryAssessment, allowed:false, status:'资金时效待确认', tone:'warning'};
+  }
   const entryBlockedByFunds = Boolean(analysis.entryAssessment?.allowed && entryAssessment && !entryAssessment.allowed);
   const entryAllowed = Boolean(entryAssessment?.allowed);
   const verdict = entryAllowed ? '可关注'
-    : (persistentOutflow || breakoutWeak || entryBlockedByFunds) && analysis.verdict === '可关注' ? '等待确认' : analysis.verdict;
+    : (persistentOutflow || breakoutWeak || entryBlockedByFunds || capitalWindows.stale) && analysis.verdict === '可关注' ? '等待确认' : analysis.verdict;
   const buyCondition = entryAllowed ? entryAssessment.summary
-    : persistentOutflow
+    : capitalWindows.stale ? capitalWindows.summary : persistentOutflow
       ? '阶段主力资金持续净流出，暂不执行低吸；等待净流入天数恢复并重新满足原技术条件后再评估。'
       : breakoutWeak
         ? '横盘结构已经转弱，暂不执行低吸；等待重新站回箱底并修复量价结构后再评估。'
         : analysis.buyCondition;
   return {
     ...analysis,
+    capitalWindows,
     score: analysis.score,
     capitalAdjustedScore: Math.max(0, Math.min(100, Math.round((analysis.score || 0) + adjustment))),
     verdict,
     buyCondition,
     tradePlan: analysis.tradePlan ? {
       ...analysis.tradePlan,
-      enabled: entryAllowed ? true : persistentOutflow || breakoutWeak || entryBlockedByFunds ? false : analysis.tradePlan.enabled
+      enabled: entryAllowed ? true : persistentOutflow || breakoutWeak || entryBlockedByFunds || capitalWindows.stale ? false : analysis.tradePlan.enabled
     } : analysis.tradePlan,
     entryAssessment,
     breakoutPotential,
@@ -1785,16 +1891,16 @@ function applyEntryContextAssessment(analysis, { newsContext = null, riskProfile
   if (hasOverseas) evidence.push(overseas.summary);
   const overseasSummary = hasOverseas ? `，${overseas.summary}` : '';
   const usGrowthRisk = hasOverseas && overseas.severity === 'high' && isUSGrowthSensitive(subject);
-  const subjectIndustries = [subject?.industry, subject?.sector].map(cleanStockName).filter(value => value && !['行业待确认', '线上搜索'].includes(value));
   const relatedSector = subject?.rotationProfiles?.[0]
-    || (marketOverview?.sectors || []).find(item => subjectIndustries.some(value => item.name === value))
-    || (marketOverview?.sectors || []).find(item => subjectIndustries.some(value => value.length >= 2 && (item.name.includes(value) || value.includes(item.name))));
-  const directSectorCapital = relatedSector && !relatedSector.capitalEstimated && finiteNumber(relatedSector.mainNetInflow) !== null;
+    || resolveStockRotationProfiles(subject, marketOverview?.sectors)[0];
+  const directSectorCapital = relatedSector && !relatedSector.capitalEstimated && !relatedSector.capitalStale && finiteNumber(relatedSector.mainNetInflow) !== null;
   const sectorRotationSummary = relatedSector
     ? `${relatedSector.name}${relatedSector.rotationState || '轮动中性'}，板块涨跌${signedPercent(relatedSector.changePct)}${Number.isFinite(Number(relatedSector.upRatio)) ? `，上涨占比${(Number(relatedSector.upRatio) * 100).toFixed(0)}%` : ''}${directSectorCapital ? `，主力净${Number(relatedSector.mainNetInflow) >= 0 ? '流入' : '流出'}${formatCapitalAmount(Math.abs(Number(relatedSector.mainNetInflow)))}，占比${signedPercent(relatedSector.mainNetPct)}${relatedSector.capitalRank ? `，资金排名${relatedSector.capitalRank}` : ''}` : '，资金为量价活跃度估算'}`
     : '';
   if (sectorRotationSummary) evidence.push(sectorRotationSummary);
-  const sectorWeak = relatedSector && (directSectorCapital
+  if (relatedSector?.capitalStale) evidence.push('板块资金为过期缓存，不参与当前资金确认');
+  if (relatedSector?.rotationTransition?.summary) evidence.push(relatedSector.rotationTransition.summary);
+  const sectorWeak = relatedSector && !relatedSector.capitalStale && (directSectorCapital
     ? Number(relatedSector.mainNetInflow) < 0 && Number(relatedSector.mainNetPct || 0) < 0
     : Number(relatedSector.rotationScore) <= 38 && Number(relatedSector.changePct) <= -2 && Number(relatedSector.upRatio) <= .3);
 
@@ -1847,7 +1953,7 @@ function evaluateRecommendationFactors(item, context, newsContext, financialAnal
   const directSector = item?.rotationProfiles?.[0];
   const sector = directSector ? {
     ...directSector,
-    score:Number(directSector.rotationScore || 50),
+    score:directSector.capitalStale ? 50 : Number(directSector.rotationScore || 50),
     label:directSector.rotationState || '轮动中性',
     changes:[item.changePct], amounts:[item.amount]
   } : context?.sectorProfiles?.get(recommendationIndustryGroupKey(item));
@@ -1882,7 +1988,7 @@ function evaluateRecommendationFactors(item, context, newsContext, financialAnal
   add('market', '市场方向', context?.marketScore || 0,
     context?.breadth ? `全市场上涨${context.breadth.up}只、下跌${context.breadth.down}只` : '全市场宽度不可用', Boolean(context?.breadth));
 
-  const newsAvailable = Boolean(newsContext?.items?.length);
+  const newsAvailable = Boolean(newsContext?.available ?? newsContext?.items?.length);
   const newsAssessment = assessRecommendationNewsConfirmation(item, newsContext);
   add('catalyst', '成长/创新催化', newsAssessment.factorScore,
     newsAvailable ? newsAssessment.evidence : '未获取到可核验的近期消息', newsAvailable);
@@ -1948,7 +2054,9 @@ function assessRecommendationNewsConfirmation(item, newsContext = {}) {
   };
   const flow = item?.fundFlowPeriod;
   const technicalConfirmed = Number(item?.analysis?.score ?? item?.technicalScore) >= 65;
-  const capitalConfirmed = Boolean(flow?.available && !flow.estimated && flow.days > 0 && flow.mainNetInflow > 0
+  const capitalWindows = analyzeCapitalWindows(flow, item?.analysis?.tradeDate);
+  const capitalConfirmed = Boolean(flow?.available && !flow.estimated && !capitalWindows.stale
+    && (!capitalWindows.available || capitalWindows.confirmed) && flow.days > 0 && flow.mainNetInflow > 0
     && Number(flow.netRatio) > 0 && flow.positiveDays >= Math.ceil(flow.days * .6));
   const confirmed = technicalConfirmed && capitalConfirmed;
   return {
@@ -2018,6 +2126,7 @@ async function fetchGlobalMarketContext() {
 }
 
 function recommendationScoreBand(score) {
+  if (score === null || score === undefined || score === '') return '';
   const value = Number(score);
   if (!Number.isFinite(value)) return '';
   if (value < 55) return '<55';
@@ -2089,6 +2198,8 @@ function summarizeRecommendationOutcomes(rows, { now = Date.now(), minimumAgeDay
   let excludedCount = 0;
   let immatureCount = 0;
   let invalidCount = 0;
+  let duplicateCount = 0;
+  const seen = new Set();
   const eligible = [];
   for (const row of Array.isArray(rows) ? rows : []) {
     const label = String(row?.label || '').trim();
@@ -2107,6 +2218,12 @@ function summarizeRecommendationOutcomes(rows, { now = Date.now(), minimumAgeDay
       immatureCount++;
       continue;
     }
+    const identity = row.code ? `${row.code}|${addedAt}|${base}` : '';
+    if (identity && seen.has(identity)) {
+      duplicateCount++;
+      continue;
+    }
+    if (identity) seen.add(identity);
     const signal = String(row?.signal || '').trim();
     eligible.push({
       label,
@@ -2173,6 +2290,7 @@ function summarizeRecommendationOutcomes(rows, { now = Date.now(), minimumAgeDay
     excludedCount,
     immatureCount,
     invalidCount,
+    duplicateCount,
     overall: recommendationOutcomeStats(samples),
     recentOverall,
     marketRisk,
@@ -2186,6 +2304,9 @@ function summarizeRecommendationOutcomes(rows, { now = Date.now(), minimumAgeDay
     byRecentTechnicalScoreBand
   };
   profile.signature = JSON.stringify({
+    overall:profile.overall,
+    recentOverall:profile.recentOverall,
+    byFamily, bySignal, byScoreBand, byTechnicalScoreBand,
     sampleSize: profile.sampleSize,
     marketRisk: marketRisk.status,
     recentCohorts: profile.recentCohortCount,
@@ -2275,6 +2396,7 @@ function calibrateRecommendationWithOutcomes(item, profile) {
 }
 
 function recommendationGateDecision(item) {
+  if (analyzeCapitalWindows(item?.fundFlowPeriod, item?.analysis?.tradeDate).weakening) return {passed:false, reason:'recent-capital-outflow'};
   const signalScore = Number(item?.signalScore);
   const technicalScore = Number(item?.technicalScore);
   if (!['突破确认', '突破蓄势', '接近突破', '底部吸筹', '震荡洗盘'].includes(item?.signal)) {
@@ -2293,11 +2415,13 @@ function recommendationPassesOutcomeGate(item) {
 }
 
 function recommendationPassesWatchGate(item, postRisk = false) {
+  if (analyzeCapitalWindows(item?.fundFlowPeriod, item?.analysis?.tradeDate).weakening) return false;
   const signalScore = Number(item?.signalScore);
   const technicalScore = Number(item?.technicalScore);
   const qualityScore = Number(item?.qualityScore);
   const distance = Number(item?.analysis?.distanceToBreakout);
-  if (!['待突破', '横盘观察'].includes(item?.signal)) return false;
+  const persistentRebound = item?.signal === '已反弹' && item?.analysis?.trendContinuation?.passed;
+  if (!persistentRebound && !['待突破', '横盘观察'].includes(item?.signal)) return false;
   if (![signalScore, technicalScore, qualityScore, distance].every(Number.isFinite)) return false;
   if (signalScore < (postRisk ? 50 : 65) || technicalScore < 75 || qualityScore < 70) return false;
   if (distance < -1.5 || distance > 4) return false;
@@ -2324,27 +2448,27 @@ function finalizeRecommendationDisplay(strictItems, watchItems, minimumCount = 8
     .slice(0, needed)
     .map(item => ({
       ...item,
-      signal: '横盘观察',
+      signal: item.signal === '已反弹' ? '已反弹' : '横盘观察',
       recommendationTier: '观察候选',
       entryAssessment: {
         ...(item.entryAssessment || {}),
         allowed: false,
-        status: '高分观察，等待形态确认',
+        status: item.signal === '已反弹' ? '趋势延续观察，等待确认' : '高分观察，等待形态确认',
         tone: 'warning',
         summary: `${item.entryAssessment?.summary || '当前技术质量较高，但形态尚未确认。'} 本项仅作为观察候选，不构成入场信号。`
       },
-      reason: `横盘观察；${item.reason || '技术和质量评分较高，但尚未形成明确突破形态。'} 本项仅作为观察候选，不构成入场信号。`
+      reason: `${item.signal === '已反弹' ? '趋势延续观察' : '横盘观察'}；${item.reason || '技术和质量评分较高，但尚未形成明确突破形态。'} 本项仅作为观察候选，不构成入场信号。`
     }));
   return [...strict, ...watches];
 }
 
-function applyOutcomeFeedbackAssessment(analysis, profile) {
+function applyOutcomeFeedbackAssessment(analysis, profile, signalOverride = '') {
   if (!analysis || !profile?.sampleSize) return analysis;
-  const signal = analysis.entryAssessment?.setupType === 'bottom-accumulation' ? '底部吸筹'
+  const signal = signalOverride || (analysis.entryAssessment?.setupType === 'bottom-accumulation' ? '底部吸筹'
     : analysis.entryAssessment?.setupType === 'sideways-washout' ? '震荡洗盘'
       : analysis.reboundSignal === '已反弹' ? '已反弹'
         : analysis.reboundSignal === '底部待反弹' ? '底部待反弹'
-          : '待突破';
+          : analysis.consolidationBreakout?.status || '待突破');
   const outcome = calibrateRecommendationWithOutcomes({ signal, technicalScore: analysis.score }, profile);
   const strategyDrawdown = profile.marketRisk?.status === 'drawdown';
   const currentStrong = Number(analysis.score) >= 70
@@ -2403,6 +2527,7 @@ function canReuseMarketRecommendations(cachedOverview, { feedbackSignature = '',
   const savedAt = Date.parse(cachedOverview?.recommendationsFetchedAt || cachedOverview?.fetchedAt || '');
   const cachedHasDirectSectorCapital = Number(cachedOverview?.recommendationCoverage?.directSectorCapital || 0) > 0;
   return Boolean(cachedOverview?.recommendations?.length
+    && !cachedOverview.cachedFallback && !cachedOverview.recommendationFallback?.active
     && Array.isArray(cachedOverview.momentumRecommendations)
     && cachedOverview.recommendationCoverage?.modelVersion === RECOMMENDATION_MODEL_VERSION
     && cachedOverview.recommendationCoverage?.outcomeFeedback?.signature === feedbackSignature
@@ -2412,7 +2537,16 @@ function canReuseMarketRecommendations(cachedOverview, { feedbackSignature = '',
     && now - savedAt < maxAgeMs);
 }
 
-function restoreCachedMarketRecommendations(result, cachedOverview, marketQuotes = []) {
+function deactivateCachedRecommendation(item) {
+  const entryAssessment = {allowed:false, status:'数据待补充', tone:'neutral',
+    summary:'当前为旧缓存推荐，需刷新走势、资金、消息面和大盘数据后重新评估。', evidence:[]};
+  return {...item, stale:true, newsLabel:'消息待核验', entryAssessment,
+    ...(item.tradePlan ? {tradePlan:{...item.tradePlan,enabled:false}} : {}),
+    reason:`缓存仅供回看；综合入场：${entryAssessment.status}，${entryAssessment.summary}`};
+}
+
+function restoreCachedMarketRecommendations(result, cachedOverview, marketQuotes = [], { reuse = false } = {}) {
+  if (result.recommendationsComputed === true) return false;
   if ((result.recommendations || []).length || !(cachedOverview?.recommendations || []).length) return false;
   const eligibleRecommendations = cachedOverview.recommendations.filter(item =>
     recommendationPassesDisplayGate(item)
@@ -2422,14 +2556,12 @@ function restoreCachedMarketRecommendations(result, cachedOverview, marketQuotes
   const quoteByCode = new Map((marketQuotes || []).map(item => [item.code, item]));
   result.recommendations = eligibleRecommendations.map(item => {
     const quote = quoteByCode.get(item.code);
-    const entryAssessment = item.entryAssessment || {
-      allowed: false, status: '数据待补充', tone: 'neutral',
-      summary: '当前为旧缓存推荐，需刷新走势、资金、消息面和大盘数据后重新评估。', evidence: []
-    };
-    const reason = /综合入场/.test(item.reason || '')
+    const snapshot = reuse && item.entryAssessment ? item : deactivateCachedRecommendation(item);
+    const entryAssessment = snapshot.entryAssessment;
+    const reason = reuse && /综合入场/.test(item.reason || '')
       ? item.reason : `${item.reason ? item.reason.replace(/[。；;]+$/, '') + '；' : ''}综合入场：${entryAssessment.status}，${entryAssessment.summary}`;
     return {
-      ...item,
+      ...snapshot,
       ...(quote ? {
         price: quote.price, change: quote.change, changePct: quote.changePct,
         high: quote.high, low: quote.low, open: quote.open, prevClose: quote.prevClose,
@@ -2438,11 +2570,11 @@ function restoreCachedMarketRecommendations(result, cachedOverview, marketQuotes
       } : {}),
       industry: resolveRecommendationIndustry(item),
       entryAssessment,
-      reason
+      reason:reuse ? reason : snapshot.reason
     };
   });
   const cachedModelCurrent = cachedOverview.recommendationCoverage?.modelVersion === RECOMMENDATION_MODEL_VERSION;
-  result.momentumRecommendations = (cachedModelCurrent ? cachedOverview.momentumRecommendations || [] : []).filter(item => item.momentumDecision?.passed)
+  if (!(result.momentumRecommendations || []).length) result.momentumRecommendations = (reuse && cachedModelCurrent ? cachedOverview.momentumRecommendations || [] : []).filter(item => item.momentumDecision?.passed)
     .map(item => {
       const quote = quoteByCode.get(item.code);
       return {
@@ -2777,7 +2909,16 @@ function scoreConsolidationCandidate(item) {
   return liquidity + stability + quietVolume + nearHigh * 10 + turnoverFit;
 }
 
-function selectMarketRecommendationCandidates({ rotationScreened = [], momentumScreened = [], breakoutScreened = [], consolidationScreened = [], reboundScreened = [] }, limit = 120) {
+function selectFullMarketScreening(scored, screening, tradeDate, now = Date.now()) {
+  const savedAt=Date.parse(screening?.generatedAt || '');
+  if(!screening?.complete || !Array.isArray(screening.codes) || screening.modelVersion!==RECOMMENDATION_MODEL_VERSION || screening.tradeDate!==tradeDate
+    || !Number.isFinite(savedAt) || savedAt>now || now-savedAt>24*60*60*1000) return [];
+  const byCode=new Map((scored || []).map(item=>[item.code,item]));
+  return [...new Set(screening.codes || [])].map(code=>byCode.get(code))
+    .filter(item=>item && item.tradeDate===tradeDate && item.amount>=3e7 && item.price>0 && item.high>0);
+}
+
+function selectMarketRecommendationCandidates({ rotationScreened = [], momentumScreened = [], breakoutScreened = [], consolidationScreened = [], reboundScreened = [], fullMarketScreened = [] }, limit = 120) {
   const selectByIndustry = (source, sourceLimit, perIndustry) => {
     const output = [];
     const industryCounts = new Map();
@@ -2790,13 +2931,17 @@ function selectMarketRecommendationCandidates({ rotationScreened = [], momentumS
     }
     return output;
   };
-  const selected = [
-    ...rotationScreened,
-    ...momentumScreened,
-    ...selectByIndustry(breakoutScreened, 50, 3),
-    ...selectByIndustry(consolidationScreened, 50, 3),
-    ...selectByIndustry(reboundScreened, 120, 4)
+  const queues = [
+    rotationScreened, momentumScreened,
+    selectByIndustry(breakoutScreened, 50, 3),
+    selectByIndustry(consolidationScreened, 50, 3),
+    selectByIndustry(reboundScreened, 120, 4),
+    selectByIndustry(fullMarketScreened, 60, 3)
   ];
+  const selected=[];
+  for(let index=0;index<Math.max(...queues.map(queue=>queue.length));index++) {
+    for(const queue of queues) if(queue[index]) selected.push(queue[index]);
+  }
   const candidates = [];
   const candidateCodes = new Set();
   for (const item of selected) {
@@ -2895,16 +3040,19 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
   const rotationScreened = selectRotationPriorityCandidates(scored, marketAssessmentContext.sectors, {limit:48, perSector:4, sectorLimit:12});
   const momentumScreened = scored.filter(item => item.momentumDecision?.passed)
     .sort((a, b) => Number(b.momentumDecision.score) - Number(a.momentumDecision.score)).slice(0, 30);
-  const candidates = selectMarketRecommendationCandidates({ rotationScreened, momentumScreened, breakoutScreened, consolidationScreened, reboundScreened }, 96);
+  const tradeDate=(marketQuotes || []).map(item=>item.tradeDate).filter(Boolean).sort().at(-1);
+  const fullMarketScreening=readDiskCache('full-market-screening',24*60*60*1000);
+  const fullMarketScreened=selectFullMarketScreening(scored,fullMarketScreening,tradeDate);
+  const candidates = selectMarketRecommendationCandidates({ rotationScreened, momentumScreened, breakoutScreened, consolidationScreened, reboundScreened, fullMarketScreened }, 96);
   const analyzed = [];
   const historyErrors = [];
   const historyResults = await settleWithConcurrency(candidates, 6, async quote => {
       let history = readTimedCache(marketHistoryCache, quote.code, 10 * 60 * 1000);
       if (!history) {
         try {
-          history = await fetchTencentHistory(quote.code, 120);
+          history = await fetchTencentHistory(quote.code, 320);
         } catch (tencentError) {
-          history = await fetchSinaHistory(quote.code);
+          history = await fetchSinaHistory(quote.code, 320);
         }
         if (history.length >= 60) writeTimedCache(marketHistoryCache, quote.code, history);
       }
@@ -2951,7 +3099,7 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
   appendSignal(momentumQualifying, '强势追踪');
   const recommendationResults = await settleWithConcurrency(ranked, 4, async item => {
     const [fundFlowResult, newsResult, financialResult] = await Promise.allSettled([
-      fetchSinaFundFlowHistory(item.code, 10),
+      fetchSinaFundFlowHistory(item.code, 10, force),
       fetchStockNews({ code: item.code, name: item.name, force }),
       fetchStockFinancials({ code: item.code, force: false })
     ]);
@@ -2975,7 +3123,7 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
       newsContext, marketNewsContext: marketAssessmentContext.marketNewsContext,
       marketOverview: marketAssessmentContext, subject: item
     });
-    const entryAnalysis = applyOutcomeFeedbackAssessment(contextualAnalysis, outcomeProfile);
+    const entryAnalysis = applyOutcomeFeedbackAssessment(contextualAnalysis, outcomeProfile, signal);
     const entryAssessment = entryAnalysis.entryAssessment;
     if (!momentumSignal && entryAssessment?.setupType === 'bottom-accumulation') signal = '底部吸筹';
     else if (!momentumSignal && entryAssessment?.setupType === 'sideways-washout') signal = '震荡洗盘';
@@ -2991,7 +3139,8 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
         : item.analysis.accumulationSetup?.passed
         ? item.analysis.accumulationSetup.summary
         : `${item.analysis.maAlignment}，现价${ma30Position}MA30（${item.analysis.ma30.toFixed(2)}元）；距20日突破位${distance >= 0 ? '约' + distance.toFixed(2) + '%' : '已突破约' + Math.abs(distance).toFixed(2) + '%'}；近5日量比${item.analysis.volumeRatio.toFixed(2)}`
-      : item.analysis.reboundReason;
+      : momentumSignal ? item.momentumDecision?.entryAssessment?.summary || '板块强势扩散，等待回踩确认'
+        : `${item.analysis.reboundReason}；${item.analysis.trendContinuation?.summary || ''}`;
     const newsAssessment = assessRecommendationNewsConfirmation(item, newsContext);
     const newsLabel = newsAssessment.label;
     const factorAnalysis = evaluateRecommendationFactors(item, factorContext, newsContext, financialAnalysis);
@@ -3008,7 +3157,7 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
         : technicalBreakout.status === '接近突破' ? 10
           : technicalBreakout.status === '突破蓄势' ? 7
             : technicalBreakout.status === '结构偏弱' ? -15 : 2;
-    const rawSignalScore = Math.max(0, Math.min(100, (breakoutSignal ? item.analysis.score : item.analysis.reboundScore)
+    const rawSignalScore = Math.max(0, Math.min(100, (breakoutSignal || momentumSignal ? item.analysis.score : item.analysis.reboundScore)
       + setupAdjustment + horizontalAdjustment));
     const qualityScore = item.quality?.score ?? 100;
     const factorScore = factorAnalysis.score ?? rawSignalScore;
@@ -3087,7 +3236,8 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
     && !isExplosiveVolume(item.analysis?.volumeRatio)
     && !['破位', '爆量观察', '结构偏弱', '不宜追高', '公司风险', '消息风险待确认', '大盘消息风险待确认', '美股科技风险待确认', '板块退潮，等待确认'].includes(item.entryAssessment?.status)
     && !(item.newsLabel === '消息谨慎' && item.signalScore < 65)
-    && !(item.rotationProfiles?.[0]?.capitalEstimated === false && Number(item.rotationProfiles[0].mainNetInflow) < 0 && Number(item.rotationProfiles[0].mainNetPct || 0) < 0)
+    && !(item.rotationProfiles?.[0]?.capitalEstimated === false && !item.rotationProfiles[0].capitalStale && Number(item.rotationProfiles[0].mainNetInflow) < 0 && Number(item.rotationProfiles[0].mainNetPct || 0) < 0)
+    && !analyzeCapitalWindows(item.fundFlowPeriod, item.analysis?.tradeDate).weakening
     && !(item.fundFlowPeriod?.available && item.fundFlowPeriod.netRatio <= (item.fundFlowPeriod.estimated ? -6 : -3) && item.fundFlowPeriod.positiveDays <= 4)
     && !(item.financialAnalysis?.hardRisks?.length >= 2 && item.financialAnalysis?.score < 45)
     && !(item.canslim?.available >= 5 && item.canslim.score < 50));
@@ -3197,8 +3347,10 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
       riskUnknown,
       riskUnverifiedIncluded,
       riskScoreRejected,
-      directSectorCapital:marketAssessmentContext.sectors.filter(item => !item.capitalEstimated && finiteNumber(item.mainNetInflow) !== null).length,
+      directSectorCapital:marketAssessmentContext.sectors.filter(item => !item.capitalEstimated && !item.capitalStale && finiteNumber(item.mainNetInflow) !== null).length,
       rotationCandidates:rotationScreened.length,
+      fullMarketCandidates:fullMarketScreened.length,
+      fullMarketHistoryCovered:fullMarketScreened.length ? Number(fullMarketScreening.historyCovered) || 0 : 0,
       momentumCandidates:momentumScreened.length,
       momentumQualified:momentumRecommendations.length,
       strictQualified: groupedRecommendations.filter(item => item.recommendationTier !== '观察候选').length,
@@ -3280,6 +3432,7 @@ async function fetchMarketOverview(force = false, favoriteOutcomes = []) {
     result.breadth = snapshotResult.value.breadth;
     result.limits = snapshotResult.value.limits;
     result.activeStocks = snapshotResult.value.activeStocks;
+    result.tradeDate = snapshotResult.value.quotes.map(row=>row.tradeDate).filter(Boolean).sort().at(-1) || '';
     result.turnover = snapshotResult.value.turnover;
     result.errors.push(...snapshotResult.value.errors.map(error => `全市场行情部分失败：${error}`));
     const newsPromise = fetchMarketNews(force);
@@ -3308,7 +3461,9 @@ async function fetchMarketOverview(force = false, favoriteOutcomes = []) {
       Object.assign(result, sectorsResult.value, mergedSectors);
     }
     else result.errors.push(`板块轮动失败：${sectorsResult.reason?.message || sectorsResult.reason}`);
-    const hasDirectSectorCapital = result.sectors.some(item => !item.capitalEstimated && finiteNumber(item.mainNetInflow) !== null);
+    result.sectors ||= [];
+    result.sectors = annotateSectorRotation(result.sectors, marketOverviewCache?.value || previousOverview, result.tradeDate);
+    const hasDirectSectorCapital = result.sectors.some(item => !item.capitalEstimated && !item.capitalStale && finiteNumber(item.mainNetInflow) !== null);
     reuseRecommendations = !force && canReuseMarketRecommendations(recommendationCache, { feedbackSignature, hasDirectSectorCapital });
     const [recommendationsResult, newsResult] = await Promise.allSettled([
       reuseRecommendations ? Promise.resolve(null) : (async () => buildMarketRecommendations(snapshotResult.value.quotes, force, outcomeProfile, {
@@ -3320,11 +3475,12 @@ async function fetchMarketOverview(force = false, favoriteOutcomes = []) {
     ]);
     if (recommendationsResult.status === 'fulfilled' && recommendationsResult.value) {
       result.recommendations = recommendationsResult.value.recommendations;
+      result.recommendationsComputed = true;
       result.momentumRecommendations = recommendationsResult.value.momentumRecommendations;
       result.recommendationCoverage = recommendationsResult.value.coverage;
       result.recommendationsFetchedAt = new Date().toISOString();
     } else if (reuseRecommendations) {
-      restoreCachedMarketRecommendations(result, recommendationCache, snapshotResult.value.quotes);
+      restoreCachedMarketRecommendations(result, recommendationCache, snapshotResult.value.quotes, {reuse:true});
       result.recommendationsFetchedAt = recommendationCache.recommendationsFetchedAt || recommendationCache.fetchedAt;
       result.recommendationCoverage.cachedFallback = false;
       delete result.recommendationFallback;
@@ -3366,8 +3522,8 @@ async function fetchMarketOverview(force = false, favoriteOutcomes = []) {
         warnings: [...new Set([...(previousOverview.warnings || []), ...(result.warnings || [])])],
         errors: [...new Set([...(previousOverview.errors || []), ...result.errors, '本轮大盘接口均不可用，已显示最近一次成功数据'])]
       };
-      fallback.recommendations = (fallback.recommendations || []).map(item => ({ ...item, industry: resolveRecommendationIndustry(item) }));
-      fallback.momentumRecommendations = (fallback.momentumRecommendations || []).map(item => ({ ...item, industry: resolveRecommendationIndustry(item) }));
+      fallback.recommendations = (fallback.recommendations || []).map(item => ({ ...deactivateCachedRecommendation(item), industry: resolveRecommendationIndustry(item) }));
+      fallback.momentumRecommendations = [];
       if (fallback.recommendationCoverage?.modelVersion !== RECOMMENDATION_MODEL_VERSION) {
         fallback.momentumRecommendations = [];
         fallback.recommendationCoverage = {
@@ -4942,7 +5098,7 @@ function assessCurrentEntry({
       : suspectedAccumulation
         ? `疑似吸筹：${accumulationSetup.summary}`
         : `吸筹证据不足：${accumulationSetup.summary || '未识别到底部均线粘合和温和放量组合'}`;
-  const compression = Number(consolidationBreakout?.volumeCompressionRatio);
+  const compression = finiteNumber(consolidationBreakout?.volumeCompressionRatio);
   const washoutSummary = !consolidationBreakout || !consolidationBreakout.available
     ? '洗盘评估数据不足'
     : consolidationBreakout.isConsolidating && Number.isFinite(compression) && compression <= 1
@@ -4954,7 +5110,8 @@ function assessCurrentEntry({
   const hasStructureSignal = Boolean(accumulationSetup?.passed || suspectedAccumulation
     || consolidationBreakout?.available && consolidationBreakout.isConsolidating);
   const withStructure = result => hasStructureSignal ? { ...result, structureSummary } : result;
-  if (![price, support, breakout, Number(ma5), Number(ma10), Number(ma20), Number(ma30), ratio].every(Number.isFinite)) {
+  if (![latestPrice, supportPrice, resistance, ma5, ma10, ma20, ma30].every(value => finiteNumber(value) > 0)
+    || finiteNumber(volumeRatio) === null || ratio < 0) {
     return withStructure({ allowed: false, status: '数据待补充', tone: 'neutral', summary: '关键价格、均线或量能数据不足，暂不形成入场结论。', evidence });
   }
   const trendBroken = price < support * .99 || (price < Number(ma30) && Number(ma5) < Number(ma10) && Number(ma20) < Number(ma30));
@@ -5013,12 +5170,12 @@ function assessCurrentEntry({
   if (consolidationBreakout?.available && consolidationBreakout.isConsolidating) {
     const boxLow = Number(consolidationBreakout.boxLow);
     const boxHigh = Number(consolidationBreakout.boxHigh);
-    const compression = Number(consolidationBreakout.volumeCompressionRatio);
+    const compression = finiteNumber(consolidationBreakout.volumeCompressionRatio);
     const boxPosition = Number.isFinite(boxLow) && Number.isFinite(boxHigh) && boxHigh > boxLow
       ? (price - boxLow) / (boxHigh - boxLow) : null;
     const looksLikeWashout = Number.isFinite(compression) && compression <= 1
       && Number(consolidationBreakout.failedPressureCount || 0) <= 1;
-    const lowBuyCandidate = looksLikeWashout && Number.isFinite(boxPosition)
+    const lowBuyCandidate = looksLikeWashout && trendConfirmed && momentumHealthy && Number.isFinite(boxPosition)
       && boxPosition >= .1 && boxPosition <= .65 && price >= support * .99;
     const nearBoxTop = Number.isFinite(boxPosition) && boxPosition > .7;
     if (looksLikeWashout) {
@@ -5093,7 +5250,63 @@ function buildTradePlan({ latestPrice, supportPrice, resistance, rangeHigh, rece
   };
 }
 
+function analyzePathMetrics(history) {
+  const rows=(history || []).filter(row=>Number.isFinite(row?.close) && row.close>0);
+  if(rows.length<2) return {available:false,summary:'长周期涨跌数据不足'};
+  let peak=rows[0].close, trough=peak, drawdown=0, runup=0, up=0, down=0, longestUp=0, longestDown=0;
+  let bestDay=-Infinity, worstDay=Infinity;
+  for(let i=1;i<rows.length;i++) {
+    const price=rows[i].close, change=(price/rows[i-1].close-1)*100;
+    peak=Math.max(peak,price); trough=Math.min(trough,price);
+    drawdown=Math.min(drawdown,(price/peak-1)*100);
+    runup=Math.max(runup,(price/trough-1)*100);
+    up=change>0?up+1:0; down=change<0?down+1:0;
+    longestUp=Math.max(longestUp,up);longestDown=Math.max(longestDown,down);
+    bestDay=Math.max(bestDay,change);worstDay=Math.min(worstDay,change);
+  }
+  const returns=Object.fromEntries([5,20,60,120,250].map(days=>[days,rows.length>days?roundMetric((rows.at(-1).close/rows.at(-1-days).close-1)*100):null]));
+  return {available:true,observations:rows.length,startDate:rows[0].date,endDate:rows.at(-1).date,
+    returns,maxDrawdown:roundMetric(drawdown),maxRunup:roundMetric(runup),rangePct:roundMetric((peak/trough-1)*100),
+    bestDay:roundMetric(bestDay),worstDay:roundMetric(worstDay),longestUp,longestDown,
+    summary:`可用${rows.length}根日线（${rows[0].date || '起点未知'}至${rows.at(-1).date || '终点未知'}），窗口内最大上涨${runup.toFixed(1)}%、最大收盘回撤${drawdown.toFixed(1)}%，最长连涨${longestUp}日、连跌${longestDown}日；不代表上市以来全部历史`};
+}
+
+function analyzeTrendContinuation(history) {
+  const rows = history.slice(-60);
+  if (rows.length < 40 || rows.some(row => !(row.close > 0) || !Number.isFinite(row.close))) {
+    return { available:false, passed:false, summary:'趋势延续数据不足' };
+  }
+  const recent = rows.slice(-10);
+  const ma20 = average(rows.slice(-20).map(row=>row.close));
+  const priorMa20 = average(rows.slice(-25,-5).map(row=>row.close));
+  const aboveDays = recent.filter((row,index)=> {
+    const end = rows.length - 10 + index + 1;
+    return row.close >= average(rows.slice(end-20,end).map(value=>value.close));
+  }).length;
+  let peak = recent[0].close, drawdown = 0;
+  recent.forEach(row=>{ peak=Math.max(peak,row.close); drawdown=Math.min(drawdown,(row.close/peak-1)*100); });
+  const distance = (rows.at(-1).close / ma20 - 1) * 100;
+  const slope = (ma20 / priorMa20 - 1) * 100;
+  const passed = aboveDays >= 8 && slope > 0 && drawdown >= -10 && distance >= 0 && distance <= 12
+    && percentageReturn(rows,5) <= 12;
+  return {
+    available:true, passed, aboveDays, window:10, drawdown:roundMetric(drawdown),
+    ma20Slope:roundMetric(slope), distanceToMA20:roundMetric(distance),
+    summary:`近10日有${aboveDays}日站在当日MA20上方，MA20较5日前${slope >= 0 ? '抬升' : '下降'}${Math.abs(slope).toFixed(1)}%，窗口内收盘最大回撤${Math.abs(drawdown).toFixed(1)}%，现价偏离MA20 ${distance.toFixed(1)}%；${passed ? '趋势延续条件成立，仍需资金、消息和入场位置确认' : '趋势持续性或价格位置尚未满足条件'}`
+  };
+}
+
 function analyzeHistory(history) {
+  if (Array.isArray(history) && history.length < 20) {
+    const error = new Error(`历史样本不足：当前${history.length}根日线，策略至少需要20根；暂不生成技术推荐`);
+    error.code = 'INSUFFICIENT_HISTORY';
+    throw error;
+  }
+  if (!Array.isArray(history) || history.some(row =>
+    !row || ![row.close,row.open,row.high,row.low,row.volume].every(Number.isFinite)
+      || row.close <= 0 || row.low <= 0 || row.high < row.low || row.volume < 0)) {
+    throw new Error('历史行情不足或包含无效价格、成交量');
+  }
   const rows = history.slice(-120);
   const closes = rows.map(row => row.close);
   const latest = rows.at(-1);
@@ -5110,7 +5323,7 @@ function analyzeHistory(history) {
   const recentGains = closes.slice(-15).map((value, index, values) => index ? value - values[index - 1] : 0).slice(1);
   const avgGain = average(recentGains.map(value => Math.max(value, 0))) || 0;
   const avgLoss = average(recentGains.map(value => Math.max(-value, 0))) || 0;
-  const rsi14 = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
+  const rsi14 = avgLoss === 0 ? avgGain === 0 ? 50 : 100 : 100 - 100 / (1 + avgGain / avgLoss);
   const volume5 = average(rows.slice(-5).map(row => row.volume));
   const volume20 = average(rows.slice(-21, -1).map(row => row.volume)) || average(rows.slice(-20).map(row => row.volume));
   const volumeRatio = volume20 ? latest.volume / volume20 : 0;
@@ -5180,7 +5393,7 @@ function analyzeHistory(history) {
     && (macdHistogram > 0 || macdImproving && return5 >= 3);
   const reboundSignal = reboundConfirmed ? '已反弹' : waitingForRebound ? '底部待反弹' : '';
   const reboundReason = reboundSignal === '已反弹'
-    ? `近60日从前高回撤${Math.abs(bottomDrawdown).toFixed(1)}%，${bottomRow.date}见阶段低点后反弹${reboundFromBottom.toFixed(1)}%；现价站上MA20，MA5高于MA10，MACD${macdHistogram > 0 ? '处于零轴上方' : '持续改善'}`
+    ? `近60日从前高回撤${Math.abs(bottomDrawdown).toFixed(1)}%，${bottomRow.date}见阶段低点后反弹${reboundFromBottom.toFixed(1)}%；现价站上MA20，MA5高于MA10，MACD${macdHistogram > 0 ? '柱值为正' : '持续改善'}`
     : reboundSignal === '底部待反弹'
       ? `近60日从前高回撤${Math.abs(bottomDrawdown).toFixed(1)}%，距${bottomRow.date}阶段低点仅${reboundFromBottom.toFixed(1)}%；短均线或MACD开始改善，尚待站稳MA20和放量确认`
       : '';
@@ -5198,6 +5411,8 @@ function analyzeHistory(history) {
   const direction = periodReturn >= 0 ? '上涨' : '下跌';
   const accumulationSetup = analyzeAccumulationSetup(rows);
   const consolidationBreakout = analyzeConsolidationBreakout(rows);
+  const trendContinuation = analyzeTrendContinuation(rows);
+  const pathMetrics = analyzePathMetrics(history);
   let score = 0;
   if (latest.close > ma20) score += 12;
   if (latest.close > ma30) score += 8;
@@ -5248,7 +5463,9 @@ function analyzeHistory(history) {
   });
   if (['破位', '爆量观察', '结构偏弱'].includes(entryAssessment.status)) tradePlan.enabled = false;
   return {
-    summary, ma5: roundMetric(ma5), ma10: roundMetric(ma10), ma20: roundMetric(ma20), ma30: roundMetric(ma30), ma60: roundMetric(ma60), maAlignment,
+    tradeDate:latest.date,
+    summary: `${summary} 趋势持续性：${trendContinuation.summary}。 长周期：${pathMetrics.summary}。`, trendContinuation, pathMetrics,
+    ma5: roundMetric(ma5), ma10: roundMetric(ma10), ma20: roundMetric(ma20), ma30: roundMetric(ma30), ma60: roundMetric(ma60), maAlignment,
     rsi14: roundMetric(rsi14, 1), rangeLow: roundMetric(rangeLow), rangeHigh: roundMetric(rangeHigh),
     return5: roundMetric(return5), return20: roundMetric(return20), return60: roundMetric(percentageReturn(rows, 60)),
     volume, volumeRatio: roundMetric(volumeRatio), volume5Ratio: roundMetric(volume5Ratio),
@@ -5275,16 +5492,16 @@ async function fetchStockHistory({ code, name, industry = '', sector = '', force
   const cached = force ? null : readTimedCache(stockHistoryCache, cacheKey, 2 * 60 * 1000);
   if (cached && (cached.feedbackSignature || '') === feedbackSignature) return { ...cached, cached: true };
   const historyErrors = [];
-  const [historyResult, quoteResult, newsResult, riskResult, financialResult, fundFlowResult, marketNewsResult, marketIndicesResult, overseasResult] = await Promise.allSettled([
+  const [historyResult, quoteResult, newsResult, riskResult, financialResult, fundFlowResult, marketNewsResult, marketIndicesResult, overseasResult, sectorCapitalResult] = await Promise.allSettled([
     (async () => {
       try {
-        const history = await fetchTencentHistory(cacheKey, 120);
+        const history = await fetchTencentHistory(cacheKey, 320);
         if (history.length >= 60) return { history, source: '腾讯前复权日线' };
       } catch (err) {
         historyErrors.push(`腾讯历史行情失败：${err.message || err}`);
       }
       try {
-        return { history: await fetchSinaHistory(cacheKey), source: '新浪日线' };
+        return { history: await fetchSinaHistory(cacheKey, 320), source: '新浪日线' };
       } catch (err) {
         historyErrors.push(`新浪历史行情失败：${err.message || err}`);
         return { history: [], source: '' };
@@ -5297,7 +5514,8 @@ async function fetchStockHistory({ code, name, industry = '', sector = '', force
     fetchSinaFundFlowHistory(cacheKey, 10, force),
     fetchMarketNews(force),
     force ? fetchTencentMarketIndices() : Promise.resolve(marketOverviewCache?.value?.indices || []),
-    force ? fetchGlobalMarketContext() : Promise.resolve(marketOverviewCache?.value?.overseas || assessGlobalMarketContext([]))
+    force ? fetchGlobalMarketContext() : Promise.resolve(marketOverviewCache?.value?.overseas || assessGlobalMarketContext([])),
+    fetchSectorCapitalFlow(force)
   ]);
   const errors = [...historyErrors];
   let history = historyResult.status === 'fulfilled' ? historyResult.value.history : [];
@@ -5316,7 +5534,7 @@ async function fetchStockHistory({ code, name, industry = '', sector = '', force
   }
   outcomeProfile = summarizeRecommendationOutcomes(mergeRecommendationOutcomeQuotes(favoriteOutcomes, [...quoteCache.values()]));
   feedbackSignature = outcomeProfile.signature;
-  if (history.length < 20) throw new Error(errors.join('；') || '历史行情不足');
+  if (!history.length && errors.length) throw new Error(errors.join('；'));
   let analysis = analyzeHistory(history);
   const fundFlowPeriod = fundFlowResult.status === 'fulfilled'
     ? fundFlowResult.value
@@ -5347,6 +5565,15 @@ async function fetchStockHistory({ code, name, industry = '', sector = '', force
     overseas: overseasResult.status === 'fulfilled'
       ? overseasResult.value : marketOverviewCache?.value?.overseas || assessGlobalMarketContext([])
   };
+  if (sectorCapitalResult.status === 'fulfilled') {
+    analysisMarketOverview.sectors = mergeSectorCapitalRows({sectors:analysisMarketOverview.sectors || []},sectorCapitalResult.value.rows).sectors;
+    errors.push(...(sectorCapitalResult.value.warnings || []).map(message=>`板块资金来源提示：${message}`));
+  } else {
+    analysisMarketOverview.sectors = (analysisMarketOverview.sectors || []).map(row=>({...row,capitalStale:true}));
+    errors.push(`最新板块资金未确认：${sectorCapitalResult.reason?.message || sectorCapitalResult.reason}`);
+  }
+  const directory = stockDirectoryCache || readDiskCache('stock-directory') || [];
+  const resolvedIndustry = resolveRecommendationIndustry({code:cacheKey,industry,sector},new Map(directory.map(row=>[row.code,row])));
   if (newsContext.signal === '偏谨慎' && analysis.verdict === '可关注') analysis.verdict = '等待确认';
   const riskProfile = riskResult.status === 'fulfilled'
     ? riskResult.value
@@ -5361,7 +5588,7 @@ async function fetchStockHistory({ code, name, industry = '', sector = '', force
   }
   analysis = applyEntryContextAssessment(analysis, {
     newsContext, riskProfile, marketOverview: analysisMarketOverview, marketNewsContext,
-    subject: { code: cacheKey, name, industry, sector }
+    subject: { code: cacheKey, name, industry:resolvedIndustry, sector }
   });
   analysis = applyOutcomeFeedbackAssessment(analysis, outcomeProfile);
   if (!analysis.entryAssessment?.allowed && analysis.verdict === '可关注'
@@ -5836,8 +6063,13 @@ app.on('window-all-closed', () => {
 });
 
 module.exports = {
+  eastmoneyListRows,
+  fetchEastmoneyListPages,
+  RECOMMENDATION_MODEL_VERSION,
   SECTOR_CAPITAL_FALLBACK_MAX_AGE_MS,
   normalizeQuoteRow,
+  finiteNumber,
+  requestText,
   normalizeTencentQuote,
   mapSinaFinancialData,
   buildFinancialAnalysis,
@@ -5888,6 +6120,13 @@ module.exports = {
   applyIndividualCapitalAssessment,
   applyEntryContextAssessment,
   analyzeHistory,
+  analyzeTrendContinuation,
+  analyzeCapitalWindows,
+  analyzePathMetrics,
+  selectFullMarketScreening,
+  assessReboundQuality,
+  assessBreakoutQuality,
+  annotateSectorRotation,
   buildTradePlan,
   mergeQuoteIntoHistory,
   aggregateHistoryPeriod,

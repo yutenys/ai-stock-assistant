@@ -24,6 +24,9 @@ Module._load = function(request, parent, isMain) {
 };
 
 const {
+  RECOMMENDATION_MODEL_VERSION,
+  finiteNumber,
+  requestText,
   SECTOR_CAPITAL_FALLBACK_MAX_AGE_MS,
   normalizeQuoteRow,
   normalizeTencentQuote,
@@ -35,6 +38,8 @@ const {
   buildRecommendationFactorContext,
   buildIndustryRotationFromQuotes,
   normalizeSectorCapitalRows,
+  eastmoneyListRows,
+  fetchEastmoneyListPages,
   mergeSectorCapitalRows,
   resolveStockRotationProfiles,
   selectRotationPriorityCandidates,
@@ -76,6 +81,13 @@ const {
   applyIndividualCapitalAssessment,
   applyEntryContextAssessment,
   analyzeHistory,
+  analyzeTrendContinuation,
+  analyzeCapitalWindows,
+  analyzePathMetrics,
+  selectFullMarketScreening,
+  assessBreakoutQuality,
+  assessReboundQuality,
+  annotateSectorRotation,
   buildTradePlan,
   mergeQuoteIntoHistory,
   aggregateHistoryPeriod,
@@ -85,6 +97,189 @@ const {
   settleWithConcurrency
 } = require('../main.js');
 Module._load = originalLoad;
+
+test('长周期统计保留时间顺序，不将后来的低点算作先前涨幅',()=>{
+  const result=analyzePathMetrics([10,20,5].map((close,i)=>({close,date:`2026-09-0${i+1}`})));
+  assert.equal(result.maxRunup,100);
+  assert.equal(result.maxDrawdown,-75);
+  assert.equal(result.rangePct,300);
+  assert.equal(result.longestUp,1);
+  assert.equal(result.longestDown,1);
+  assert.equal(result.returns[250],null);
+  assert.equal(analyzePathMetrics([]).available,false);
+});
+
+test('缺失估值不等于负估值，弱均线缩量箱体不进入低吸候选',()=>{
+  const stock={price:10,low:9.5,high:10,changePct:0,amount:1e9,totalMarketCap:1e10,analysis:{score:80,reboundScore:80}};
+  for(const assess of [assessBreakoutQuality,assessReboundQuality]) {
+    assert.equal(assess({...stock,peRatio:null,pbRatio:null}).score,100);
+    assert.ok(assess({...stock,peRatio:-1}).score<100);
+  }
+  const params={latestPrice:10.15,ma5:10.1,ma10:10.3,ma20:10.1,ma30:10,supportPrice:9.8,resistance:10.8,volumeRatio:.8,rsi14:60,
+    consolidationBreakout:{available:true,isConsolidating:true,boxLow:9.8,boxHigh:10.8,volumeCompressionRatio:.8,failedPressureCount:0}};
+  assert.equal(assessCurrentEntry(params).lowBuyCandidate,false);
+  assert.notEqual(assessCurrentEntry({...params,consolidationBreakout:{...params.consolidationBreakout,volumeCompressionRatio:null}}).setupType,'sideways-washout');
+});
+
+test('全市场历史筛选只使用完整同日同模型结果，候选队列避免类别饿死',()=>{
+  const now=Date.parse('2026-09-05T08:00:00Z'),stock={code:'600001',tradeDate:'2026-09-04',amount:1e8,price:10,high:10};
+  const cache={complete:true,codes:['600001','600001','600999'],tradeDate:'2026-09-04',generatedAt:'2026-09-05T07:59:00Z',modelVersion:RECOMMENDATION_MODEL_VERSION};
+  assert.equal(selectFullMarketScreening([stock],cache,'2026-09-04',now).length,1);
+  assert.equal(selectFullMarketScreening([{...stock,amount:0}],cache,'2026-09-04',now).length,0);
+  assert.equal(selectFullMarketScreening([stock],{...cache,complete:false},'2026-09-04',now).length,0);
+  assert.equal(selectFullMarketScreening([stock],cache,'2026-09-07',now).length,0);
+  const rows=prefix=>Array.from({length:100},(_,i)=>({code:`${prefix}${String(i).padStart(4,'0')}`,industry:`行业${i}`}));
+  const picked=selectMarketRecommendationCandidates({breakoutScreened:rows('60'),reboundScreened:rows('00'),fullMarketScreened:rows('30')},6);
+  assert.equal(picked.filter(item=>item.code.startsWith('00')).length,2);
+  assert.equal(picked.filter(item=>item.code.startsWith('30')).length,2);
+});
+
+test('空白与非数值类型不被转换成有效零值', () => {
+  for (const value of [' ', '\t', false, true, [], {}, null, undefined, Infinity]) assert.equal(finiteNumber(value),null);
+  assert.equal(finiteNumber('0'),0);
+  assert.equal(finiteNumber(' 1.5 '),1.5);
+});
+
+test('行情响应中途断开能结束请求并进入失败路径', async () => {
+  const http=require('node:http');
+  const server=http.createServer((_req,res)=>{
+    res.writeHead(200,{'Content-Length':'100'});
+    res.write('x');
+    setTimeout(()=>res.destroy(),25);
+  });
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  try { await assert.rejects(requestText(`http://127.0.0.1:${server.address().port}`,500),/断开|aborted|socket/i); }
+  finally { await new Promise(resolve=>server.close(resolve)); }
+});
+
+test('成功筛空不能恢复旧推荐，接口失败回退不保留入场许可', () => {
+  const cached={recommendations:[{code:'600001',signal:'突破确认',technicalScore:80,signalScore:80,entryAssessment:{allowed:true,status:'可入场'},tradePlan:{enabled:true},newsLabel:'消息确认'}]};
+  const empty={recommendations:[],recommendationsComputed:true,momentumRecommendations:[{code:'600002'}]};
+  assert.equal(restoreCachedMarketRecommendations(empty,cached),false);
+  assert.equal(empty.recommendations.length,0);
+  const failed={recommendations:[],momentumRecommendations:[{code:'600002'}]};
+  assert.equal(restoreCachedMarketRecommendations(failed,cached),true);
+  assert.equal(failed.recommendations[0].entryAssessment.allowed,false);
+  assert.equal(failed.recommendations[0].tradePlan.enabled,false);
+  assert.equal(failed.recommendations[0].newsLabel,'消息待核验');
+  assert.equal(failed.momentumRecommendations[0].code,'600002');
+});
+
+test('短期流出不能被十日累计流入和利好标题覆盖', () => {
+  const rows=Array.from({length:10},(_,i)=>({date:`2026-08-${String(22+i).padStart(2,'0')}`,mainNetInflow:i===9?-50:100,mainNetPct:i===9?-5:5}));
+  const flow={available:true,days:10,positiveDays:9,mainNetInflow:850,netRatio:4,rows};
+  const windows=analyzeCapitalWindows(flow,'2026-08-31');
+  assert.equal(windows.net10,850);
+  assert.equal(windows.weakening,true);
+  assert.equal(windows.confirmed,false);
+  assert.match(windows.summary,/1日净额-/);
+  const analysis={tradeDate:'2026-08-31',score:80,verdict:'可关注',entryAssessment:{allowed:true,summary:'结构确认'},tradePlan:{enabled:true}};
+  const result=applyIndividualCapitalAssessment(analysis,flow);
+  assert.equal(result.entryAssessment.allowed,false);
+  assert.equal(result.tradePlan.enabled,false);
+  assert.ok(result.capitalAdjustedScore<80);
+  const item={signal:'突破确认',signalScore:90,technicalScore:80,analysis,fundFlowPeriod:flow};
+  assert.equal(recommendationGateDecision(item).passed,false);
+  assert.equal(assessRecommendationNewsConfirmation(item,{signal:'偏积极',factorScore:80}).confirmed,false);
+});
+
+test('资金日期对齐、三日反转与估算数据不能误作实时确认', () => {
+  const rows=[{date:'2026-09-02',mainNetInflow:100,mainNetPct:5},{date:'2026-09-03',mainNetInflow:100,mainNetPct:5},{date:'2026-09-04',mainNetInflow:100,mainNetPct:5}];
+  const flow={available:true,days:3,rows};
+  assert.equal(analyzeCapitalWindows(flow,'2026-09-04').confirmed,true);
+  assert.equal(analyzeCapitalWindows(flow,'2026-09-05').stale,true);
+  const stale=applyIndividualCapitalAssessment({tradeDate:'2026-09-05',score:70,verdict:'可关注',entryAssessment:{allowed:false,summary:'观察'},tradePlan:{enabled:true}},flow);
+  assert.equal(stale.tradePlan.enabled,false);
+  assert.equal(stale.verdict,'等待确认');
+  assert.equal(analyzeCapitalWindows({...flow,estimated:true},'2026-09-04').confirmed,false);
+  const reversed={...flow,rows:rows.map((r,i)=>({...r,mainNetInflow:i? -100:10,mainNetPct:null}))};
+  assert.equal(analyzeCapitalWindows(reversed,'2026-09-04').weakening,true);
+  assert.equal(analyzeCapitalWindows(flow,'2026-09-03').endDate,'2026-09-03');
+});
+
+test('过期板块资金不进入强势追踪和轮动优先队列', () => {
+  const sector={name:'软件',mainNetInflow:1e9,mainNetPct:10,rotationScore:90,capitalEstimated:false,capitalStale:true};
+  const stock={code:'600001',industry:'软件',price:10,high:10,changePct:6,amount:1e9,rotationProfiles:[sector]};
+  assert.equal(momentumRecommendationDecision(stock).passed,false);
+  assert.deepEqual(selectRotationPriorityCandidates([stock],[sector]),[]);
+  const merged=mergeSectorCapitalRows({sectors:[{name:'软件',rotationScore:45}]},[sector]);
+  assert.equal(merged.sectors[0].rotationScore,45);
+  assert.equal(merged.sectors[0].capitalStale,true);
+});
+
+test('轮动对照使用跨交易日同口径基线而非重复刷新', () => {
+  const old={tradeDate:'2026-09-03',sectors:[{name:'软件',rotationScore:60,capitalEstimated:true}]};
+  const current=[{name:'软件',rotationScore:75,capitalEstimated:true}];
+  const first=annotateSectorRotation(current,old,'2026-09-04');
+  assert.equal(first[0].rotationTransition.delta,15);
+  const again=annotateSectorRotation([{...current[0],rotationScore:80}],{tradeDate:'2026-09-04',sectors:first},'2026-09-04');
+  assert.equal(again[0].rotationTransition.delta,20);
+  assert.equal(annotateSectorRotation(current,null,'2026-09-04')[0].rotationTransition.available,false);
+  assert.equal(annotateSectorRotation([{...current[0],capitalEstimated:false}],old,'2026-09-04')[0].rotationTransition.available,false);
+});
+
+test('趋势延续区分多日站稳、单日拉升和持续下跌', () => {
+  const make = close => ({date:'2026-09-01',open:close,close,high:close*1.01,low:close*.99,volume:100});
+  const steady = Array.from({length:60},(_,i)=>make(10+i*.025));
+  const persistent = analyzeTrendContinuation(steady);
+  assert.equal(persistent.passed,true);
+  assert.equal(persistent.aboveDays,10);
+  const falling = Array.from({length:60},(_,i)=>make(15-i*.05));
+  assert.equal(analyzeTrendContinuation(falling).passed,false);
+  falling[59]=make(15);
+  assert.equal(analyzeTrendContinuation(falling).passed,false);
+  const candidate={signal:'已反弹',technicalScore:75,signalScore:70,qualityScore:75,analysis:{trendContinuation:persistent,distanceToBreakout:2,volumeRatio:1}};
+  assert.equal(recommendationGateDecision(candidate).passed,false);
+  assert.equal(recommendationPassesWatchGate(candidate),true);
+  const watches=finalizeRecommendationDisplay([],[candidate]);
+  assert.equal(watches[0].signal,'已反弹');
+  assert.equal(watches[0].entryAssessment.allowed,false);
+  assert.equal(recommendationGateDecision({signal:'已反弹',technicalScore:75,signalScore:70}).passed,false);
+});
+
+test('零涨跌RSI为中性且无效行情不能生成分析', () => {
+  const rows=Array.from({length:60},()=>({open:10,close:10,high:10,low:10,volume:100}));
+  assert.equal(analyzeHistory(rows).rsi14,50);
+  assert.throws(()=>analyzeHistory([]),/历史行情/);
+  assert.throws(()=>analyzeHistory([...rows,{open:10,close:NaN,high:10,low:10,volume:100}]),/无效/);
+});
+
+test('同一收藏跨标签去重，缺失分数不归入低分组', () => {
+  const row={code:'002631',label:'一',favoriteBasePrice:10,price:12,favoriteAddedAt:'2026-08-13',signal:'已反弹',technicalScore:null,signalScore:null};
+  const profile=summarizeRecommendationOutcomes([row,{...row,label:'二'}],{now:Date.parse('2026-09-05')});
+  assert.equal(profile.sampleSize,1);
+  assert.equal(profile.duplicateCount,1);
+  assert.deepEqual(profile.byTechnicalScoreBand,{});
+  assert.deepEqual(profile.byScoreBand,{});
+});
+
+test('收藏时评分独立于后续刷新，旧收藏不伪造原始评分', () => {
+  const vm=require('node:vm');
+  const source=fs.readFileSync(path.join(__dirname,'../renderer.js'),'utf8');
+  const start=source.indexOf('function labelStockSnapshot(');
+  const end=source.indexOf('function loadState(',start);
+  const snapshot=vm.runInNewContext(source.slice(start,end)+';labelStockSnapshot');
+  const original=snapshot({code:'002631',price:10,technicalScore:60,signalScore:65,signal:'已反弹'});
+  const updated=snapshot({code:'002631',price:12,technicalScore:90,signalScore:95},original);
+  assert.equal(updated.favoriteBasePrice,10);
+  assert.equal(updated.favoriteEntrySnapshot.technicalScore,60);
+  assert.equal(updated.favoriteEntrySnapshot.signalScore,65);
+  assert.equal(snapshot({code:'002631',technicalScore:90},{code:'002631',favoriteBasePrice:10}).favoriteEntrySnapshot,null);
+});
+
+test('资讯时间数值、未来日期、转载去重和否定利好处理一致', () => {
+  const now=Date.parse('2026-09-05T12:00:00+08:00');
+  const row={title:'测试公司回购股份',publishedAt:'2026-09-05 11:00:00',link:'https://example.com/1'};
+  const one=summarizeNews([row],'',{now});
+  const duplicate=summarizeNews([row,{...row,link:'https://example.com/2'}],'',{now});
+  assert.equal(duplicate.rawScore,one.rawScore);
+  assert.equal(summarizeNews([{...row,publishedAt:now+3600000},row],'',{now}).rawScore,one.rawScore);
+  assert.equal(one.latestAgeHours,1);
+  assert.equal(summarizeNews([{...row,publishedAt:'2027-01-01'}],'',{now}).signal,'中性');
+  assert.equal(summarizeNews([{...row,publishedAt:''}],'',{now}).signal,'中性');
+  assert.equal(summarizeNews([{...row,title:'测试公司否认回购计划'}],'',{now}).signal,'中性');
+  assert.equal(summarizeNews([{...row,title:'测试公司澄清传闻；收到立案调查及处罚'}],'',{now}).signal,'偏谨慎');
+});
 
 test('板块主力资金缓存可覆盖周末和盘中接口临时断线', () => {
   assert.equal(SECTOR_CAPITAL_FALLBACK_MAX_AGE_MS, 72 * 60 * 60 * 1000);
@@ -214,6 +409,31 @@ test('板块真实资金优先于成交额估算并保留资金口径', () => {
   assert.equal(sector.capitalRank, 4);
   assert.match(sector.capitalSource, /东方财富行业板块资金/);
   assert.equal(merged.fundSectors[0].name, '生猪养殖');
+});
+
+test('短历史明确标注样本不足，不冒充接口故障或生成信号', () => {
+  assert.throws(() => analyzeHistory([{close:10}]), error => error.code === 'INSUFFICIENT_HISTORY' && /当前1根日线/.test(error.message));
+  assert.throws(() => analyzeHistory([]), /当前0根日线/);
+});
+
+test('板块列表兼容对象响应并完整分页，拒绝重复页和失败页', async () => {
+  assert.deepEqual(eastmoneyListRows({diff:{0:{f12:'BK0001'},1:null}}), [{f12:'BK0001'}]);
+  assert.deepEqual(eastmoneyListRows({diff:null}), []);
+  const calls = [];
+  const fetchPage = async pathname => {
+    const page = Number(new URL(pathname, 'https://example.test').searchParams.get('pn'));
+    calls.push(page);
+    const rows = Array.from({length:page === 3 ? 5 : 100}, (_, i) => ({f12:String((page - 1) * 100 + i + 1)}));
+    return {json:{data:{total:205,diff:Object.fromEntries(rows.map((row,i)=>[i,row]))}},errors:[],host:'https://push2.eastmoney.com'};
+  };
+  const result = await fetchEastmoneyListPages(new URLSearchParams(), 100, fetchPage);
+  assert.equal(result.rows.length, 205);
+  assert.deepEqual(calls.sort(), [1,2,3]);
+  await assert.rejects(fetchEastmoneyListPages(new URLSearchParams(), 100, () => fetchPage('/?pn=1')), /不完整/);
+  await assert.rejects(fetchEastmoneyListPages(new URLSearchParams(), 100, pathname => {
+    if (pathname.includes('pn=2')) throw new Error('page failed');
+    return fetchPage(pathname);
+  }), /page failed/);
 });
 
 test('东方财富板块资金字段按真实净流入和占比解析', () => {
@@ -556,10 +776,12 @@ test('旧推荐模型缓存不能复用为双轨推荐结果', () => {
   };
   const currentCache = {
     ...oldCache,
-    recommendationCoverage:{modelVersion:'2026-09-04-sector-capital-dual-v4',directSectorCapital:0,outcomeFeedback:{signature:'same'}}
+    recommendationCoverage:{modelVersion:RECOMMENDATION_MODEL_VERSION,directSectorCapital:0,outcomeFeedback:{signature:'same'}}
   };
   assert.equal(canReuseMarketRecommendations(oldCache, {feedbackSignature:'same', now}), false);
   assert.equal(canReuseMarketRecommendations(currentCache, {feedbackSignature:'same', now}), true);
+  assert.equal(canReuseMarketRecommendations({...currentCache,cachedFallback:true}, {feedbackSignature:'same', now}), false);
+  assert.equal(canReuseMarketRecommendations({...currentCache,recommendationFallback:{active:true}}, {feedbackSignature:'same', now}), false);
   assert.equal(canReuseMarketRecommendations(currentCache, {feedbackSignature:'changed', now}), false);
   assert.equal(canReuseMarketRecommendations(currentCache, {feedbackSignature:'same', now:Date.parse('2026-09-04T06:59:00.000Z')}), false);
   assert.equal(canReuseMarketRecommendations(currentCache, {feedbackSignature:'same', hasDirectSectorCapital:true, now}), false);
