@@ -9,6 +9,11 @@ contextBridge.exposeInMainWorld('stockApi', {
   fetchStockChart: (request) => ipcRenderer.invoke('fetch-stock-chart', request),
   fetchStockFundFlow: (request) => ipcRenderer.invoke('fetch-stock-fund-flow', request),
   fetchMarketOverview: (force) => ipcRenderer.invoke('fetch-market-overview', force),
+  onMarketProgress: (callback) => {
+    const listener = (_event, progress) => callback(progress);
+    ipcRenderer.on('market-overview-progress', listener);
+    return () => ipcRenderer.removeListener('market-overview-progress', listener);
+  },
   fetchLiveNews: (request) => ipcRenderer.invoke('fetch-live-news', request),
   fetchCompanyProfile: (stock) => ipcRenderer.invoke('fetch-company-profile', stock),
   openExternal: (url) => ipcRenderer.invoke('open-external-url', url),

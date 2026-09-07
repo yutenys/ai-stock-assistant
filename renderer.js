@@ -25,6 +25,7 @@ let searchSeq = 0;
 let logs = [];
 let currentViewSource = 'empty';
 let marketOverviewRefreshing = false;
+let marketOverviewPending = null;
 let latestMarketRecommendations = [];
 let latestMarketMomentumRecommendations = [];
 let activeMarketRecommendationTrack = 'stable';
@@ -361,11 +362,30 @@ function renderMarketOverview(result){
   if(detailStock && historyResult) renderHistoryAnalysis(detailStock, historyResult);
 }
 
-async function loadMarketOverview(force=false, silent=false){
-  if(marketOverviewRefreshing || !window.stockApi?.fetchMarketOverview) return latestMarketOverview;
+function loadMarketOverview(force=false, silent=false){
+  if(marketOverviewPending) return marketOverviewPending;
+  marketOverviewPending = performMarketRefresh(force, silent).finally(() => { marketOverviewPending = null; });
+  return marketOverviewPending;
+}
+
+async function performMarketRefresh(force=false, silent=false){
+  if(!window.stockApi?.fetchMarketOverview) return latestMarketOverview;
   marketOverviewRefreshing = true;
   $('refreshMarketOverview').disabled = true;
   $('refreshMarketOverview').textContent = '刷新中';
+  $('marketUpdated').textContent = '正在连接行情接口';
+  const stopProgress = window.stockApi.onMarketProgress?.(progress => {
+    $('marketUpdated').textContent = progress.message;
+    if(progress.snapshot?.indices?.length){
+      const snapshot = progress.snapshot;
+      $('marketIndices').innerHTML = snapshot.indices.map(index => `<div class="market-index"><div><b>${escapeHtml(index.name)}</b><span> ${escapeHtml(index.code)}</span></div><div class="${pctClass(index.changePct)}"><b>${formatNumber(index.price)}</b><span> ${formatPct(index.changePct)}</span></div></div>`).join('');
+      $('marketUp').textContent = snapshot.breadth?.up ?? '--';
+      $('marketDown').textContent = snapshot.breadth?.down ?? '--';
+      $('marketFlat').textContent = snapshot.breadth?.flat ?? '--';
+      $('marketTurnover').textContent = money(snapshot.turnover);
+      $('marketUpdated').textContent = progress.message;
+    }
+  });
   try{
     const result = await window.stockApi.fetchMarketOverview({force, favoriteOutcomes:favoriteOutcomeRows()});
     renderMarketOverview(result);
@@ -382,6 +402,7 @@ async function loadMarketOverview(force=false, silent=false){
     if(force && !silent) notify(`大盘数据更新失败：${err.message || err}`, 'error');
     return null;
   }finally{
+    stopProgress?.();
     marketOverviewRefreshing = false;
     $('refreshMarketOverview').disabled = false;
     $('refreshMarketOverview').textContent = '刷新';
@@ -638,7 +659,11 @@ function executeSimulatedTrade(code, side, options={}){
   position.source = stock.source;
   position.stock = {...position.stock, ...stock};
   position.updatedAt = new Date().toISOString();
-  simulatedTrades.unshift({id:`${Date.now()}-${code}`, time:nowText(), side:side === 'buy' ? '买入' : '卖出', code, name:stock.name, price, quantity, amount, realizedPnl});
+  simulatedTrades.unshift({id:`${Date.now()}-${code}`, time:nowText(), side:side === 'buy' ? '买入' : '卖出', code, name:stock.name, price, quantity, amount, realizedPnl,
+    entrySnapshot:side === 'buy' ? { capturedAt:new Date().toISOString(), signal:stock.marketSignal || stock.signal || stock.type,
+      modelVersion:stock.recommendationModelVersion || '', technicalScore:stock.technicalScore ?? null,
+      signalScore:stock.signalScore ?? null, context:stock.recommendationContext ? JSON.parse(JSON.stringify(stock.recommendationContext)) : null,
+      labels:typeof labels === 'undefined' ? [] : labels.filter(label => label.stocks?.some(item => item.code === code)).map(label => label.name) } : null });
   simulatedTrades = simulatedTrades.slice(0, 500);
   saveState();
   addLog('action', `模拟${side === 'buy' ? '买入' : '卖出'}成交`, {code, name:stock.name, price, quantity, amount, realizedPnl});

@@ -17,6 +17,22 @@ function harness(names, values={}) {
   return context;
 }
 
+test('大盘并发刷新共享正在执行的请求，完成后可重新刷新', async () => {
+  const pending=[];
+  const context=harness(['loadMarketOverview'],{marketOverviewPending:null,
+    performMarketRefresh:()=>new Promise(resolve=>pending.push(resolve))});
+  const first=context.loadMarketOverview(true);
+  assert.equal(context.loadMarketOverview(true),first);
+  assert.equal(pending.length,1);
+  pending[0]({fresh:true});
+  assert.equal((await first).fresh,true);
+  assert.equal(context.marketOverviewPending,null);
+  const next=context.loadMarketOverview(true);
+  assert.equal(pending.length,2);
+  pending[1]({fresh:true});
+  await next;
+});
+
 test('模拟交易拒绝未知方向和超范围数量，失败不修改持仓',()=>{
   const context=harness(['executeSimulatedTrade'],{
     portfolio:[],simulatedTrades:[],findStockByCode:()=>({code:'600001',name:'测试',price:10}),
@@ -30,13 +46,19 @@ test('模拟交易拒绝未知方向和超范围数量，失败不修改持仓',
 
 test('旧持仓数值字符串不能使加仓数量发生字符串拼接',()=>{
   const position={code:'600001',quantity:'100',costPrice:'10',realizedPnl:0};
+  const stock={code:'600001',name:'测试',price:10,recommendationModelVersion:'test-v1',recommendationContext:{news:{signal:'neutral'}}};
   const context=harness(['executeSimulatedTrade'],{
-    portfolio:[position],simulatedTrades:[],findStockByCode:()=>({code:'600001',name:'测试',price:10}),
+    portfolio:[position],simulatedTrades:[],findStockByCode:()=>stock,labels:[{name:'测试版本',stocks:[stock]}],
     portfolioPosition:()=>position,document:{querySelector:()=>null},nowText:()=>'',money:String
   });
   assert.equal(context.executeSimulatedTrade('600001','buy',{price:10,amount:1000,quiet:true,render:false}),true);
   assert.equal(position.quantity,200);
   assert.equal(position.costPrice,10);
+  const snapshot=context.simulatedTrades[0].entrySnapshot;
+  assert.equal(snapshot.modelVersion,'test-v1');
+  assert.equal(snapshot.labels[0],'测试版本');
+  stock.recommendationContext.news.signal='negative';
+  assert.equal(snapshot.context.news.signal,'neutral');
 });
 
 test('取消个股标签勾选后保存移除成员，其他股票不受影响',()=>{

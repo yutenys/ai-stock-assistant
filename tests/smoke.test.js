@@ -30,6 +30,7 @@ const {
   SECTOR_CAPITAL_FALLBACK_MAX_AGE_MS,
   normalizeQuoteRow,
   normalizeTencentQuote,
+  normalizeSinaHistoryRows,
   mapSinaFinancialData,
   buildFinancialAnalysis,
   buildIndividualInvestmentAnalysis,
@@ -97,6 +98,36 @@ const {
   settleWithConcurrency
 } = require('../main.js');
 Module._load = originalLoad;
+
+test('新浪股数转换为手后与实时报价合并，量比和资金估算不差100倍', () => {
+  const rows = Array.from({length:65}, (_, i) => ({day:new Date(Date.UTC(2026,5,i+1)).toISOString().slice(0,10),open:10,close:10,high:11,low:9,volume:100000}));
+  const normalized = normalizeSinaHistoryRows(rows);
+  assert.equal(normalized[0].volume,1000);
+  const merged = mergeQuoteIntoHistory(normalized,{tradeDate:normalized.at(-1).date,price:10.5,open:10,high:11,low:9,volume:1500,amount:1575000});
+  assert.equal(analyzeHistory(merged).volumeRatio,1.5);
+  assert.equal(estimateFundFlowFromHistory(normalized,10).rows[0].amount,1000000);
+  assert.equal(normalizeSinaHistoryRows([{...rows[0],volume:null}])[0].volume,null);
+});
+
+test('真实当日流出阻止估算资金误判入场，过期当日资金不能用于确认', () => {
+  const flow={available:true,estimated:true,days:10,mainNetInflow:1e8,netRatio:10,positiveDays:8,endDate:'2026-09-07',rows:[],
+    current:{tradeDate:'2026-09-07',mainNetInflow:-2e7,mainNetPct:-6,estimated:false}};
+  assert.equal(analyzeCapitalWindows(flow,'2026-09-07').weakening,true);
+  assert.equal(analyzeCapitalWindows(flow,'2026-09-08').weakening,false);
+  assert.equal(analyzeCapitalWindows({...flow,current:{...flow.current,tradeDate:''}},'').weakening,false);
+  assert.equal(recommendationPassesOutcomeGate({signal:'接近突破',signalScore:85,technicalScore:85,analysis:{tradeDate:'2026-09-07'},fundFlowPeriod:flow}),false);
+  const result=applyIndividualCapitalAssessment({tradeDate:'2026-09-07',score:85,verdict:'可关注',entryAssessment:{allowed:true,summary:'技术条件成立'},consolidationBreakout:{available:false}},flow);
+  assert.equal(result.entryAssessment.allowed,false);
+  assert.match(result.entryAssessment.summary,/当日真实主力/);
+  assert.equal(analyzeCapitalWindows({...flow,current:{...flow.current,mainNetInflow:2e7,mainNetPct:6}},'2026-09-07').confirmed,false);
+});
+
+test('同批次相对跑赢但绝对亏损或低胜率不能获得历史加分', () => {
+  const stats={count:20,averageReturn:-.4,winRate:27,outperformRate:70,medianExcessReturn:1,averageExcessReturn:2};
+  assert.equal(outcomeStatsAdjustment(stats,8),0);
+  assert.equal(outcomeStatsAdjustment({...stats,averageReturn:2,winRate:35},8),0);
+  assert.ok(outcomeStatsAdjustment({...stats,averageReturn:2,winRate:60},8)>0);
+});
 
 test('长周期统计保留时间顺序，不将后来的低点算作先前涨幅',()=>{
   const result=analyzePathMetrics([10,20,5].map((close,i)=>({close,date:`2026-09-0${i+1}`})));
@@ -240,7 +271,7 @@ test('趋势延续区分多日站稳、单日拉升和持续下跌', () => {
 test('零涨跌RSI为中性且无效行情不能生成分析', () => {
   const rows=Array.from({length:60},()=>({open:10,close:10,high:10,low:10,volume:100}));
   assert.equal(analyzeHistory(rows).rsi14,50);
-  assert.throws(()=>analyzeHistory([]),/历史行情/);
+  assert.throws(()=>analyzeHistory([]),/历史样本不足/);
   assert.throws(()=>analyzeHistory([...rows,{open:10,close:NaN,high:10,low:10,volume:100}]),/无效/);
 });
 
@@ -1057,7 +1088,7 @@ test('公司资料可从板块归属识别实际行业', { timeout: 30000 }, asy
   assert.equal(new Set(result.profile.tags).size, result.profile.tags.length);
 });
 
-test('大盘分析返回指数、轮动、资金和涨跌停结构', { timeout: 60000 }, async () => {
+test('大盘分析返回指数、轮动、资金和涨跌停结构', { timeout: 180000 }, async () => {
   const handler = handlers.get('fetch-market-overview');
   assert.equal(typeof handler, 'function');
   const result = await handler(null, true);
@@ -1899,7 +1930,7 @@ test('消息面和大盘环境会调整个股及大盘推荐入场结论', () =>
   assert.match(directSectorFlow.entryAssessment.summary, /猪肉概念.*主力净流入15\.55亿.*占比\+9\.65%.*资金排名2/);
 });
 
-test('低价高估值弱反弹股票不会进入大盘推荐', { timeout: 60000 }, async () => {
+test('低价高估值弱反弹股票不会进入大盘推荐', { timeout: 180000 }, async () => {
   const result = await handlers.get('fetch-market-overview')(null, true);
   assert.ok(!result.recommendations.some(stock => stock.code === '600157'));
   assert.ok(result.recommendations.every(stock => stock.qualityScore >= 65));

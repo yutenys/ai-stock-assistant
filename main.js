@@ -1,4 +1,8 @@
-const { app, BrowserWindow, ipcMain, shell } = require('electron');
+const { Worker, isMainThread, parentPort, workerData } = require('node:worker_threads');
+const { app, BrowserWindow, ipcMain, shell } = isMainThread ? require('electron') : {
+  app: { isPackaged: workerData.isPackaged, whenReady: () => ({ then() {} }), on() {} },
+  ipcMain: { handle() {} }
+};
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
@@ -26,7 +30,7 @@ let marketDirectorySavedAt = 0;
 const CONTROLLED_VOLUME_MIN = 1.5;
 const CONTROLLED_VOLUME_MAX = 4;
 const SECTOR_CAPITAL_FALLBACK_MAX_AGE_MS = 72 * 60 * 60 * 1000;
-const RECOMMENDATION_MODEL_VERSION = '2026-09-05-full-universe-v8';
+const RECOMMENDATION_MODEL_VERSION = '2026-09-07-volume-outcomes-v9';
 
 function isControlledVolumeExpansion(value) {
   const ratio = Number(value);
@@ -641,17 +645,15 @@ function normalizeQuoteRow(r) {
 }
 
 async function fetchQuoteRows(codes) {
-  const fields = 'f12,f14,f2,f3,f4,f5,f6,f7,f8,f9,f10,f15,f16,f17,f18,f20,f21,f23,f51,f52,f62,f184,f57,f58';
+  const fields = 'f12,f14,f2,f3,f4,f5,f6,f7,f8,f9,f10,f15,f16,f17,f18,f20,f21,f23,f51,f52,f62,f184,f57,f58,f124';
   const secids = codes.map(secidOf).join(',');
-  const url = `https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2&fields=${fields}&secids=${encodeURIComponent(secids)}&_=${Date.now()}`;
-  const json = await getJsonWithRetry(url, 1);
-  return json?.data?.diff || [];
+  const pathname = `/api/qt/ulist.np/get?fltt=2&invt=2&fields=${fields}&secids=${encodeURIComponent(secids)}&_=${Date.now()}`;
+  const { json } = await fetchEastmoneyHostPath(pathname, 3500);
+  return eastmoneyListRows(json.data);
 }
 
 async function fetchEastmoneySingleFundFlow(code) {
-  const fields = 'f57,f58,f62,f184';
-  const json = await getJsonWithRetry(`https://push2.eastmoney.com/api/qt/stock/get?secid=${secidOf(code)}&fltt=2&invt=2&fields=${fields}&_=${Date.now()}`, 0);
-  const data = json?.data || {};
+  const data = (await fetchQuoteRows([code])).find(row => row.f12 === code) || {};
   const mainNetInflow = finiteNumber(data.f62);
   const mainNetPct = finiteNumber(data.f184);
   if (mainNetInflow == null || mainNetPct == null) throw new Error('东方财富单股资金字段为空');
@@ -661,7 +663,7 @@ async function fetchEastmoneySingleFundFlow(code) {
     mainNetInflow,
     mainNetPct,
     source: '东方财富单股资金',
-    tradeDate: new Date().toISOString().slice(0, 10),
+    tradeDate: data.f124 > 0 ? new Date(data.f124 * 1000).toISOString().slice(0, 10) : '',
     estimated: false
   };
 }
@@ -672,14 +674,13 @@ async function fetchSinaSingleFundFlow(code) {
   const text = await getText(url, { Referer: 'https://finance.sina.com.cn/', Accept: '*/*' });
   const rows = JSON.parse(text.slice(text.indexOf('['), text.lastIndexOf(']') + 1));
   const row = rows?.[0] || {};
-  const mainNetWan = finiteNumber(row.r0_net);
-  const mainNetPct = finiteNumber(row.r0_ratio);
-  if (mainNetWan == null || mainNetPct == null) throw new Error('新浪资金字段为空');
+  const summary = summarizeFundFlowRows([row], 1);
+  if (!summary.available) throw new Error('新浪资金字段为空');
   return {
-    mainInflow: finiteNumber(row.r0_in) == null ? null : Number(row.r0_in) * 10000,
-    mainOutflow: finiteNumber(row.r0_out) == null ? null : Math.abs(Number(row.r0_out)) * 10000,
-    mainNetInflow: mainNetWan * 10000,
-    mainNetPct,
+    mainInflow: summary.mainInflow,
+    mainOutflow: summary.mainOutflow,
+    mainNetInflow: summary.mainNetInflow,
+    mainNetPct: summary.netRatio,
     source: '新浪日资金流向',
     tradeDate: String(row.opendate || ''),
     estimated: false
@@ -745,7 +746,7 @@ async function fetchStockFundFlow({ code, force = false }) {
     fetchSinaSingleFundFlow(safeCode)
   ]);
   for (const result of primary) {
-    if (result.status === 'fulfilled' && result.value.mainInflow != null && result.value.mainOutflow != null) {
+    if (result.status === 'fulfilled' && finiteNumber(result.value.mainNetInflow) !== null) {
       return writeTimedCache(stockFundFlowCache, safeCode, { ...result.value, errors });
     }
     errors.push(result.status === 'fulfilled' ? `${result.value.source}未提供主力流入/流出分项` : result.reason?.message || String(result.reason));
@@ -1094,6 +1095,8 @@ async function fetchEastmoneyListPages(params, timeout, fetchPage = fetchEastmon
   const query = new URLSearchParams(params);
   query.set('pn', '1');
   query.set('pz', '100');
+  // Quotes move between requests; paginate by immutable code, then rank locally.
+  query.set('fid', 'f12');
   const first = await fetchPage(`/api/qt/clist/get?${query}`, timeout);
   const rows = eastmoneyListRows(first.json?.data);
   const total = finiteNumber(first.json?.data?.total);
@@ -1690,6 +1693,10 @@ function fundFlowPeriodEvidence(flow) {
 }
 
 function analyzeCapitalWindows(flow, tradeDate = '') {
+  const current = flow?.current;
+  const currentValid = tradeDate && current && !current.estimated && !current.stale
+    && current.tradeDate === tradeDate && finiteNumber(current.mainNetInflow) !== null;
+  const currentWeakening = Boolean(currentValid && current.mainNetInflow < 0 && finiteNumber(current.mainNetPct) !== null && current.mainNetPct <= -3);
   const byDate = new Map();
   for (const row of flow?.rows || []) {
     const date = dateOnly(row?.date);
@@ -1699,14 +1706,16 @@ function analyzeCapitalWindows(flow, tradeDate = '') {
   const endDate = rows.at(-1)?.date || flow?.endDate || '';
   const stale = Boolean(flow?.stale || tradeDate && endDate && endDate !== tradeDate);
   if (!flow?.available || flow.estimated || !rows.length) return {
-    available:false, stale, weakening:false, confirmed:false,
-    summary:flow?.estimated ? '量价估算不作为真实主力资金确认' : '多周期资金数据不足'
+    available:false, stale, weakening:currentWeakening, confirmed:false,
+    latestNet:currentValid ? current.mainNetInflow : null, latestRatio:currentValid ? current.mainNetPct : null,
+    summary:currentValid ? `当日真实主力净额${formatCapitalAmount(current.mainNetInflow)}，占比${signedPercent(current.mainNetPct)}；${currentWeakening ? '当日资金显著流出，不建议入场；' : ''}多日资金未确认`
+      : flow?.estimated ? '量价估算不作为真实主力资金确认' : '多周期资金数据不足'
   };
   const net = count => rows.length >= count ? rows.slice(-count).reduce((sum,row)=>sum+Number(row.mainNetInflow),0) : null;
   const latestNet = net(1), net3 = net(3), net10 = net(10);
   const latestRatio = finiteNumber(rows.at(-1).mainNetPct);
   const recentOutDays = rows.slice(-3).filter(row=>row.mainNetInflow < 0).length;
-  const weakening = !stale && (latestNet < 0 && latestRatio !== null && latestRatio <= -3
+  const weakening = currentWeakening || !stale && (latestNet < 0 && latestRatio !== null && latestRatio <= -3
     || net3 !== null && net3 < 0 && recentOutDays >= 2);
   const confirmed = !stale && !weakening && net3 !== null && net3 > 0 && latestNet > 0;
   const signedNet = value => value === null ? '数据不足' : `${value < 0 ? '-' : '+'}${formatCapitalAmount(value)}`;
@@ -1728,11 +1737,11 @@ function combineConsolidationBreakout(technical, flow) {
     flowAvailable: false
   };
   const windows = analyzeCapitalWindows(flow, technical.tradeDate);
-  const flowAvailable = Boolean(flow?.available && flow.days && !windows.stale);
-  const persistentOutflow = flowAvailable && (windows.weakening || flow.mainNetInflow < 0
+  const flowAvailable = Boolean(flow?.available && !flow.estimated && flow.days && !windows.stale);
+  const persistentOutflow = windows.weakening || flowAvailable && (flow.mainNetInflow < 0
     && flow.netRatio <= -3 && flow.positiveDays <= Math.floor(flow.days * .4));
-  const flowAdjustment = !flowAvailable ? 0
-    : persistentOutflow ? -18 : windows.available && !windows.confirmed ? 0
+  const flowAdjustment = persistentOutflow ? -18 : !flowAvailable ? 0
+    : windows.available && !windows.confirmed ? 0
       : flow.mainNetInflow > 0 && flow.positiveDays >= Math.ceil(flow.days * .6) ? 10
       : flow.mainNetInflow > 0 ? 5 : persistentOutflow ? -18 : -8;
   const score = clampRecommendationScore(technical.technicalScore + flowAdjustment);
@@ -1754,14 +1763,14 @@ function applyIndividualCapitalAssessment(analysis, flow) {
   const directFlow = available && !flow.estimated;
   const strongFlow = directFlow && flow.mainNetInflow > 0
     && (!capitalWindows.available || capitalWindows.confirmed) && flow.positiveDays >= Math.ceil(flow.days * .6);
-  const persistentOutflow = available && (capitalWindows.weakening || flow.mainNetInflow < 0
+  const persistentOutflow = capitalWindows.weakening || available && (flow.mainNetInflow < 0
     && flow.netRatio <= (flow.estimated ? -6 : -3) && flow.positiveDays <= Math.floor(flow.days * .4));
   const rawAdjustment = !available ? 0
     : persistentOutflow ? -8 : capitalWindows.available && !capitalWindows.confirmed ? 0
       : flow.mainNetInflow > 0 && flow.positiveDays >= Math.ceil(flow.days * .6) ? 6
       : flow.mainNetInflow > 0 ? 3 : persistentOutflow ? -8 : -4;
-  const adjustment = flow?.estimated ? Math.round(rawAdjustment * .5) : rawAdjustment;
-  const status = !available ? '资金数据不足'
+  const adjustment = capitalWindows.weakening ? -8 : flow?.estimated ? Math.min(0, Math.round(rawAdjustment * .5)) : rawAdjustment;
+  const status = capitalWindows.weakening ? '资金偏弱' : !available ? '资金数据不足'
     : flow.estimated ? flow.mainNetInflow > 0 ? '量价资金改善' : persistentOutflow ? '量价资金偏弱' : '量价资金待确认'
     : capitalWindows.weakening ? '资金偏弱' : setup.passed && adjustment >= 6 ? '蓄势增强'
       : setup.passed && flow.mainNetInflow <= 0 ? '资金未确认'
@@ -1783,7 +1792,7 @@ function applyIndividualCapitalAssessment(analysis, flow) {
       status: persistentOutflow ? '资金未确认' : '结构偏弱',
       tone: 'negative',
       summary: persistentOutflow
-        ? `${entryAssessment.summary} 但阶段主力资金持续净流出，当前不建议入场。`
+        ? `${entryAssessment.summary} 但当前真实资金或阶段量价数据偏弱，当前不建议入场。`
         : `${entryAssessment.summary} 但横盘量价结构已转弱，当前不建议入场。`
     };
   } else if (entryAssessment?.lowBuyCandidate && strongFlow
@@ -1807,7 +1816,7 @@ function applyIndividualCapitalAssessment(analysis, flow) {
   } else if (entryAssessment?.lowBuyCandidate && available && flow.mainNetInflow <= 0) {
     entryAssessment = { ...entryAssessment, status: '资金未确认', tone: 'warning', summary: `${entryAssessment.summary} 阶段主力资金尚未转为净流入，当前只观察，不执行低吸。` };
   }
-  if (entryAssessment && (capitalWindows.available || capitalWindows.stale)) {
+  if (entryAssessment && (capitalWindows.available || capitalWindows.stale || flow?.current)) {
     entryAssessment = {...entryAssessment, summary:`${entryAssessment.summary} ${capitalWindows.summary}。`};
     if (capitalWindows.stale) entryAssessment = {...entryAssessment, allowed:false, status:'资金时效待确认', tone:'warning'};
   }
@@ -1817,7 +1826,7 @@ function applyIndividualCapitalAssessment(analysis, flow) {
     : (persistentOutflow || breakoutWeak || entryBlockedByFunds || capitalWindows.stale) && analysis.verdict === '可关注' ? '等待确认' : analysis.verdict;
   const buyCondition = entryAllowed ? entryAssessment.summary
     : capitalWindows.stale ? capitalWindows.summary : persistentOutflow
-      ? '阶段主力资金持续净流出，暂不执行低吸；等待净流入天数恢复并重新满足原技术条件后再评估。'
+      ? `${capitalWindows.available || flow?.current ? capitalWindows.summary : flow?.estimated ? '阶段量价资金偏弱' : '阶段主力资金持续净流出'}；暂不执行低吸，等待资金和原技术条件恢复后再评估。`
       : breakoutWeak
         ? '横盘结构已经转弱，暂不执行低吸；等待重新站回箱底并修复量价结构后再评估。'
         : analysis.buyCondition;
@@ -2325,6 +2334,8 @@ function outcomeStatsAdjustment(stats, minimumCount) {
   if (Number(stats.outperformRate) < 35 && Number(stats.medianExcessReturn) < -.5) return -6;
   if (Number(stats.outperformRate) < 45 && Number(stats.medianExcessReturn) < -.5) return -4;
   if (Number(stats.outperformRate) < 50 && Number(stats.averageExcessReturn) <= -1 && Number(stats.medianExcessReturn) < -.5) return -4;
+  // Outperforming a losing cohort is not evidence of a profitable setup.
+  if (Number(stats.averageReturn) <= 0 || Number(stats.winRate) < 50) return 0;
   if (Number(stats.outperformRate) >= 65 && Number(stats.medianExcessReturn) >= .5) return 5;
   if (Number(stats.outperformRate) >= 55 && Number(stats.averageExcessReturn) >= 1) return 2;
   return 0;
@@ -2977,7 +2988,7 @@ function finalizeMomentumRecommendations(items, limit = 8, perSector = 2) {
   return selected;
 }
 
-async function buildMarketRecommendations(marketQuotes, force = false, outcomeProfile = null, marketContext = null) {
+async function buildMarketRecommendations(marketQuotes, force = false, outcomeProfile = null, marketContext = null, onProgress = () => {}) {
   const marketAssessmentContext = {
     breadth: (marketQuotes || []).reduce((counts, item) => {
       if (item.changePct > 0) counts.up++;
@@ -3043,10 +3054,13 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
   const tradeDate=(marketQuotes || []).map(item=>item.tradeDate).filter(Boolean).sort().at(-1);
   const fullMarketScreening=readDiskCache('full-market-screening',24*60*60*1000);
   const fullMarketScreened=selectFullMarketScreening(scored,fullMarketScreening,tradeDate);
-  const candidates = selectMarketRecommendationCandidates({ rotationScreened, momentumScreened, breakoutScreened, consolidationScreened, reboundScreened, fullMarketScreened }, 96);
+  const candidates = selectMarketRecommendationCandidates({ rotationScreened, momentumScreened, breakoutScreened, consolidationScreened, reboundScreened, fullMarketScreened }, 160);
+  const currentFundsPromise = settleWithConcurrency(Array.from({length:Math.ceil(candidates.length / 80)}, (_, index) =>
+    candidates.slice(index * 80, (index + 1) * 80).map(item => item.code)), 2, fetchQuoteRows);
+  onProgress({ stage:'history', message:`正在分析 ${candidates.length} 只候选的走势与量能` });
   const analyzed = [];
   const historyErrors = [];
-  const historyResults = await settleWithConcurrency(candidates, 6, async quote => {
+  const historyResults = await settleWithConcurrency(candidates, 8, async quote => {
       let history = readTimedCache(marketHistoryCache, quote.code, 10 * 60 * 1000);
       if (!history) {
         try {
@@ -3097,16 +3111,23 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
   const momentumQualifying = analyzed.filter(item => item.momentumDecision?.passed)
     .sort((a, b) => Number(b.momentumDecision.score) - Number(a.momentumDecision.score));
   appendSignal(momentumQualifying, '强势追踪');
-  const recommendationResults = await settleWithConcurrency(ranked, 4, async item => {
+  const currentFundResults = await currentFundsPromise;
+  const currentFunds = new Map(currentFundResults.filter(result => result.status === 'fulfilled').flatMap(result => result.value)
+    .map(row => [row.f12, { mainNetInflow:finiteNumber(row.f62), mainNetPct:finiteNumber(row.f184),
+      tradeDate:row.f124 > 0 ? new Date(row.f124 * 1000).toISOString().slice(0, 10) : '',
+      source:'东方财富批量主力资金', fetchedAt:new Date().toISOString(), estimated:false }]));
+  onProgress({ stage:'factors', message:`正在核验 ${ranked.length} 只候选的资金、消息与财务` });
+  const recommendationResults = await settleWithConcurrency(ranked, 6, async item => {
     const [fundFlowResult, newsResult, financialResult] = await Promise.allSettled([
       fetchSinaFundFlowHistory(item.code, 10, force),
       fetchStockNews({ code: item.code, name: item.name, force }),
       fetchStockFinancials({ code: item.code, force: false })
     ]);
-    const fundFlowPeriod = fundFlowResult.status === 'fulfilled' ? fundFlowResult.value : {
+    const historicalFlow = fundFlowResult.status === 'fulfilled' ? fundFlowResult.value : {
       ...item.estimatedFundFlow,
       fallbackReason: fundFlowResult.reason?.message || String(fundFlowResult.reason || '阶段资金接口不可用')
     };
+    const fundFlowPeriod = { ...historicalFlow, current:currentFunds.get(item.code) || null };
     const capitalAnalysis = applyIndividualCapitalAssessment(item.analysis, fundFlowPeriod);
     const breakoutPotential = capitalAnalysis.breakoutPotential;
     const momentumSignal = item.signal === '强势追踪';
@@ -3147,7 +3168,7 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
     const canslim = buildCanslimFromFactors(factorAnalysis);
     const sectorDescription = factorAnalysis.sectorProfile
       ? `${factorAnalysis.sectorProfile.name}${factorAnalysis.sectorProfile.label}（板块评分${factorAnalysis.sectorProfile.score}）` : '板块强度未确认';
-    const capitalDescription = fundFlowPeriod?.available ? fundFlowPeriodEvidence(fundFlowPeriod) : '阶段主力资金暂未取得，不据此加分';
+    const capitalDescription = `${fundFlowPeriod?.available ? fundFlowPeriodEvidence(fundFlowPeriod) : '阶段主力资金暂未取得，不据此加分'}；${analyzeCapitalWindows(fundFlowPeriod, item.analysis.tradeDate).summary}`;
     const structureReason = entryAssessment?.structureSummary ? `；形态评估：${entryAssessment.structureSummary}` : '';
     let reason = `${item.signal}；${technicalReason}；${capitalDescription}；${sectorDescription}；${newsContext.signal === '偏积极' ? newsAssessment.confirmed ? '正向消息已获技术与阶段资金确认' : '存在正向消息但阶段资金未确认，不据此加分' : newsContext.signal === '偏谨慎' ? '存在近期风险消息，信号降级等待确认' : '消息面时效加权后中性'}（最新${newsContext.latestPublishedAt ? formatNewsTime(newsContext.latestPublishedAt) : '未取得'}，${newsContext.freshness}）；综合入场：${entryAssessment?.status || '数据待补充'}，${entryAssessment?.summary || '关键数据不足'}${structureReason}。`;
     const setupAdjustment = item.analysis.accumulationSetup?.passed ? 10 : 0;
@@ -3248,12 +3269,14 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
     .slice(0, 20);
   const stableQualityRecommendations = [...strictQualityRecommendations, ...watchQualityRecommendations];
   const momentumQualityRecommendations = recommendations.filter(item => item.momentumDecision?.passed
+    && !analyzeCapitalWindows(item.fundFlowPeriod, item.analysis?.tradeDate).weakening
     && item.qualityScore >= 55
     && item.newsLabel !== '消息谨慎'
     && !['破位', '爆量观察', '结构偏弱', '公司风险'].includes(item.entryAssessment?.status));
   const qualityRecommendations = [...new Map([...stableQualityRecommendations, ...momentumQualityRecommendations]
     .map(item => [item.code, item])).values()];
-  const riskResults = await settleWithConcurrency(qualityRecommendations, 4, item => fetchFutureRiskProfile({
+  onProgress({ stage:'risk', message:`正在核验 ${qualityRecommendations.length} 只候选的公司风险` });
+  const riskResults = await settleWithConcurrency(qualityRecommendations, 6, item => fetchFutureRiskProfile({
     code: item.code,
     name: item.name,
     force: false
@@ -3328,10 +3351,14 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
       industryUnresolved: analyzed.filter(item => resolveRecommendationIndustry(item) === '行业待确认').length,
       directoryAvailable: directoryByCode.size > 0,
       historyFailures: historyErrors.length,
+      enrichmentFailures: recommendationResults.filter(result => result.status === 'rejected').length,
+      fundFlowErrors: [...new Set(recommendations.map(item => item.fundFlowPeriod?.fallbackReason).filter(Boolean))],
       accumulationCandidates: analyzed.filter(item => item.analysis.accumulationSetup?.passed).length,
       consolidationCandidates: analyzed.filter(item => item.analysis.consolidationBreakout?.isConsolidating).length,
       fundFlowAvailable: recommendations.filter(item => item.fundFlowPeriod?.available).length,
       fundFlowDirect: recommendations.filter(item => item.fundFlowPeriod?.available && !item.fundFlowPeriod.estimated).length,
+      currentFundFlowDirect: recommendations.filter(item => finiteNumber(item.fundFlowPeriod?.current?.mainNetInflow) !== null).length,
+      currentFundFlowErrors:currentFundResults.filter(result => result.status === 'rejected').map(result => result.reason?.message || String(result.reason)),
       fundFlowEstimated: recommendations.filter(item => item.fundFlowPeriod?.estimated).length,
       signals: finalSignals,
       signalCandidates: {
@@ -3392,7 +3419,9 @@ function marketAnalysis(result) {
   return `市场情绪${sentiment}${up || down ? `，上涨${up}家、下跌${down}家` : ''}。${leaders ? `轮动靠前：${leaders}。` : ''}${funds ? `主力资金靠前：${funds}。` : ''}涨停${result.limits?.upCount ?? 0}只、跌停${result.limits?.downCount ?? 0}只。${overseas}${news}${signalGroups ? `稳健轮动候选——${signalGroups}；` : '当前未筛出满足条件的稳健候选。'}${momentumNames ? `强势追踪候选：${momentumNames}，仅等待回踩确认，不追涨停或爆量加速。` : '当前没有通过真实板块资金确认的强势追踪候选。'}`;
 }
 
-async function fetchMarketOverview(force = false, favoriteOutcomes = []) {
+async function fetchMarketOverview(force = false, favoriteOutcomes = [], onProgress = () => {}) {
+  const startedAt = Date.now();
+  onProgress({ stage:'snapshot', message:'正在更新大盘、全市场行情与美股数据' });
   const freshCachedQuotes = [...quoteCache.values()].filter(quote => !quote.stale
     && Date.now() - Date.parse(quote.fetchedAt || '') < 10 * 60 * 1000);
   let outcomeProfile = summarizeRecommendationOutcomes(mergeRecommendationOutcomeQuotes(favoriteOutcomes, freshCachedQuotes));
@@ -3410,6 +3439,10 @@ async function fetchMarketOverview(force = false, favoriteOutcomes = []) {
   const [indicesResult, snapshotResult, overseasResult] = await Promise.allSettled([
     fetchTencentMarketIndices(), fetchTencentMarketSnapshot(), fetchGlobalMarketContext()
   ]);
+  onProgress({ stage:'sectors', message:'正在更新板块轮动、真实资金与市场消息',
+    snapshot: { indices:indicesResult.status === 'fulfilled' ? indicesResult.value : [],
+      breadth:snapshotResult.value?.breadth, turnover:snapshotResult.value?.turnover,
+      fetchedAt:new Date().toISOString() } });
   if (indicesResult.status === 'fulfilled' && indicesResult.value.length) result.indices = indicesResult.value;
   else result.errors.push(`指数行情失败：${indicesResult.reason?.message || '返回为空'}`);
   if (overseasResult.status === 'fulfilled') result.overseas = overseasResult.value;
@@ -3470,7 +3503,7 @@ async function fetchMarketOverview(force = false, favoriteOutcomes = []) {
         indices: result.indices || [], overseas: result.overseas,
         marketNewsContext: await marketNewsContextPromise,
         sectors:result.sectors || []
-      }))(),
+      }, onProgress))(),
       newsPromise
     ]);
     if (recommendationsResult.status === 'fulfilled' && recommendationsResult.value) {
@@ -3478,6 +3511,9 @@ async function fetchMarketOverview(force = false, favoriteOutcomes = []) {
       result.recommendationsComputed = true;
       result.momentumRecommendations = recommendationsResult.value.momentumRecommendations;
       result.recommendationCoverage = recommendationsResult.value.coverage;
+      if (result.recommendationCoverage.fundFlowErrors?.length) {
+        result.warnings.push(`部分候选多日主力资金未取得，阶段量价估算不作为资金确认；已取得 ${result.recommendationCoverage.currentFundFlowDirect || 0} 只候选当日真实资金`);
+      }
       result.recommendationsFetchedAt = new Date().toISOString();
     } else if (reuseRecommendations) {
       restoreCachedMarketRecommendations(result, recommendationCache, snapshotResult.value.quotes, {reuse:true});
@@ -3513,6 +3549,7 @@ async function fetchMarketOverview(force = false, favoriteOutcomes = []) {
   result.turnover ||= result.indices.slice(0, 2).reduce((sum, item) => sum + (item.amount || 0), 0);
   result.analysis = marketAnalysis(result);
   result.source = ['腾讯指数', result.overseas.available ? result.overseas.source : '', snapshotResult.status === 'fulfilled' ? '腾讯全市场行情' : '', result.sectorCapital?.source || (result.sectors.length ? '全市场细分行业轮动估算' : '')].filter(Boolean).join(' + ');
+  result.elapsedMs = Date.now() - startedAt;
   if (!result.indices.length && !result.sectors.length) {
     if (previousOverview?.indices?.length || previousOverview?.sectors?.length) {
       const fallback = {
@@ -4793,6 +4830,11 @@ function normalizeHistoryRows(rows) {
   }).filter(row => row.date && row.close != null && row.high != null && row.low != null);
 }
 
+function normalizeSinaHistoryRows(rows) {
+  // Sina reports shares; all internal candles and quote volumes use lots of 100 shares.
+  return normalizeHistoryRows(rows).map(row => ({ ...row, volume: row.volume === null ? null : row.volume / 100 }));
+}
+
 function aggregateHistoryPeriod(rows, period) {
   const groups = new Map();
   normalizeHistoryRows(rows).forEach(row => {
@@ -4852,7 +4894,7 @@ async function fetchSinaHistory(code, count = 66) {
   const text = await getText(`https://quotes.sina.cn/cn/api/jsonp_v2.php/var%20history=/CN_MarketDataService.getKLineData?symbol=${symbol}&scale=240&ma=no&datalen=${safeCount}`, { Referer: 'https://finance.sina.com.cn/' });
   const jsonText = (text.match(/=\s*\(([\s\S]*?)\);?\s*$/) || [])[1];
   if (!jsonText) throw new Error('新浪日线返回格式异常');
-  return normalizeHistoryRows(JSON.parse(jsonText));
+  return normalizeSinaHistoryRows(JSON.parse(jsonText));
 }
 
 function average(values) {
@@ -5492,7 +5534,7 @@ async function fetchStockHistory({ code, name, industry = '', sector = '', force
   const cached = force ? null : readTimedCache(stockHistoryCache, cacheKey, 2 * 60 * 1000);
   if (cached && (cached.feedbackSignature || '') === feedbackSignature) return { ...cached, cached: true };
   const historyErrors = [];
-  const [historyResult, quoteResult, newsResult, riskResult, financialResult, fundFlowResult, marketNewsResult, marketIndicesResult, overseasResult, sectorCapitalResult] = await Promise.allSettled([
+  const [historyResult, quoteResult, newsResult, riskResult, financialResult, fundFlowResult, marketNewsResult, marketIndicesResult, overseasResult, sectorCapitalResult, currentFundResult] = await Promise.allSettled([
     (async () => {
       try {
         const history = await fetchTencentHistory(cacheKey, 320);
@@ -5515,7 +5557,8 @@ async function fetchStockHistory({ code, name, industry = '', sector = '', force
     fetchMarketNews(force),
     force ? fetchTencentMarketIndices() : Promise.resolve(marketOverviewCache?.value?.indices || []),
     force ? fetchGlobalMarketContext() : Promise.resolve(marketOverviewCache?.value?.overseas || assessGlobalMarketContext([])),
-    fetchSectorCapitalFlow(force)
+    fetchSectorCapitalFlow(force),
+    fetchEastmoneySingleFundFlow(cacheKey)
   ]);
   const errors = [...historyErrors];
   let history = historyResult.status === 'fulfilled' ? historyResult.value.history : [];
@@ -5537,8 +5580,10 @@ async function fetchStockHistory({ code, name, industry = '', sector = '', force
   if (!history.length && errors.length) throw new Error(errors.join('；'));
   let analysis = analyzeHistory(history);
   const fundFlowPeriod = fundFlowResult.status === 'fulfilled'
-    ? fundFlowResult.value
+    ? { ...fundFlowResult.value }
     : { ...estimateFundFlowFromHistory(history, 10), fallbackReason:fundFlowResult.reason?.message || String(fundFlowResult.reason || '') };
+  fundFlowPeriod.current = currentFundResult.status === 'fulfilled' ? currentFundResult.value : null;
+  if (currentFundResult.status === 'rejected') errors.push(`当日资金失败：${currentFundResult.reason?.message || currentFundResult.reason}`);
   if (fundFlowResult.status === 'rejected') errors.push(`阶段主力资金接口失败，已使用日线量价资金代理：${fundFlowResult.reason?.message || fundFlowResult.reason}`);
   analysis = applyIndividualCapitalAssessment(analysis, fundFlowPeriod);
   let newsContext = summarizeNews([]);
@@ -5998,10 +6043,74 @@ ipcMain.handle('fetch-stock-fund-flow', async (_event, request) => {
   }
 });
 
+let marketWorker = null;
+let marketWorkerPending = null;
+const marketProgressListeners = new Set();
+
+function fetchMarketOverviewInWorker(request, onProgress = () => {}) {
+  marketProgressListeners.add(onProgress);
+  if (!marketWorkerPending) {
+    marketWorkerPending = new Promise((resolve, reject) => {
+      if (!marketWorker) marketWorker = new Worker(__filename, { workerData: { isPackaged:app.isPackaged, marketAnalysis:true } });
+      const worker = marketWorker;
+      const finish = (error, result) => {
+        clearTimeout(timer);
+        worker.off('message', onMessage);
+        worker.off('error', onError);
+        worker.off('exit', onExit);
+        if (error) { marketWorker = null; worker.terminate(); reject(error); }
+        else { worker.unref(); resolve(result); }
+      };
+      const onError = error => finish(error);
+      const onExit = code => finish(new Error(`大盘分析线程退出：${code}`));
+      const timer = setTimeout(() => finish(new Error('大盘分析超时，请稍后重试')), 180000);
+      const onMessage = message => {
+        if (message.progress) {
+          for (const listener of marketProgressListeners) listener(message.progress);
+        } else if (message.error) finish(new Error(message.error));
+        else if (message.result) {
+          for (const quote of message.quotes || []) {
+            const previous = quoteCache.get(quote.code);
+            if (!previous || Date.parse(quote.fetchedAt) >= (Date.parse(previous.fetchedAt) || 0)) quoteCache.set(quote.code, quote);
+          }
+          marketOverviewCache = { savedAt:Date.now(), value:message.result };
+          finish(null, message.result);
+        }
+      };
+      worker.ref();
+      worker.on('message', onMessage);
+      worker.on('error', onError);
+      worker.on('exit', onExit);
+      worker.postMessage(request);
+    }).finally(() => {
+      marketWorkerPending = null;
+      marketProgressListeners.clear();
+    });
+  }
+  return marketWorkerPending;
+}
+
+if (!isMainThread && workerData?.marketAnalysis) {
+  parentPort.on('message', async request => {
+    try {
+      const result = await fetchMarketOverview(Boolean(request.force), request.favoriteOutcomes,
+        progress => parentPort.postMessage({ progress }));
+      parentPort.postMessage({ result, quotes:[...quoteCache.values()] });
+    } catch (error) {
+      parentPort.postMessage({ error:error.stack || error.message });
+    }
+  });
+}
+
+app.on('before-quit', () => { marketWorker?.terminate(); });
+
 ipcMain.handle('fetch-market-overview', async (_event, input) => {
   const request = input && typeof input === 'object' ? input : { force: Boolean(input) };
   try {
-    const result = await fetchMarketOverview(Boolean(request.force), request.favoriteOutcomes);
+    const result = await fetchMarketOverviewInWorker(request, progress => {
+      if (_event?.sender && !_event.sender.isDestroyed()) _event.sender.send('market-overview-progress', progress);
+    });
+    appendLogLine({ type:'info', message:'大盘筛选诊断', action:'market_screening_diagnostics', detail:{ elapsedMs:result.elapsedMs, coverage:result.recommendationCoverage } });
     appendLogLine({ type: result.errors.length ? 'warn' : 'success', message: '大盘实时分析完成', action: 'market_overview', detail: { indices: result.indices.length, sectors: result.sectors.length, sectorLeaders:result.sectors.slice(0, 8).map(item => ({name:item.name, changePct:item.changePct, upRatio:item.upRatio, rotationScore:item.rotationScore, rotationState:item.rotationState, mainNetInflow:item.mainNetInflow, mainNetPct:item.mainNetPct, capitalRank:item.capitalRank, capitalEstimated:item.capitalEstimated, capitalSource:item.capitalSource})), stableRecommendations: result.recommendations?.length || 0, momentumRecommendations:result.momentumRecommendations?.length || 0, rotationCandidates:result.recommendationCoverage?.rotationCandidates || 0, recommendationOutcomeSamples: result.recommendationCoverage?.outcomeFeedback?.sampleSize || 0, stockFundFlowDirect:result.recommendationCoverage?.fundFlowDirect || 0, stockFundFlowEstimated:result.recommendationCoverage?.fundFlowEstimated || 0, directSectorCapital:result.recommendationCoverage?.directSectorCapital || 0, sectorCapital:result.sectorCapital || null, overseas:result.overseas, news: result.newsContext?.items?.length || 0, turnover: result.turnover, limits: result.limits, source: result.source, warnings: result.warnings || [], errors: result.errors } });
     return result;
   } catch (err) {
@@ -6047,7 +6156,7 @@ function createWindow() {
     return { action: 'deny' };
   });
   win.once('ready-to-show', () => win.show());
-  win.loadFile('index.html');
+  win.loadFile(path.join(__dirname, 'index.html'));
 }
 
 app.whenReady().then(() => {
@@ -6063,6 +6172,8 @@ app.on('window-all-closed', () => {
 });
 
 module.exports = {
+  normalizeSinaHistoryRows,
+  fetchMarketOverviewInWorker,
   eastmoneyListRows,
   fetchEastmoneyListPages,
   RECOMMENDATION_MODEL_VERSION,

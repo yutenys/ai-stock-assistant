@@ -1,0 +1,56 @@
+const fs = require('node:fs');
+const path = require('node:path');
+const { monitorEventLoopDelay } = require('node:perf_hooks');
+const { api, live } = require('./market-diagnostics.cjs');
+const root = path.resolve(__dirname, '..');
+const read = name => JSON.parse(fs.readFileSync(path.join(root, 'cache', name), 'utf8'));
+const state = read('local-state-review.json');
+async function main() {
+  const snapshot = process.argv.includes('--snapshot') ? read('review-live-snapshot.json')
+    : { ...await live.fetchTencentMarketSnapshot(), fetchedAt:new Date().toISOString() };
+  const quoteFetchedAt = snapshot.fetchedAt || fs.statSync(path.join(root, 'cache', 'review-live-snapshot.json')).mtime.toISOString();
+  if (!process.argv.includes('--snapshot')) fs.writeFileSync(path.join(root, 'cache', 'review-live-snapshot.json'), JSON.stringify(snapshot));
+  const quotes = new Map(snapshot.quotes.map(row => [row.code, row]));
+  const excluded = label => ['重点关注', 'personal'].includes(String(label).trim().toLowerCase());
+  const favoriteOutcomes = (state.labels || []).flatMap(label => (label.stocks || []).map(stock => ({
+    code:stock.code, label:label.name, favoriteBasePrice:stock.favoriteBasePrice,
+    favoriteAddedAt:stock.favoriteAddedAt, price:stock.price,
+    signal:stock.favoriteEntrySnapshot?.signal || stock.marketSignal || stock.signal || stock.type || stock.status,
+    signalScore:stock.favoriteEntrySnapshot?.signalScore ?? null,
+    technicalScore:stock.favoriteEntrySnapshot?.technicalScore ?? null
+  })));
+  const pricedOutcomes = api.mergeRecommendationOutcomeQuotes(favoriteOutcomes, snapshot.quotes);
+  const profile = api.summarizeRecommendationOutcomes(pricedOutcomes, {now:quoteFetchedAt});
+  const cohorts = (state.labels || []).filter(label => !excluded(label.name)).map(label => {
+    const stats = api.summarizeRecommendationOutcomes(pricedOutcomes.filter(row => row.label === label.name), {now:quoteFetchedAt});
+    return { label:label.name, ...stats.overall, immatureCount:stats.immatureCount, invalidCount:stats.invalidCount };
+  });
+  // Old positions cannot safely be attributed using their current label membership.
+  const positions = (state.portfolio || []).map(position => {
+    const price = quotes.get(position.code)?.price;
+    return { code:position.code, name:position.name, quantity:position.quantity, cost:position.costPrice, price,
+      floatingPnl:price > 0 ? (price - position.costPrice) * position.quantity : null,
+      returnPct:price > 0 && position.costPrice > 0 ? (price / position.costPrice - 1) * 100 : null,
+      realizedPnl:position.realizedPnl, attribution:'模拟账户诊断，不以当前标签反推入场归属' };
+  });
+  const eventLoop = monitorEventLoopDelay({resolution:20});
+  eventLoop.enable();
+  const startedAt = Date.now();
+  const progress = [];
+  const market = await api.fetchMarketOverviewInWorker({force:true, favoriteOutcomes}, update => {
+    const row = { stage:update.stage, message:update.message, elapsedMs:Date.now() - startedAt };
+    progress.push(row);
+    console.log(JSON.stringify(row));
+  });
+  eventLoop.disable();
+  const report = { fetchedAt:new Date().toISOString(), quoteFetchedAt, quoteTradeDate:snapshot.quotes[0]?.tradeDate,
+    profile, cohorts, positions, simulatedTradeCount:state.simulatedTrades?.length || 0,
+    totalFloatingPnl:positions.reduce((sum, row) => sum + (row.floatingPnl || 0), 0),
+    progress, eventLoopMaxMs:eventLoop.max / 1e6, elapsedMs:Date.now() - startedAt,
+    coverage:market.recommendationCoverage, errors:market.errors, warnings:market.warnings,
+    recommendations:market.recommendations.map(row => ({code:row.code,name:row.name,signal:row.signal,score:row.signalScore,entry:row.entryAssessment?.status})),
+    momentum:market.momentumRecommendations.map(row => ({code:row.code,name:row.name,score:row.signalScore})) };
+  fs.writeFileSync(path.join(root, 'cache', 'performance-review.json'), JSON.stringify(report, null, 2));
+  console.log(JSON.stringify(report, null, 2));
+}
+main().catch(error => { console.error(error); process.exitCode = 1; });
