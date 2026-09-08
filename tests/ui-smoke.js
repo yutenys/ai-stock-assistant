@@ -204,7 +204,7 @@ app.whenReady().then(async () => {
     ],
     breadth: { up: 3210, down: 1780, flat: 126 },
     turnover: 1146711000000,
-    sectors: [{ name: '中药', changePct: 2.31, mainNetInflow: 1860000000, mainNetPct:6.8, capitalRank:8, capitalEstimated:false, rotationState:'资金升温', leader: '珍宝岛' }],
+    sectors: [{ name: '中药', changePct: 2.31, mainNetInflow: 1860000000, mainNetPct:6.8, mainNet5:2e9, mainNet10:3e9, capitalTradeDate:'2026-08-12', capitalTrend:{available:true}, capitalRank:8, capitalEstimated:false, rotationState:'资金升温', leader: '珍宝岛' }],
     weakSectors: [{ name: '煤炭', changePct: -1.25, leader: '测试股票' }],
     fundSectors: [{ name: '猪肉概念', changePct: 5.92, mainNetInflow: 1555330704, mainNetPct:9.65, capitalRank:2, capitalEstimated:false, rotationState:'资金升温', leader: '邦基科技' }],
     limits: { upCount: 68, downCount: 7, upStocks: [{ code: '603567', name: '珍宝岛', industry: '中药' }], downStocks: [] },
@@ -937,6 +937,8 @@ app.whenReady().then(async () => {
     && state.marketText.includes('数据提示：技术形态候选本轮未生成')
     && state.marketText.includes('未来半年风险核验 16 只，排除 2 只，未确认 1 只（降分保留 1 只）')
     && state.marketText.includes('横盘候选 5 只')
+    && state.marketText.includes('5日净额20.00亿 / 10日净额30.00亿')
+    && state.marketText.includes('资金截至2026-08-12')
     && state.marketBatchLabelState.initialAll && state.marketBatchLabelState.afterClear
     && state.marketBatchLabelState.initialTrack && state.marketBatchLabelState.momentumTrack && state.marketBatchLabelState.stableRestored
     && state.marketBatchLabelState.momentumModal.count === 1

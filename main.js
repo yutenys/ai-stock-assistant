@@ -30,7 +30,7 @@ let marketDirectorySavedAt = 0;
 const CONTROLLED_VOLUME_MIN = 1.5;
 const CONTROLLED_VOLUME_MAX = 4;
 const SECTOR_CAPITAL_FALLBACK_MAX_AGE_MS = 72 * 60 * 60 * 1000;
-const RECOMMENDATION_MODEL_VERSION = '2026-09-07-volume-outcomes-v9';
+const RECOMMENDATION_MODEL_VERSION = '2026-09-08-capital-rotation-v10';
 
 function isControlledVolumeExpansion(value) {
   const ratio = Number(value);
@@ -645,7 +645,7 @@ function normalizeQuoteRow(r) {
 }
 
 async function fetchQuoteRows(codes) {
-  const fields = 'f12,f14,f2,f3,f4,f5,f6,f7,f8,f9,f10,f15,f16,f17,f18,f20,f21,f23,f51,f52,f62,f184,f57,f58,f124';
+  const fields = 'f12,f14,f2,f3,f4,f5,f6,f7,f8,f9,f10,f15,f16,f17,f18,f20,f21,f23,f51,f52,f62,f184,f57,f58,f124,f267,f268,f164,f165,f174,f175';
   const secids = codes.map(secidOf).join(',');
   const pathname = `/api/qt/ulist.np/get?fltt=2&invt=2&fields=${fields}&secids=${encodeURIComponent(secids)}&_=${Date.now()}`;
   const { json } = await fetchEastmoneyHostPath(pathname, 3500);
@@ -662,6 +662,7 @@ async function fetchEastmoneySingleFundFlow(code) {
     mainOutflow: null,
     mainNetInflow,
     mainNetPct,
+    ...capitalWindowFields(data),
     source: '东方财富单股资金',
     tradeDate: data.f124 > 0 ? new Date(data.f124 * 1000).toISOString().slice(0, 10) : '',
     estimated: false
@@ -1052,6 +1053,41 @@ function normalizeSectorCapitalName(value) {
   return cleanStockName(value).replace(/[ⅠⅡⅢⅣⅤ]+$/u, '').replace(/[一二三四五]级$/u, '').trim();
 }
 
+function capitalWindowFields(row) {
+  // Eastmoney's official 3/5/10-day capital table reports amounts in yuan.
+  return {mainNet3:finiteNumber(row.f267), mainNetPct3:finiteNumber(row.f268),
+    mainNet5:finiteNumber(row.f164), mainNetPct5:finiteNumber(row.f165),
+    mainNet10:finiteNumber(row.f174), mainNetPct10:finiteNumber(row.f175)};
+}
+
+function isSectorRotationTheme(row) {
+  if (row.boardType !== 'concept') return true;
+  const name = normalizeSectorCapitalName(row.name);
+  return !/^(融资融券|沪股通|深股通|机构重仓|基金重仓|社保重仓|QFII重仓|证金持股|转债标的|行业龙头|ST股|AB股|AH股|B股|沪深300|HS300|中证500|上证50|上证180|上证380|创业成份|创业板综|深成500|深证100R|MSCI中国|富时罗素)$/.test(name)
+    && !/^\d{4}(?:[一二三四]季报|中报|年报)/.test(name)
+    && !/^(?:昨日|最近|近期|百日|历史)(?:涨停|连板|触板|首板|炸板|高换手|高振幅|多板|打二板|新高)/.test(name)
+    && !/^(?:微盘|小盘|中盘|大盘)(?:股|精选|成长|价值)$/.test(name);
+}
+
+function assessSectorCapitalTrend(row) {
+  const net = finiteNumber(row.mainNetInflow), net3 = finiteNumber(row.mainNet3);
+  const net5 = finiteNumber(row.mainNet5), net10 = finiteNumber(row.mainNet10);
+  const valid = net !== null && !row.capitalEstimated && !row.capitalStale;
+  const available = valid && (net5 !== null || net10 !== null);
+  // Rolling windows overlap; subtraction isolates the earlier days.
+  const prior4Net = net5 !== null && net !== null ? net5 - net : null;
+  const prior5Net = net10 !== null && net5 !== null ? net10 - net5 : null;
+  const confirmed = available && net > 0 && net5 > 0 && net10 > 0 && prior4Net > 0 && (net3 === null || net3 > 0);
+  const weakening = valid && net < 0 && Number(row.mainNetPct) <= -3;
+  const phase = !valid ? '资金时效待核验' : !available ? '单日资金待确认'
+    : net <= 0 ? net5 > 0 ? '流入后退潮' : '资金持续偏弱'
+      : confirmed ? '持续流入' : '当日转入待确认';
+  const amount = value => value === null ? '未提供' : `${value < 0 ? '-' : '+'}${formatCapitalAmount(value)}`;
+  return {available, confirmed, weakening, phase, prior4Net, prior5Net,
+    scoreAdjustment:!valid ? 0 : weakening ? -12 : confirmed ? 6 : available && net > 0 ? -3 : 0,
+    summary:`${phase}；真实主力净额当日${amount(net)}、3日${amount(net3)}、5日${amount(net5)}、10日${amount(net10)}（滚动窗口不相加，不代表连续每日流入）`};
+}
+
 function eastmoneyListRows(data) {
   const rows = data?.diff;
   if (!rows || typeof rows !== 'object') return [];
@@ -1068,6 +1104,8 @@ function normalizeSectorCapitalRows(rows, boardType, host, fetchedAt = new Date(
     totalMarketCap:finiteNumber(row.f20),
     mainNetInflow:finiteNumber(row.f62),
     mainNetPct:finiteNumber(row.f184),
+    ...capitalWindowFields(row),
+    capitalTradeDate:row.f124 > 0 ? new Date(row.f124 * 1000).toISOString().slice(0, 10) : '',
     source:`东方财富${typeLabel}板块主力资金（${new URL(host).hostname}）`,
     fetchedAt
   })).filter(item => /^BK\d{4}$/.test(item.code) && item.name && item.mainNetInflow !== null)
@@ -1121,7 +1159,7 @@ async function fetchSectorCapitalRank(boardType, sortField) {
   const boardFilter = boardType === 'concept' ? 'm:90+t:3' : 'm:90+t:2';
   const params = new URLSearchParams({
     pn:'1', pz:'100', po:'1', np:'1', fltt:'2', invt:'2', fid:sortField,
-    fs:boardFilter, fields:'f12,f14,f3,f20,f62,f184', _:String(Date.now())
+    fs:boardFilter, fields:'f12,f14,f3,f20,f62,f184,f267,f268,f164,f165,f174,f175,f124', _:String(Date.now())
   });
   const response = await fetchEastmoneyListPages(params, 3500);
   const rows = normalizeSectorCapitalRows(response.rows, boardType, response.host);
@@ -1164,13 +1202,10 @@ async function fetchSectorCapitalFlow(force = false) {
   const rows = [...byCode.values()];
   const rankByType = type => rows.filter(item => item.boardType === type).sort((a, b) => Number(b.mainNetInflow) - Number(a.mainNetInflow));
   for (const type of ['industry', 'concept']) rankByType(type).forEach((item, index) => { item.capitalRank = index + 1; });
-  const conceptBoards = rows.filter(item => item.boardType === 'concept' && item.mainNetInflow > 0 && item.mainNetPct > 0 && item.changePct > 0)
-    .sort((a, b) => (Number(b.mainNetPct) * 2 + Number(b.changePct)) - (Number(a.mainNetPct) * 2 + Number(a.changePct))
-      || Number(b.mainNetInflow) - Number(a.mainNetInflow))
-    .slice(0, 10);
-  const memberResults = await settleWithConcurrency(conceptBoards, 5, fetchSectorBoardMemberCodes);
+  const memberBoards = selectSectorMemberBoards(rows);
+  const memberResults = await settleWithConcurrency(memberBoards, 5, fetchSectorBoardMemberCodes);
   memberResults.forEach((result, index) => {
-    const board = conceptBoards[index];
+    const board = memberBoards[index];
     if (result.status === 'fulfilled') board.memberCodes = result.value;
     else warnings.push(`${board.name}成分获取失败：${result.reason?.message || result.reason}`);
   });
@@ -1185,9 +1220,27 @@ async function fetchSectorCapitalFlow(force = false) {
   writeDiskCache('sector-capital', value);
   appendLogLine({
     type:warnings.length ? 'warn' : 'info', message:'板块主力资金加载完成', action:'sector_capital_loaded',
-    detail:{ rows:rows.length, conceptMembers:conceptBoards.filter(item => item.memberCodes?.length).length, hosts:[...hosts], warnings }
+    detail:{ rows:rows.length, memberBoards:memberBoards.filter(item => item.memberCodes?.length).map(item=>({code:item.code,name:item.name,type:item.boardType,count:item.memberCodes.length})), hosts:[...hosts], warnings }
   });
   return value;
+}
+
+function selectSectorMemberBoards(rows, limit = 20) {
+  const eligible = (rows || []).filter(row => isSectorRotationTheme(row) && !row.capitalStale && row.mainNetInflow > 0 && row.mainNetPct > 0);
+  const score = row => Number(row.mainNetPct) * 2 + Math.min(5, Number(row.changePct) || 0)
+    + assessSectorCapitalTrend(row).scoreAdjustment;
+  const queues = ['industry','concept'].map(type => eligible.filter(row => row.boardType === type)
+    .sort((a,b)=>score(b)-score(a) || b.mainNetInflow-a.mainNetInflow));
+  const names = new Set(), selected = [];
+  for (let index=0; index<Math.max(...queues.map(queue=>queue.length)) && selected.length<limit; index++) {
+    for (const queue of queues) {
+      const row=queue[index];
+      if (!row || names.has(row.name) || selected.length>=limit) continue;
+      names.add(row.name);
+      selected.push(row);
+    }
+  }
+  return selected;
 }
 
 async function fetchSectorBoardMemberCodes(board) {
@@ -1224,12 +1277,15 @@ function sectorQuoteStats(memberCodes, marketQuotes) {
   };
 }
 
-function mergeSectorCapitalRows(rotation, capitalRows, marketQuotes = []) {
+function mergeSectorCapitalRows(rotation, capitalRows, marketQuotes = [], tradeDate = '') {
+  tradeDate ||= (marketQuotes || []).map(row => row.tradeDate).filter(Boolean).sort().at(-1) || '';
+  capitalRows = (capitalRows || []).filter(isSectorRotationTheme);
   const baseRows = rotation?.sectors || [];
   const baseByName = new Map(baseRows.map(item => [normalizeSectorCapitalName(item.name), item]));
-  const directValues = (capitalRows || []).filter(item=>!item.capitalStale).map(item => finiteNumber(item.mainNetInflow)).filter(value => value !== null);
+  const directValues = (capitalRows || []).filter(item=>!item.capitalStale && (!tradeDate || item.capitalTradeDate === tradeDate)).map(item => finiteNumber(item.mainNetInflow)).filter(value => value !== null);
   const mergedByName = new Map();
   (capitalRows || []).forEach(row => {
+    row = {...row, capitalStale:Boolean(row.capitalStale || tradeDate && row.capitalTradeDate !== tradeDate)};
     const name = normalizeSectorCapitalName(row.name);
     if (!name) return;
     const current = mergedByName.get(name);
@@ -1246,8 +1302,9 @@ function mergeSectorCapitalRows(rotation, capitalRows, marketQuotes = []) {
     const flowRankScore = direct ? percentileScore(directValues, mainNetInflow) : Number(stats.rotationScore || 50);
     const flowRatioScore = direct && mainNetPct !== null ? clampRecommendationScore(50 + mainNetPct * 3) : 50;
     const changeScore = clampRecommendationScore(50 + changePct * 7);
+    const capitalTrend = assessSectorCapitalTrend(row);
     const rotationScore = direct
-      ? clampRecommendationScore(flowRankScore * .4 + flowRatioScore * .25 + breadthScore * .2 + changeScore * .15)
+      ? clampRecommendationScore(flowRankScore * .4 + flowRatioScore * .25 + breadthScore * .2 + changeScore * .15 + capitalTrend.scoreAdjustment)
       : Number(stats.rotationScore || 50);
     mergedByName.set(name, {
       ...stats,
@@ -1263,7 +1320,8 @@ function mergeSectorCapitalRows(rotation, capitalRows, marketQuotes = []) {
       capitalSource:row.source || stats.source || '全市场行业涨幅、上涨广度与成交活跃度',
       capitalFetchedAt:row.fetchedAt || '',
       rotationScore,
-      rotationState:row.capitalStale ? '资金缓存待核验' : rotationScore >= 72 ? '资金升温' : rotationScore >= 58 ? '轮动活跃' : rotationScore <= 38 ? '资金退潮' : '轮动中性'
+      capitalTrend,
+      rotationState:row.capitalStale ? '资金缓存待核验' : capitalTrend.available ? capitalTrend.phase : rotationScore >= 72 ? '资金升温' : rotationScore >= 58 ? '轮动活跃' : rotationScore <= 38 ? '资金退潮' : '轮动中性'
     });
   });
   baseRows.forEach(row => {
@@ -1309,6 +1367,7 @@ function resolveStockRotationProfiles(stock, sectors) {
 }
 
 function annotateSectorRotation(sectors, previous, tradeDate) {
+  if (previous?.recommendationCoverage?.modelVersion && previous.recommendationCoverage.modelVersion !== RECOMMENDATION_MODEL_VERSION) previous = null;
   const priorByName = new Map((previous?.sectors || []).map(row=>[row.name,row]));
   return (sectors || []).map(row=>{
     const prior = priorByName.get(row.name);
@@ -1341,17 +1400,20 @@ function selectRotationPriorityCandidates(scored, sectors, options = {}) {
     .sort((a, b) => Number(a.capitalEstimated) - Number(b.capitalEstimated)
       || Number(b.rotationScore || 0) - Number(a.rotationScore || 0)
       || Number(b.mainNetPct || 0) - Number(a.mainNetPct || 0)
-      || Number(b.mainNetInflow || 0) - Number(a.mainNetInflow || 0))
-    .slice(0, sectorLimit);
+      || Number(b.mainNetInflow || 0) - Number(a.mainNetInflow || 0));
   const selected = [];
   const codes = new Set();
+  let coveredSectors = 0;
+  const resolved = (scored || []).map(item => ({...item, rotationProfiles:item.rotationProfiles || resolveStockRotationProfiles(item, sectors)}));
   eligibleSectors.forEach(sector => {
-    const rows = (scored || []).map(item => ({ ...item, rotationProfiles:resolveStockRotationProfiles(item, sectors) }))
-      .filter(item => item.rotationProfiles.some(profile => profile.name === sector.name)
+    if (coveredSectors >= sectorLimit || selected.length >= limit) return;
+    const rows = resolved
+      .filter(item => !codes.has(item.code) && item.rotationProfiles.some(profile => profile.name === sector.name)
         && Number(item.amount || 0) >= 3e7
         && Number(item.changePct || 0) >= -1 && Number(item.changePct || 0) < 8.8
         && Number(item.price || 0) > 0 && Number(item.high || 0) > 0 && Number(item.price) / Number(item.high) >= .9)
       .sort((a, b) => Number(b.preliminaryScore || 0) - Number(a.preliminaryScore || 0) || Number(b.amount || 0) - Number(a.amount || 0));
+    if (rows.length) coveredSectors++;
     rows.slice(0, perSector).forEach(item => {
       if (codes.has(item.code) || selected.length >= limit) return;
       codes.add(item.code);
@@ -1679,7 +1741,21 @@ function formatCapitalAmount(value) {
   return Math.abs(number) >= 1e8 ? `${(Math.abs(number) / 1e8).toFixed(2)}亿` : `${(Math.abs(number) / 1e4).toFixed(0)}万`;
 }
 
+function mergeFundFlowSnapshot(history, current, tradeDate) {
+  const merged = {...history, current};
+  const windows = analyzeCapitalWindows(merged, tradeDate);
+  if (!windows.aggregateOnly) return merged;
+  const days = windows.net10 !== null ? 10 : 5;
+  return {...merged, available:true, estimated:false, aggregateOnly:true, days,
+    mainNetInflow:days === 10 ? windows.net10 : windows.net5,
+    netRatio:finiteNumber(days === 10 ? current.mainNetPct10 : current.mainNetPct5),
+    mainInflow:null, mainOutflow:null, positiveDays:null, negativeDays:null,
+    grossFlowsAvailable:false, rows:[], endDate:tradeDate,
+    source:`${current.source || '东方财富资金'}（真实多日累计）`, summary:windows.summary};
+}
+
 function fundFlowPeriodEvidence(flow) {
+  if (flow?.aggregateOnly) return flow.summary;
   if (!flow?.available) return '阶段主力资金数据不可用';
   if (flow.estimated) {
     const direction = flow.mainNetInflow >= 0 ? '偏流入' : '偏流出';
@@ -1697,6 +1773,12 @@ function analyzeCapitalWindows(flow, tradeDate = '') {
   const currentValid = tradeDate && current && !current.estimated && !current.stale
     && current.tradeDate === tradeDate && finiteNumber(current.mainNetInflow) !== null;
   const currentWeakening = Boolean(currentValid && current.mainNetInflow < 0 && finiteNumber(current.mainNetPct) !== null && current.mainNetPct <= -3);
+  if (currentValid && (finiteNumber(current.mainNet5) !== null || finiteNumber(current.mainNet10) !== null)) {
+    const trend = assessSectorCapitalTrend(current);
+    return {available:true, stale:false, endDate:tradeDate, latestNet:current.mainNetInflow, latestRatio:current.mainNetPct,
+      net3:finiteNumber(current.mainNet3), net5:finiteNumber(current.mainNet5), net10:finiteNumber(current.mainNet10),
+      weakening:currentWeakening, confirmed:trend.confirmed, summary:trend.summary, aggregateOnly:true};
+  }
   const byDate = new Map();
   for (const row of flow?.rows || []) {
     const date = dateOnly(row?.date);
@@ -1737,10 +1819,10 @@ function combineConsolidationBreakout(technical, flow) {
     flowAvailable: false
   };
   const windows = analyzeCapitalWindows(flow, technical.tradeDate);
-  const flowAvailable = Boolean(flow?.available && !flow.estimated && flow.days && !windows.stale);
+  const flowAvailable = Boolean(windows.confirmed || flow?.available && !flow.estimated && flow.days && !windows.stale);
   const persistentOutflow = windows.weakening || flowAvailable && (flow.mainNetInflow < 0
-    && flow.netRatio <= -3 && flow.positiveDays <= Math.floor(flow.days * .4));
-  const flowAdjustment = persistentOutflow ? -18 : !flowAvailable ? 0
+    && flow.netRatio <= -3 && finiteNumber(flow.positiveDays) !== null && flow.positiveDays <= Math.floor(flow.days * .4));
+  const flowAdjustment = persistentOutflow ? -18 : windows.confirmed ? 10 : !flowAvailable ? 0
     : windows.available && !windows.confirmed ? 0
       : flow.mainNetInflow > 0 && flow.positiveDays >= Math.ceil(flow.days * .6) ? 10
       : flow.mainNetInflow > 0 ? 5 : persistentOutflow ? -18 : -8;
@@ -1761,16 +1843,16 @@ function applyIndividualCapitalAssessment(analysis, flow) {
   const capitalWindows = analyzeCapitalWindows(flow, analysis.tradeDate);
   const available = Boolean(flow?.available && flow.days && !capitalWindows.stale);
   const directFlow = available && !flow.estimated;
-  const strongFlow = directFlow && flow.mainNetInflow > 0
-    && (!capitalWindows.available || capitalWindows.confirmed) && flow.positiveDays >= Math.ceil(flow.days * .6);
+  const strongFlow = capitalWindows.confirmed || directFlow && flow.mainNetInflow > 0
+    && !capitalWindows.available && flow.positiveDays >= Math.ceil(flow.days * .6);
   const persistentOutflow = capitalWindows.weakening || available && (flow.mainNetInflow < 0
-    && flow.netRatio <= (flow.estimated ? -6 : -3) && flow.positiveDays <= Math.floor(flow.days * .4));
+    && flow.netRatio <= (flow.estimated ? -6 : -3) && finiteNumber(flow.positiveDays) !== null && flow.positiveDays <= Math.floor(flow.days * .4));
   const rawAdjustment = !available ? 0
     : persistentOutflow ? -8 : capitalWindows.available && !capitalWindows.confirmed ? 0
       : flow.mainNetInflow > 0 && flow.positiveDays >= Math.ceil(flow.days * .6) ? 6
       : flow.mainNetInflow > 0 ? 3 : persistentOutflow ? -8 : -4;
-  const adjustment = capitalWindows.weakening ? -8 : flow?.estimated ? Math.min(0, Math.round(rawAdjustment * .5)) : rawAdjustment;
-  const status = capitalWindows.weakening ? '资金偏弱' : !available ? '资金数据不足'
+  const adjustment = capitalWindows.weakening ? -8 : capitalWindows.confirmed ? 6 : flow?.estimated ? Math.min(0, Math.round(rawAdjustment * .5)) : rawAdjustment;
+  const status = capitalWindows.weakening ? '资金偏弱' : capitalWindows.confirmed ? '真实多窗口资金同向' : !available ? '资金数据不足'
     : flow.estimated ? flow.mainNetInflow > 0 ? '量价资金改善' : persistentOutflow ? '量价资金偏弱' : '量价资金待确认'
     : capitalWindows.weakening ? '资金偏弱' : setup.passed && adjustment >= 6 ? '蓄势增强'
       : setup.passed && flow.mainNetInflow <= 0 ? '资金未确认'
@@ -1798,7 +1880,8 @@ function applyIndividualCapitalAssessment(analysis, flow) {
   } else if (entryAssessment?.lowBuyCandidate && strongFlow
     && ['bottom-accumulation', 'sideways-washout'].includes(entryAssessment.setupType)) {
     const setupLabel = entryAssessment.setupType === 'bottom-accumulation' ? '底部吸筹' : '震荡洗盘';
-    const capitalEvidence = `近${flow.days}日阶段主力净流入${formatCapitalAmount(flow.mainNetInflow)}，净流入${flow.positiveDays}日`;
+    const capitalEvidence = flow.aggregateOnly ? fundFlowPeriodEvidence(flow)
+      : `近${flow.days}日阶段主力净流入${formatCapitalAmount(flow.mainNetInflow)}，净流入${flow.positiveDays}日`;
     entryAssessment = {
       ...entryAssessment,
       allowed: true,
@@ -1900,8 +1983,11 @@ function applyEntryContextAssessment(analysis, { newsContext = null, riskProfile
   if (hasOverseas) evidence.push(overseas.summary);
   const overseasSummary = hasOverseas ? `，${overseas.summary}` : '';
   const usGrowthRisk = hasOverseas && overseas.severity === 'high' && isUSGrowthSensitive(subject);
-  const relatedSector = subject?.rotationProfiles?.[0]
-    || resolveStockRotationProfiles(subject, marketOverview?.sectors)[0];
+  const profiles = subject?.rotationProfiles || resolveStockRotationProfiles(subject, marketOverview?.sectors);
+  const industry = normalizeSectorCapitalName(resolveRecommendationIndustry(subject));
+  const weakIndustry = profiles.find(row => row.boardType === 'industry' && row.name === industry
+    && !row.capitalStale && !row.capitalEstimated && row.mainNetInflow < 0 && row.mainNetPct <= -3);
+  const relatedSector = weakIndustry || profiles[0];
   const directSectorCapital = relatedSector && !relatedSector.capitalEstimated && !relatedSector.capitalStale && finiteNumber(relatedSector.mainNetInflow) !== null;
   const sectorRotationSummary = relatedSector
     ? `${relatedSector.name}${relatedSector.rotationState || '轮动中性'}，板块涨跌${signedPercent(relatedSector.changePct)}${Number.isFinite(Number(relatedSector.upRatio)) ? `，上涨占比${(Number(relatedSector.upRatio) * 100).toFixed(0)}%` : ''}${directSectorCapital ? `，主力净${Number(relatedSector.mainNetInflow) >= 0 ? '流入' : '流出'}${formatCapitalAmount(Math.abs(Number(relatedSector.mainNetInflow)))}，占比${signedPercent(relatedSector.mainNetPct)}${relatedSector.capitalRank ? `，资金排名${relatedSector.capitalRank}` : ''}` : '，资金为量价活跃度估算'}`
@@ -1909,6 +1995,7 @@ function applyEntryContextAssessment(analysis, { newsContext = null, riskProfile
   if (sectorRotationSummary) evidence.push(sectorRotationSummary);
   if (relatedSector?.capitalStale) evidence.push('板块资金为过期缓存，不参与当前资金确认');
   if (relatedSector?.rotationTransition?.summary) evidence.push(relatedSector.rotationTransition.summary);
+  if (relatedSector?.capitalTrend?.available) evidence.push(relatedSector.capitalTrend.summary);
   const sectorWeak = relatedSector && !relatedSector.capitalStale && (directSectorCapital
     ? Number(relatedSector.mainNetInflow) < 0 && Number(relatedSector.mainNetPct || 0) < 0
     : Number(relatedSector.rotationScore) <= 38 && Number(relatedSector.changePct) <= -2 && Number(relatedSector.upRatio) <= .3);
@@ -1916,7 +2003,7 @@ function applyEntryContextAssessment(analysis, { newsContext = null, riskProfile
   let entryAssessment = {
     ...entry,
     evidence: [...new Set(evidence)],
-    summary: `${entry.summary} 消息面${hasNews ? `${newsSignal}（${newsContext?.freshness || '时效未知'}）` : '暂无可核验资讯'}，大盘环境${marketLabel}${sectorRotationSummary ? `，${sectorRotationSummary}` : ''}${overseasSummary}。`
+    summary: `${entry.summary} 消息面${hasNews ? `${newsSignal}（${newsContext?.freshness || '时效未知'}）` : '暂无可核验资讯'}，大盘环境${marketLabel}${sectorRotationSummary ? `，${sectorRotationSummary}` : ''}${overseasSummary}。${relatedSector?.capitalTrend?.available ? relatedSector.capitalTrend.summary : ''}`
   };
   if (riskProfile?.status === 'risk') {
     entryAssessment = { ...entryAssessment, allowed: false, status: '公司风险', tone: 'negative', summary: `${entryAssessment.summary} 未来半年存在已核验公司风险，当前不建议入场。` };
@@ -1926,7 +2013,7 @@ function applyEntryContextAssessment(analysis, { newsContext = null, riskProfile
     entryAssessment = { ...entryAssessment, allowed: false, status: '大盘消息风险待确认', tone: 'warning', summary: `${entryAssessment.summary} 大盘近期风险消息偏多，等待市场宽度和资金重新确认。` };
   } else if (marketWeak && entryAssessment.allowed) {
     entryAssessment = { ...entryAssessment, allowed: false, status: '大盘偏弱，等待确认', tone: 'warning', summary: `${entryAssessment.summary} 市场下跌家数或指数跌幅偏大，暂缓入场。` };
-  } else if (sectorWeak && entryAssessment.allowed) {
+  } else if (sectorWeak && !['破位', '爆量观察', '结构偏弱', '公司风险'].includes(entryAssessment.status)) {
     entryAssessment = { ...entryAssessment, allowed: false, status: '板块退潮，等待确认', tone: 'warning', summary: `${entryAssessment.summary} 所属板块资金与上涨广度同步退潮，等待板块止跌并恢复轮动。` };
   } else if (usGrowthRisk && entryAssessment.allowed) {
     entryAssessment = { ...entryAssessment, allowed: false, status: '美股科技风险待确认', tone: 'warning', summary: `${entryAssessment.summary} 海外科技风险偏高，等待A股价格、量能和阶段资金重新确认。` };
@@ -1985,7 +2072,8 @@ function evaluateRecommendationFactors(item, context, newsContext, financialAnal
 
   const flow = item.fundFlowPeriod;
   const directFlowScore = flow?.available
-    ? clampRecommendationScore(50 + Number(flow.netRatio || 0) * 5 + (flow.positiveDays / flow.days - .5) * 45) : 0;
+    ? clampRecommendationScore(50 + Number(flow.netRatio || 0) * 5
+      + (finiteNumber(flow.positiveDays) !== null && flow.days > 0 ? (flow.positiveDays / flow.days - .5) * 45 : 0)) : 0;
   const flowScore = flow?.estimated ? clampRecommendationScore(50 + (directFlowScore - 50) * .5) : directFlowScore;
   add('capitalAccumulation', '阶段主力资金', flowScore, fundFlowPeriodEvidence(flow), Boolean(flow?.available));
 
@@ -2066,7 +2154,7 @@ function assessRecommendationNewsConfirmation(item, newsContext = {}) {
   const capitalWindows = analyzeCapitalWindows(flow, item?.analysis?.tradeDate);
   const capitalConfirmed = Boolean(flow?.available && !flow.estimated && !capitalWindows.stale
     && (!capitalWindows.available || capitalWindows.confirmed) && flow.days > 0 && flow.mainNetInflow > 0
-    && Number(flow.netRatio) > 0 && flow.positiveDays >= Math.ceil(flow.days * .6));
+    && Number(flow.netRatio) > 0 && (capitalWindows.aggregateOnly ? capitalWindows.confirmed : flow.positiveDays >= Math.ceil(flow.days * .6)));
   const confirmed = technicalConfirmed && capitalConfirmed;
   return {
     label: confirmed ? '消息确认' : '消息中性',
@@ -2439,7 +2527,7 @@ function recommendationPassesWatchGate(item, postRisk = false) {
   if (isExplosiveVolume(item?.analysis?.volumeRatio)) return false;
   if (item?.newsLabel === '消息谨慎') return false;
   if (['破位', '爆量观察', '结构偏弱', '不宜追高', '公司风险', '消息风险待确认', '大盘消息风险待确认', '美股科技风险待确认', '板块退潮，等待确认'].includes(item?.entryAssessment?.status)) return false;
-  if (item?.fundFlowPeriod?.available && item.fundFlowPeriod.netRatio <= (item.fundFlowPeriod.estimated ? -6 : -3) && item.fundFlowPeriod.positiveDays <= 4) return false;
+  if (item?.fundFlowPeriod?.available && item.fundFlowPeriod.netRatio <= (item.fundFlowPeriod.estimated ? -6 : -3) && finiteNumber(item.fundFlowPeriod.positiveDays) !== null && item.fundFlowPeriod.positiveDays <= 4) return false;
   if (item?.financialAnalysis?.hardRisks?.length >= 2 && item.financialAnalysis.score < 45) return false;
   if (item?.canslim?.available >= 5 && item.canslim.score < 50) return false;
   return true;
@@ -2968,8 +3056,8 @@ function finalizeMomentumRecommendations(items, limit = 8, perSector = 2) {
   const sectorCounts = new Map();
   const selected = [];
   const candidates = (items || []).filter(item => item.momentumDecision?.passed)
-    .sort((a, b) => Number(b.momentumDecision?.score || 0) - Number(a.momentumDecision?.score || 0)
-      || Number(b.signalScore || 0) - Number(a.signalScore || 0));
+    .sort((a, b) => Number(b.signalScore || 0) - Number(a.signalScore || 0)
+      || Number(b.momentumDecision?.score || 0) - Number(a.momentumDecision?.score || 0));
   for (const item of candidates) {
     const sector = item.momentumDecision.profile?.name || '板块待确认';
     if ((sectorCounts.get(sector) || 0) >= perSector) continue;
@@ -2978,8 +3066,8 @@ function finalizeMomentumRecommendations(items, limit = 8, perSector = 2) {
       ...item,
       signal:'强势追踪',
       recommendationTier:'强势追踪',
-      signalScore:Math.max(Number(item.signalScore || 0), Number(item.momentumDecision.score || 0)),
-      score:Math.max(Number(item.score || 0), Number(item.momentumDecision.score || 0)),
+      signalScore:Number(item.signalScore || 0),
+      score:Number(item.signalScore || 0),
       entryAssessment:item.momentumDecision.entryAssessment,
       reason:`强势追踪：${item.momentumDecision.entryAssessment.summary}${item.reason ? ` 原稳健分析：${item.reason}` : ''}`
     });
@@ -3114,6 +3202,7 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
   const currentFundResults = await currentFundsPromise;
   const currentFunds = new Map(currentFundResults.filter(result => result.status === 'fulfilled').flatMap(result => result.value)
     .map(row => [row.f12, { mainNetInflow:finiteNumber(row.f62), mainNetPct:finiteNumber(row.f184),
+      ...capitalWindowFields(row),
       tradeDate:row.f124 > 0 ? new Date(row.f124 * 1000).toISOString().slice(0, 10) : '',
       source:'东方财富批量主力资金', fetchedAt:new Date().toISOString(), estimated:false }]));
   onProgress({ stage:'factors', message:`正在核验 ${ranked.length} 只候选的资金、消息与财务` });
@@ -3127,7 +3216,7 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
       ...item.estimatedFundFlow,
       fallbackReason: fundFlowResult.reason?.message || String(fundFlowResult.reason || '阶段资金接口不可用')
     };
-    const fundFlowPeriod = { ...historicalFlow, current:currentFunds.get(item.code) || null };
+    const fundFlowPeriod = mergeFundFlowSnapshot(historicalFlow, currentFunds.get(item.code) || null, item.analysis.tradeDate);
     const capitalAnalysis = applyIndividualCapitalAssessment(item.analysis, fundFlowPeriod);
     const breakoutPotential = capitalAnalysis.breakoutPotential;
     const momentumSignal = item.signal === '强势追踪';
@@ -3259,7 +3348,7 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
     && !(item.newsLabel === '消息谨慎' && item.signalScore < 65)
     && !(item.rotationProfiles?.[0]?.capitalEstimated === false && !item.rotationProfiles[0].capitalStale && Number(item.rotationProfiles[0].mainNetInflow) < 0 && Number(item.rotationProfiles[0].mainNetPct || 0) < 0)
     && !analyzeCapitalWindows(item.fundFlowPeriod, item.analysis?.tradeDate).weakening
-    && !(item.fundFlowPeriod?.available && item.fundFlowPeriod.netRatio <= (item.fundFlowPeriod.estimated ? -6 : -3) && item.fundFlowPeriod.positiveDays <= 4)
+    && !(item.fundFlowPeriod?.available && item.fundFlowPeriod.netRatio <= (item.fundFlowPeriod.estimated ? -6 : -3) && finiteNumber(item.fundFlowPeriod.positiveDays) !== null && item.fundFlowPeriod.positiveDays <= 4)
     && !(item.financialAnalysis?.hardRisks?.length >= 2 && item.financialAnalysis?.score < 45)
     && !(item.canslim?.available >= 5 && item.canslim.score < 50));
   const strictQualityRecommendations = commonQualityRecommendations.filter(recommendationPassesOutcomeGate);
@@ -3272,7 +3361,7 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
     && !analyzeCapitalWindows(item.fundFlowPeriod, item.analysis?.tradeDate).weakening
     && item.qualityScore >= 55
     && item.newsLabel !== '消息谨慎'
-    && !['破位', '爆量观察', '结构偏弱', '公司风险'].includes(item.entryAssessment?.status));
+    && !['破位', '爆量观察', '结构偏弱', '公司风险', '板块退潮，等待确认', '美股科技风险待确认', '大盘消息风险待确认', '消息风险待确认'].includes(item.entryAssessment?.status));
   const qualityRecommendations = [...new Map([...stableQualityRecommendations, ...momentumQualityRecommendations]
     .map(item => [item.code, item])).values()];
   onProgress({ stage:'risk', message:`正在核验 ${qualityRecommendations.length} 只候选的公司风险` });
@@ -3357,6 +3446,7 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
       consolidationCandidates: analyzed.filter(item => item.analysis.consolidationBreakout?.isConsolidating).length,
       fundFlowAvailable: recommendations.filter(item => item.fundFlowPeriod?.available).length,
       fundFlowDirect: recommendations.filter(item => item.fundFlowPeriod?.available && !item.fundFlowPeriod.estimated).length,
+      fundFlowAggregate: recommendations.filter(item => item.fundFlowPeriod?.aggregateOnly).length,
       currentFundFlowDirect: recommendations.filter(item => finiteNumber(item.fundFlowPeriod?.current?.mainNetInflow) !== null).length,
       currentFundFlowErrors:currentFundResults.filter(result => result.status === 'rejected').map(result => result.reason?.message || String(result.reason)),
       fundFlowEstimated: recommendations.filter(item => item.fundFlowPeriod?.estimated).length,
@@ -3376,6 +3466,8 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
       riskScoreRejected,
       directSectorCapital:marketAssessmentContext.sectors.filter(item => !item.capitalEstimated && !item.capitalStale && finiteNumber(item.mainNetInflow) !== null).length,
       rotationCandidates:rotationScreened.length,
+      rotationBoards:marketAssessmentContext.sectors.filter(item=>item.memberCodes?.length).map(item=>({code:item.code,name:item.name,count:item.memberCodes.length,phase:item.capitalTrend?.phase,tradeDate:item.capitalTradeDate})),
+      sectorCapitalWindows:marketAssessmentContext.sectors.filter(item=>item.capitalTrend?.available).length,
       fullMarketCandidates:fullMarketScreened.length,
       fullMarketHistoryCovered:fullMarketScreened.length ? Number(fullMarketScreening.historyCovered) || 0 : 0,
       momentumCandidates:momentumScreened.length,
@@ -3512,7 +3604,7 @@ async function fetchMarketOverview(force = false, favoriteOutcomes = [], onProgr
       result.momentumRecommendations = recommendationsResult.value.momentumRecommendations;
       result.recommendationCoverage = recommendationsResult.value.coverage;
       if (result.recommendationCoverage.fundFlowErrors?.length) {
-        result.warnings.push(`部分候选多日主力资金未取得，阶段量价估算不作为资金确认；已取得 ${result.recommendationCoverage.currentFundFlowDirect || 0} 只候选当日真实资金`);
+        result.warnings.push(`部分候选每日资金明细未取得；真实多日汇总 ${result.recommendationCoverage.fundFlowAggregate || 0} 只，量价代理 ${result.recommendationCoverage.fundFlowEstimated || 0} 只，不推算每日流入天数`);
       }
       result.recommendationsFetchedAt = new Date().toISOString();
     } else if (reuseRecommendations) {
@@ -5579,12 +5671,12 @@ async function fetchStockHistory({ code, name, industry = '', sector = '', force
   feedbackSignature = outcomeProfile.signature;
   if (!history.length && errors.length) throw new Error(errors.join('；'));
   let analysis = analyzeHistory(history);
-  const fundFlowPeriod = fundFlowResult.status === 'fulfilled'
+  const historicalFlow = fundFlowResult.status === 'fulfilled'
     ? { ...fundFlowResult.value }
     : { ...estimateFundFlowFromHistory(history, 10), fallbackReason:fundFlowResult.reason?.message || String(fundFlowResult.reason || '') };
-  fundFlowPeriod.current = currentFundResult.status === 'fulfilled' ? currentFundResult.value : null;
+  const fundFlowPeriod = mergeFundFlowSnapshot(historicalFlow, currentFundResult.status === 'fulfilled' ? currentFundResult.value : null, analysis.tradeDate);
   if (currentFundResult.status === 'rejected') errors.push(`当日资金失败：${currentFundResult.reason?.message || currentFundResult.reason}`);
-  if (fundFlowResult.status === 'rejected') errors.push(`阶段主力资金接口失败，已使用日线量价资金代理：${fundFlowResult.reason?.message || fundFlowResult.reason}`);
+  if (fundFlowResult.status === 'rejected') errors.push(`每日资金明细失败，${fundFlowPeriod.aggregateOnly ? '已取得真实3/5/10日汇总，未提供每日流入天数' : '已使用日线量价资金代理'}：${fundFlowResult.reason?.message || fundFlowResult.reason}`);
   analysis = applyIndividualCapitalAssessment(analysis, fundFlowPeriod);
   let newsContext = summarizeNews([]);
   try {
@@ -5611,7 +5703,7 @@ async function fetchStockHistory({ code, name, industry = '', sector = '', force
       ? overseasResult.value : marketOverviewCache?.value?.overseas || assessGlobalMarketContext([])
   };
   if (sectorCapitalResult.status === 'fulfilled') {
-    analysisMarketOverview.sectors = mergeSectorCapitalRows({sectors:analysisMarketOverview.sectors || []},sectorCapitalResult.value.rows).sectors;
+    analysisMarketOverview.sectors = mergeSectorCapitalRows({sectors:analysisMarketOverview.sectors || []},sectorCapitalResult.value.rows,[],analysis.tradeDate).sectors;
     errors.push(...(sectorCapitalResult.value.warnings || []).map(message=>`板块资金来源提示：${message}`));
   } else {
     analysisMarketOverview.sectors = (analysisMarketOverview.sectors || []).map(row=>({...row,capitalStale:true}));
@@ -6172,6 +6264,8 @@ app.on('window-all-closed', () => {
 });
 
 module.exports = {
+  selectSectorMemberBoards,
+  mergeFundFlowSnapshot,
   normalizeSinaHistoryRows,
   fetchMarketOverviewInWorker,
   eastmoneyListRows,

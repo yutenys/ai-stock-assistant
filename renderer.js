@@ -252,7 +252,7 @@ function renderMarketOverview(result){
   $('marketDown').textContent = result.breadth?.down ?? '--';
   $('marketFlat').textContent = result.breadth?.flat ?? '--';
   $('marketTurnover').textContent = money(result.turnover);
-  const rotationDetail = item => [item.rotationState, item.rotationTransition?.state, item.capitalStale ? '资金缓存待核验' : '', item.upRatio != null && Number.isFinite(Number(item.upRatio)) ? `上涨${(Number(item.upRatio) * 100).toFixed(0)}%` : '', item.capitalEstimated === false && !item.capitalStale && item.mainNetPct != null && Number.isFinite(Number(item.mainNetPct)) ? `净占比${Number(item.mainNetPct) >= 0 ? '+' : ''}${Number(item.mainNetPct).toFixed(2)}%` : '', item.capitalRank && !item.capitalStale ? `资金第${item.capitalRank}` : '', item.leader ? `领涨 ${item.leader}` : ''].filter(Boolean).join(' · ');
+  const rotationDetail = item => [item.rotationState, item.rotationTransition?.available || !item.capitalTrend?.available ? item.rotationTransition?.state : '', item.capitalStale ? '资金缓存待核验' : '', item.upRatio != null && Number.isFinite(Number(item.upRatio)) ? `上涨${(Number(item.upRatio) * 100).toFixed(0)}%` : '', item.capitalEstimated === false && !item.capitalStale && item.mainNetPct != null && Number.isFinite(Number(item.mainNetPct)) ? `净占比${Number(item.mainNetPct) >= 0 ? '+' : ''}${Number(item.mainNetPct).toFixed(2)}%` : '', item.capitalTrend?.available ? `5日净额${money(item.mainNet5)} / 10日净额${money(item.mainNet10)}` : '', item.capitalTradeDate ? `资金截至${item.capitalTradeDate}` : '', item.capitalRank && !item.capitalStale ? `资金第${item.capitalRank}` : '', item.leader ? `领涨 ${item.leader}` : ''].filter(Boolean).join(' · ');
   const strong = (result.sectors || []).slice(0, 4).map(item => marketRow(item, formatPct(item.changePct), rotationDetail(item))).join('');
   const weak = (result.weakSectors || []).slice(0, 2).map(item => marketRow(item, formatPct(item.changePct), rotationDetail(item) || '回落')).join('');
   $('marketSectors').innerHTML = strong + weak || '<div class="market-row"><span>板块轮动暂不可用</span></div>';
@@ -293,7 +293,7 @@ function renderMarketOverview(result){
   if(Number.isFinite(Number(coverage.consolidationCandidates))) structureCounts.push(`横盘候选 ${coverage.consolidationCandidates} 只`);
   if(Number.isFinite(Number(coverage.fundFlowAvailable))) {
     const capitalDetail = Number.isFinite(Number(coverage.fundFlowDirect))
-      ? `（接口 ${coverage.fundFlowDirect || 0}，量价代理 ${coverage.fundFlowEstimated || 0}）` : '';
+      ? `（逐日明细 ${Math.max(0,(coverage.fundFlowDirect || 0)-(coverage.fundFlowAggregate || 0))}，真实多日汇总 ${coverage.fundFlowAggregate || 0}，量价代理 ${coverage.fundFlowEstimated || 0}）` : '';
     structureCounts.push(`阶段资金可用 ${coverage.fundFlowAvailable} 只${capitalDetail}`);
   }
   const accumulationCoverage = structureCounts.length ? `；${structureCounts.join('，')}` : '';

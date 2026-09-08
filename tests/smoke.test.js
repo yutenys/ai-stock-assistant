@@ -97,6 +97,7 @@ const {
   classifyMarketNewsIssues,
   settleWithConcurrency
 } = require('../main.js');
+const {selectSectorMemberBoards, mergeFundFlowSnapshot} = require('../main.js');
 Module._load = originalLoad;
 
 test('新浪股数转换为手后与实时报价合并，量比和资金估算不差100倍', () => {
@@ -127,6 +128,102 @@ test('同批次相对跑赢但绝对亏损或低胜率不能获得历史加分',
   assert.equal(outcomeStatsAdjustment(stats,8),0);
   assert.equal(outcomeStatsAdjustment({...stats,averageReturn:2,winRate:35},8),0);
   assert.ok(outcomeStatsAdjustment({...stats,averageReturn:2,winRate:60},8)>0);
+});
+
+test('板块真实多日资金区分持续流入、当日转入与资金退潮', () => {
+  const row = {f12:'BK0448',f14:'通信设备',f3:2,f62:1e8,f184:4,f164:6e8,f165:3,f174:9e8,f175:2,f124:Date.parse('2026-09-08T02:00:00Z')/1000};
+  const normalized = normalizeSectorCapitalRows([row], 'industry', 'https://push2.eastmoney.com')[0];
+  assert.equal(normalized.mainNet5,6e8);
+  assert.equal(normalized.mainNet10,9e8);
+  assert.equal(normalized.capitalTradeDate,'2026-09-08');
+  const build = extra => mergeSectorCapitalRows({sectors:[]},[{...normalized,...extra}],[]).sectors[0];
+  assert.equal(build({}).capitalTrend.phase,'持续流入');
+  assert.equal(build({mainNet5:-3e8,mainNet10:-8e8}).capitalTrend.phase,'当日转入待确认');
+  assert.equal(build({mainNetInflow:-1e8,mainNetPct:-4}).capitalTrend.weakening,true);
+  assert.ok(build({}).rotationScore > build({mainNet5:-3e8,mainNet10:-8e8}).rotationScore);
+  assert.equal(build({capitalStale:true}).capitalTrend.confirmed,false);
+  assert.equal(build({mainNet5:null,mainNet10:null}).capitalTrend.available,false);
+  assert.equal(mergeSectorCapitalRows({sectors:[]},[normalized],[{code:'600001',tradeDate:'2026-09-09'}]).sectors[0].capitalStale,true);
+});
+
+test('真实个股5日10日净额不能与量价代理混淆或把累计窗口相加', () => {
+  const current={tradeDate:'2026-09-08',mainNetInflow:1e8,mainNetPct:5,mainNet5:4e8,mainNet10:6e8};
+  const flow={available:true,estimated:true,days:10,mainNetInflow:9e9,positiveDays:10,rows:[],current};
+  const windows=analyzeCapitalWindows(flow,'2026-09-08');
+  assert.equal(windows.confirmed,true);
+  assert.equal(windows.net5,4e8);
+  assert.equal(windows.net10,6e8);
+  assert.equal(windows.net3,null);
+  assert.match(windows.summary,/真实.*5日.*10日/);
+  assert.equal(analyzeCapitalWindows({...flow,current:{...current,mainNet5:-1e8}},'2026-09-08').confirmed,false);
+  assert.equal(analyzeCapitalWindows(flow,'2026-09-09').confirmed,false);
+});
+
+test('轮动预留队列跳过无成员板块和重复股票后继续寻找有效板块', () => {
+  const sectors=[
+    {name:'无匹配行业',rotationScore:99,mainNetInflow:1e9,mainNetPct:5,capitalEstimated:false},
+    {name:'行业甲',rotationScore:95,mainNetInflow:1e9,mainNetPct:5,capitalEstimated:false,memberCodes:['600001','600002']},
+    {name:'概念甲',rotationScore:94,mainNetInflow:1e9,mainNetPct:5,capitalEstimated:false,memberCodes:['600001','600003']},
+    {name:'行业乙',rotationScore:90,mainNetInflow:1e9,mainNetPct:5,capitalEstimated:false,memberCodes:['600004']}
+  ];
+  const scored=['600001','600002','600003','600004'].map((code,i)=>({code,price:10,high:10,changePct:1,amount:1e8,preliminaryScore:99-i}));
+  const selected=selectRotationPriorityCandidates(scored,sectors,{limit:3,perSector:1,sectorLimit:3});
+  assert.deepEqual(selected.map(row=>row.code),['600001','600003','600004']);
+});
+
+test('强势追踪最终排序保留历史消息和美股风险扣分', () => {
+  const row=(code,signalScore,raw)=>({code,signalScore,score:signalScore,momentumDecision:{passed:true,score:raw,profile:{name:code},entryAssessment:{allowed:false,status:'等待回踩',summary:'跟踪'}}});
+  const result=finalizeMomentumRecommendations([row('600001',61,95),row('600002',78,80)]);
+  assert.equal(result[0].code,'600002');
+  assert.equal(result[1].signalScore,61);
+  assert.equal(result[1].score,61);
+});
+
+test('板块成分覆盖同时预留行业和概念，重复名称不占据名额', () => {
+  const rows=Array.from({length:12},(_,i)=>({code:`BK${1000+i}`,name:`行业${i}`,boardType:'industry',mainNetInflow:1e9,mainNetPct:8,changePct:2}));
+  rows.push({...rows[0],code:'BK2000'});
+  rows.push({code:'BK3000',name:'概念甲',boardType:'concept',mainNetInflow:1e8,mainNetPct:2,changePct:1});
+  const chosen=selectSectorMemberBoards(rows,6);
+  assert.equal(chosen.length,6);
+  assert.ok(chosen.some(row=>row.boardType==='concept'));
+  assert.equal(new Set(chosen.map(row=>row.name)).size,6);
+});
+
+test('融资融券和财报筛选集合不冒充产业资金轮动', () => {
+  const make=(code,name,net)=>({code,name,boardType:'concept',changePct:2,mainNetInflow:net,mainNetPct:5,mainNet5:net*3,mainNet10:net*5,memberCodes:['600001']});
+  const rows=[make('BK0001','融资融券',9e10),make('BK0002','2026中报预增',8e10),make('BK0003','猪肉概念',2e9)];
+  assert.deepEqual(selectSectorMemberBoards(rows,3).map(row=>row.name),['猪肉概念']);
+  const merged=mergeSectorCapitalRows({sectors:[]},rows);
+  assert.deepEqual(merged.fundSectors.map(row=>row.name),['猪肉概念']);
+});
+
+test('真实多日汇总覆盖资金代理但不编造每日流入天数和买卖分项', () => {
+  const current={tradeDate:'2026-09-08',mainNetInflow:1e8,mainNetPct:4,mainNet5:5e8,mainNet10:8e8,mainNetPct10:3,source:'东方财富批量资金'};
+  const proxy={available:true,estimated:true,days:10,mainNetInflow:-9e9,positiveDays:0,netRatio:-10,rows:[{date:'2026-09-08'}]};
+  const flow=mergeFundFlowSnapshot(proxy,current,'2026-09-08');
+  assert.equal(flow.estimated,false);
+  assert.equal(flow.mainNetInflow,8e8);
+  assert.equal(flow.positiveDays,null);
+  assert.equal(flow.mainInflow,null);
+  assert.equal(flow.mainOutflow,null);
+  assert.match(fundFlowPeriodEvidence(flow),/5日.*10日/);
+  const analysis={tradeDate:'2026-09-08',score:85,entryAssessment:{lowBuyCandidate:true,allowed:false,setupType:'sideways-washout',summary:'结构稳定'}};
+  const assessed=applyIndividualCapitalAssessment(analysis,flow);
+  assert.doesNotMatch(assessed.entryAssessment.summary,/null日/);
+  assert.equal(assessRecommendationNewsConfirmation({analysis,fundFlowPeriod:flow},{signal:'偏积极'}).confirmed,true);
+  assert.equal(mergeFundFlowSnapshot(proxy,current,'2026-09-09').estimated,true);
+});
+
+test('热门概念不能掩盖实际所属行业的显著资金流出', () => {
+  const analysis={score:85,verdict:'可关注',entryAssessment:{allowed:true,summary:'技术条件成立'}};
+  const result=applyEntryContextAssessment(analysis,{subject:{industry:'通信设备',rotationProfiles:[
+    {name:'热门概念',boardType:'concept',mainNetInflow:1e9,mainNetPct:5,capitalEstimated:false},
+    {name:'通信设备',boardType:'industry',mainNetInflow:-1e9,mainNetPct:-5,capitalEstimated:false}
+  ]}});
+  assert.equal(result.entryAssessment.allowed,false);
+  assert.match(result.entryAssessment.summary,/通信设备/);
+  const waiting=applyEntryContextAssessment({...analysis,entryAssessment:{...analysis.entryAssessment,allowed:false}}, {subject:{industry:'通信设备',rotationProfiles:[{name:'通信设备',boardType:'industry',mainNetInflow:-1e9,mainNetPct:-5,capitalEstimated:false}]}});
+  assert.equal(waiting.entryAssessment.status,'板块退潮，等待确认');
 });
 
 test('长周期统计保留时间顺序，不将后来的低点算作先前涨幅',()=>{
