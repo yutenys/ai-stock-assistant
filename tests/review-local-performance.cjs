@@ -15,14 +15,19 @@ async function main() {
   const favoriteOutcomes = (state.labels || []).flatMap(label => (label.stocks || []).map(stock => ({
     code:stock.code, label:label.name, favoriteBasePrice:stock.favoriteBasePrice,
     favoriteAddedAt:stock.favoriteAddedAt, price:stock.price,
-    signal:stock.favoriteEntrySnapshot?.signal || stock.marketSignal || stock.signal || stock.type || stock.status,
+    signal:stock.favoriteEntrySnapshot?.signal || '',
     signalScore:stock.favoriteEntrySnapshot?.signalScore ?? null,
-    technicalScore:stock.favoriteEntrySnapshot?.technicalScore ?? null
+    technicalScore:stock.favoriteEntrySnapshot?.technicalScore ?? null,
+    holdingPeriod:stock.favoriteEntrySnapshot?.holdingPeriod || stock.holdingPeriod || '',
+    benchmarkIndices:stock.favoriteEntrySnapshot?.benchmarkIndices || [],
+    industryBenchmark:stock.favoriteEntrySnapshot?.industryBenchmark || null,
+    recommendationModelVersion:stock.favoriteEntrySnapshot?.modelVersion || '',
+    recommendationContext:stock.favoriteEntrySnapshot?.context || null
   })));
   const pricedOutcomes = api.mergeRecommendationOutcomeQuotes(favoriteOutcomes, snapshot.quotes);
-  const profile = api.summarizeRecommendationOutcomes(pricedOutcomes, {now:quoteFetchedAt});
+  const profile = api.summarizeRecommendationOutcomes(pricedOutcomes, {now:quoteFetchedAt,requireFreshQuote:true});
   const cohorts = (state.labels || []).filter(label => !excluded(label.name)).map(label => {
-    const stats = api.summarizeRecommendationOutcomes(pricedOutcomes.filter(row => row.label === label.name), {now:quoteFetchedAt});
+    const stats = api.summarizeRecommendationOutcomes(pricedOutcomes.filter(row => row.label === label.name), {now:quoteFetchedAt,requireFreshQuote:true});
     return { label:label.name, ...stats.overall, immatureCount:stats.immatureCount, invalidCount:stats.invalidCount };
   });
   // Old positions cannot safely be attributed using their current label membership.
@@ -44,12 +49,17 @@ async function main() {
   });
   eventLoop.disable();
   const report = { fetchedAt:new Date().toISOString(), quoteFetchedAt, quoteTradeDate:snapshot.quotes[0]?.tradeDate,
+    marketFetchedAt:market.fetchedAt, breadth:market.breadth, marketNews:market.newsContext, overseas:market.overseas,
     profile, cohorts, positions, simulatedTradeCount:state.simulatedTrades?.length || 0,
     totalFloatingPnl:positions.reduce((sum, row) => sum + (row.floatingPnl || 0), 0),
     progress, eventLoopMaxMs:eventLoop.max / 1e6, elapsedMs:Date.now() - startedAt,
     coverage:market.recommendationCoverage, errors:market.errors, warnings:market.warnings,
-    recommendations:market.recommendations.map(row => ({code:row.code,name:row.name,signal:row.signal,score:row.signalScore,entry:row.entryAssessment?.status})),
-    momentum:market.momentumRecommendations.map(row => ({code:row.code,name:row.name,score:row.signalScore})) };
+    recommendations:market.recommendations.map(row => ({code:row.code,name:row.name,industry:row.industry,signal:row.signal,score:row.signalScore,
+      tier:row.recommendationTier,entry:row.entryAssessment?.status,contextRisks:row.entryAssessment?.contextRisks,
+      rotationThemes:(row.rotationProfiles || []).map(profile=>profile.name)})),
+    momentum:market.momentumRecommendations.map(row => ({code:row.code,name:row.name,industry:row.industry,score:row.signalScore,
+      entry:row.entryAssessment?.status,contextRisks:row.entryAssessment?.contextRisks,
+      rotationThemes:(row.rotationProfiles || []).map(profile=>profile.name)})) };
   fs.writeFileSync(path.join(root, 'cache', 'performance-review.json'), JSON.stringify(report, null, 2));
   console.log(JSON.stringify(report, null, 2));
 }

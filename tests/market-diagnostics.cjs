@@ -20,7 +20,7 @@ try {
   runtime._compile(fs.readFileSync(filename,'utf8') + `
 cacheFilePath = name => require('path').join(${JSON.stringify(output)}, name+'.json');
 appendLogLine = () => {};
-module.exports.diagnostics = {fetchTencentMarketSnapshot,fetchTencentMarketSectors,fetchSectorCapitalFlow,fetchMarketNews,fetchTencentHistory,fetchSinaHistory,fetchSinaFundFlowHistory,fetchSinaFinancialRows,fetchStockNews};`,filename);
+module.exports.diagnostics = {fetchTencentMarketSnapshot,fetchTencentMarketSectors,fetchSectorCapitalFlow,fetchMarketNews,fetchTencentHistory,fetchSinaHistory,fetchSinaFundFlowHistory,fetchSinaFinancialRows,fetchStockNews,fetchDailyFundFlowHistory,fetchStockFundFlow,fetchCompanyProfile,fetchStockFinancials,fetchFutureRiskProfile,fetchStockChart,fetchGlobalMarketContext,fetchTencentQuotes};`,filename);
 } finally { Module._load=loader; }
 const api=runtime.exports, live=api.diagnostics;
 async function main(){

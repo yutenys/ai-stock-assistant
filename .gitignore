@@ -2,6 +2,7 @@ node_modules/
 release/
 logs/
 cache/
+data/recommendation-ledger/
 
 .env
 .env.*

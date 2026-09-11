@@ -16,7 +16,7 @@ app.whenReady().then(async () => {
   ipcMain.handle('append-operation-log', async () => true);
   ipcMain.handle('run-industry-workflow', async () => ({
     subject: '中药',
-    stocks: [{ code: '603567', name: '珍宝岛', sector: '线上搜索', type: '待观察', status: '已突破', focus: '搜索添加', reason: '测试数据', news: '等待刷新' }],
+    stocks: [{ code: '603567', name: '珍宝岛', sector: '线上搜索', type: '待观察', status: '已突破', focus: '搜索添加', holdingPeriod:'短线', reason: '测试数据', news: '等待刷新' }],
     errors: []
   }));
   ipcMain.handle('fetch-a-share-quotes', async () => {
@@ -204,12 +204,12 @@ app.whenReady().then(async () => {
     ],
     breadth: { up: 3210, down: 1780, flat: 126 },
     turnover: 1146711000000,
-    sectors: [{ name: '中药', changePct: 2.31, mainNetInflow: 1860000000, mainNetPct:6.8, mainNet5:2e9, mainNet10:3e9, capitalTradeDate:'2026-08-12', capitalTrend:{available:true}, capitalRank:8, capitalEstimated:false, rotationState:'资金升温', leader: '珍宝岛' }],
+    sectors: [{ name: '中药', changePct: 2.31, mainNetInflow: 1860000000, mainNetPct:6.8, mainNet5:2e9, mainNet10:3e9, capitalTradeDate:'2026-08-12', capitalTrend:{available:true}, participation:{summary:'有效成分2只，上涨2只，小样本'}, capitalRank:8, capitalEstimated:false, rotationState:'资金升温', leader: '珍宝岛' }],
     weakSectors: [{ name: '煤炭', changePct: -1.25, leader: '测试股票' }],
     fundSectors: [{ name: '猪肉概念', changePct: 5.92, mainNetInflow: 1555330704, mainNetPct:9.65, capitalRank:2, capitalEstimated:false, rotationState:'资金升温', leader: '邦基科技' }],
     limits: { upCount: 68, downCount: 7, upStocks: [{ code: '603567', name: '珍宝岛', industry: '中药' }], downStocks: [] },
     recommendations: [
-      { code: '603567', name: '珍宝岛', price:11.08, changePct:-0.72, signal: '底部待反弹', newsLabel: '消息确认', signalScore: 84, verdict: '等待确认', score: 76, breakoutPrice: 7.40, supportPrice: 6.20, ma30: 6.42, reason: '底部待反弹；回撤充分且短均线改善；阶段低点以来存在正向消息催化。', canslim:{score:81,available:6,total:7}, factorAnalysis:{score:78,available:5,total:7,sectorProfile:{name:'中药',score:76,label:'强势板块'}}, newsContext: { summary: '最新消息偏积极。' } },
+      { code: '603567', name: '珍宝岛', price:11.08, changePct:-0.72, signal: '底部待反弹', newsLabel: '消息确认', holdingPeriod:'短线', signalScore: 84, verdict: '等待确认', score: 76, breakoutPrice: 7.40, supportPrice: 6.20, ma30: 6.42, reason: '底部待反弹；回撤充分且短均线改善；阶段低点以来存在正向消息催化。', canslim:{score:81,available:6,total:7}, factorAnalysis:{score:78,available:5,total:7,sectorProfile:{name:'中药',score:76,label:'强势板块'}}, newsContext: { summary: '最新消息偏积极。' } },
       { code: '600111', name: '北方稀土股份', industry:'稀土', price:42.36, changePct:1.25, signal: '已反弹', newsLabel: '消息中性', signalScore: 80, verdict: '可关注', score: 78, breakoutPrice: 44.60, supportPrice: 39.20, ma30: 40.10, reason: '已反弹；站上MA20且MA5高于MA10；阶段低点以来消息面中性。', factorAnalysis:{score:70,available:4,total:7,sectorProfile:{name:'稀土',score:68,label:'活跃板块'}}, newsContext: { summary: '消息面中性。' } },
       ...Array.from({ length: 11 }, (_, index) => ({
         code: String(600200 + index), name: `测试推荐${index + 1}`, signal: '待突破', newsLabel: '消息中性',
@@ -370,6 +370,7 @@ app.whenReady().then(async () => {
   const detailState = await win.webContents.executeJavaScript(`({
     text: document.getElementById('detailPanel').innerText,
     labelText: document.getElementById('labelStocks').innerText,
+    holdingPeriodTag: document.querySelector('#detailPanel .holding-period-tag')?.textContent.trim() || '',
     newsTitles: [...document.querySelectorAll('[data-news-for="603567"] .news-row b')].map(node => node.textContent),
     dimensionNames: [...document.querySelectorAll('[data-history-for="603567"] .framework-table:not(.financial-table) tbody td:first-child')].map(node => ({
       text:node.innerText.trim(),
@@ -755,6 +756,22 @@ app.whenReady().then(async () => {
     commandInput: await clickAndType('commandInput', 'abc'),
     searchInput: await clickAndType('searchInput', 'xyz')
   };
+  await win.webContents.executeJavaScript(`(() => {
+    const previous = latestMarketOverview;
+    const make = (prefix, count, industry) => Array.from({length:count}, (_, index) => ({
+      code:prefix + index, name:industry + index, industry, price:10, changePct:1, signalScore:80,
+      signal:'突破蓄势', recommendationTier:'环境观察', entryAssessment:{allowed:false,status:'大盘偏弱，等待确认'}
+    }));
+    const recommendations = [...make('A',6,'证券'),...make('B',3,'多元金融'),...make('C',3,'银行'),...make('D',1,'电力')];
+    renderMarketOverview({...previous,recommendations});
+    const codes = [...document.querySelectorAll('#marketRecommendations [data-market-recommendation]')].map(node => node.dataset.marketRecommendation);
+    if(codes.length !== 10 || !codes.includes('D0')) throw new Error('Representative preview omitted an eligible industry');
+    if(!document.getElementById('marketRecommendationCoverage').textContent.includes('证券 6/13')) throw new Error('Concentration must use the full list');
+    document.getElementById('addMarketRecommendations').click();
+    if(document.querySelectorAll('[data-market-stock-choice]').length !== 13) throw new Error('Full recommendation list lost candidates');
+    document.getElementById('closeMarketLabelPanel').click();
+    renderMarketOverview(previous);
+  })()`);
   const backToTopState = await win.webContents.executeJavaScript(`(async () => {
     const button = document.getElementById('backToTop');
     const panels = [...document.querySelectorAll('.market,.right')];
@@ -865,6 +882,7 @@ app.whenReady().then(async () => {
   const multiLabelUsable = state.multiLabelState.some(text => /半导体\s+1只/.test(text))
     && state.multiLabelState.some(text => /医疗\s+1只/.test(text));
   const detailUsable = state.detailState.text.includes('所属行业：中药')
+    && state.detailState.holdingPeriodTag === '短线'
     && state.detailState.text.includes('净流入166.62万')
     && state.detailState.text.includes('主力流入3266.20万')
     && state.detailState.text.includes('流出3099.58万')
@@ -939,6 +957,7 @@ app.whenReady().then(async () => {
     && state.marketText.includes('横盘候选 5 只')
     && state.marketText.includes('5日净额20.00亿 / 10日净额30.00亿')
     && state.marketText.includes('资金截至2026-08-12')
+    && state.marketText.includes('有效成分2只，上涨2只，小样本')
     && state.marketBatchLabelState.initialAll && state.marketBatchLabelState.afterClear
     && state.marketBatchLabelState.initialTrack && state.marketBatchLabelState.momentumTrack && state.marketBatchLabelState.stableRestored
     && state.marketBatchLabelState.momentumModal.count === 1
@@ -976,7 +995,7 @@ app.whenReady().then(async () => {
     && state.marketBatchLabelState.closed
     && state.scoreConsistencyState.recommendationCount === 11
     && state.scoreConsistencyState.cardText.includes('推荐评分 84')
-    && state.scoreConsistencyState.cardText.includes('消息确认\n¥11.08')
+    && state.scoreConsistencyState.cardText.includes('消息确认\n短线\n¥11.08')
     && !state.scoreConsistencyState.cardText.includes('\n中药\n')
     && state.scoreConsistencyState.cardText.includes('CANSLIM 81 · 6/7维')
     && state.scoreConsistencyState.detailScore === '82'
@@ -1097,7 +1116,8 @@ app.whenReady().then(async () => {
     && Math.abs(state.refreshedLabelMetrics.splitAlignment.ratingLeft - state.refreshedLabelMetrics.splitAlignment.returnsLeft) < 1
     && Math.abs(state.refreshedLabelMetrics.splitAlignment.changeRight - state.refreshedLabelMetrics.splitAlignment.returnsRight) < 1
     && state.refreshedLabelMetrics.splitAlignment.gap > 10
-    && state.refreshedLabelMetrics.stateTexts.length === 3
+    && state.refreshedLabelMetrics.stateTexts[0] === '短线'
+    && state.refreshedLabelMetrics.stateTexts.length === 4
     && state.refreshedLabelMetrics.stateClasses.every(value => /b-(red|amber|green|blue|purple)/.test(value))
     && state.contextMenuState.visible
     && /置顶|从当前标签删除/.test(state.contextMenuState.actions)

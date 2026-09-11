@@ -98,24 +98,47 @@ function saveState(){
 }
 
 function favoriteOutcomeRows(){
-  return labels.flatMap(label => (label.stocks || []).map(stock => ({
-    code:stock.code,
-    label:label.name,
-    favoriteBasePrice:stock.favoriteBasePrice,
-    favoriteAddedAt:stock.favoriteAddedAt,
-    price:stock.price,
-    signal:stock.favoriteEntrySnapshot?.signal || stock.marketSignal || stock.signal || stock.type || stock.status,
-    signalScore:stock.favoriteEntrySnapshot?.signalScore ?? null,
-    technicalScore:stock.favoriteEntrySnapshot?.technicalScore ?? null,
-    recommendationModelVersion:stock.recommendationModelVersion || '',
-    recommendationContext:stock.recommendationContext || null
-  })));
+  const marketOverview = typeof latestMarketOverview === 'undefined' ? null : latestMarketOverview;
+  const currentIndices = new Map((marketOverview?.indices || []).map(index => [String(index.code || ''), Number(index.price)]));
+  const currentSectors = new Map((marketOverview?.sectors || []).map(sector => [String(sector.code || ''), Number(sector.price)]));
+  return labels.flatMap(label => (label.stocks || []).map(stock => {
+    const benchmarkReturns = (stock.favoriteEntrySnapshot?.benchmarkIndices || []).map(index => {
+      const base = Number(index.price);
+      const current = currentIndices.get(String(index.code || ''));
+      return base > 0 && current > 0 ? current / base - 1 : null;
+    }).filter(Number.isFinite);
+    const industryBenchmark = stock.favoriteEntrySnapshot?.industryBenchmark;
+    const industryBenchmarkPrice = currentSectors.get(String(industryBenchmark?.code || ''));
+    return {
+      code:stock.code,
+      label:label.name,
+      favoriteBasePrice:stock.favoriteBasePrice,
+      favoriteAddedAt:stock.favoriteAddedAt,
+      price:stock.price,
+      signal:stock.favoriteEntrySnapshot?.signal || '',
+      signalScore:stock.favoriteEntrySnapshot?.signalScore ?? null,
+      technicalScore:stock.favoriteEntrySnapshot?.technicalScore ?? null,
+      holdingPeriod:stock.favoriteEntrySnapshot?.holdingPeriod || stock.holdingPeriod || '',
+      benchmarkIndices:stock.favoriteEntrySnapshot?.benchmarkIndices || [],
+      benchmarkBasePrice:benchmarkReturns.length ? 100 : null,
+      benchmarkPrice:benchmarkReturns.length ? Number((100 * (1 + benchmarkReturns.reduce((sum, value) => sum + value, 0) / benchmarkReturns.length)).toFixed(6)) : null,
+      industryBenchmark,
+      industryBenchmarkBasePrice:Number(industryBenchmark?.price) > 0 ? Number(industryBenchmark.price) : null,
+      industryBenchmarkPrice:industryBenchmarkPrice > 0 ? industryBenchmarkPrice : null,
+      recommendationModelVersion:stock.favoriteEntrySnapshot?.modelVersion || '',
+      recommendationContext:stock.favoriteEntrySnapshot?.context || null
+    };
+  }));
 }
 
 function labelStockSnapshot(stock, existingStock=null){
   const {favoriteBasePrice: ignoredBase, favoriteAddedAt: ignoredTime, ...snapshot} = stock;
   const existingBase = Number(existingStock?.favoriteBasePrice);
   const currentPrice = Number(stock.price);
+  const marketOverview = typeof latestMarketOverview === 'undefined' ? null : latestMarketOverview;
+  const industryName = String(stock.industry || stock.sector || '').replace(/^线上板块\s*\/\s*/, '').trim();
+  const industryBenchmark = (marketOverview?.sectors || []).find(sector => Number(sector.price) > 0
+    && (String(sector.name || '').trim() === industryName || industryName.includes(String(sector.name || '').trim())));
   return {
     ...snapshot,
     favoriteEntrySnapshot: existingStock
@@ -124,6 +147,13 @@ function labelStockSnapshot(stock, existingStock=null){
         signal:stock.marketSignal || stock.signal || stock.type || stock.status,
         signalScore:stock.signalScore ?? null,
         technicalScore:stock.technicalScore ?? null,
+        holdingPeriod:stock.holdingPeriod || stock.holdingProfile?.primary || '',
+        benchmarkIndices:(marketOverview?.indices || []).filter(index => Number(index.price) > 0)
+          .map(index => ({code:index.code,name:index.name,price:Number(index.price)})),
+        industryBenchmark:industryBenchmark
+          ? {code:industryBenchmark.code,name:industryBenchmark.name,price:Number(industryBenchmark.price)} : null,
+        modelVersion:stock.recommendationModelVersion || '',
+        context:stock.recommendationContext ? JSON.parse(JSON.stringify(stock.recommendationContext)) : null,
         capturedAt:new Date().toISOString()
       },
     pinned:Boolean(existingStock?.pinned),
@@ -199,6 +229,51 @@ function recommendationIndustry(item){
   return candidates.map(value => String(value || '').trim()).find(value => value && !['行业待确认','未分类','线上搜索','-','--'].includes(value)) || '行业待确认';
 }
 
+function recommendationPreview(items, limit=10){
+  const groups = new Map();
+  const seen = new Set();
+  (items || []).forEach(item => {
+    if(seen.has(item.code)) return;
+    seen.add(item.code);
+    const industry = recommendationIndustry(item);
+    const key = industry === '行业待确认' ? `${industry}-${item.code}` : industry;
+    if(!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(item);
+  });
+  const selected = [];
+  for(let index=0; selected.length<limit; index++){
+    let added = false;
+    for(const group of groups.values()){
+      if(group[index] && selected.length<limit){
+        selected.push(group[index]);
+        added = true;
+      }
+    }
+    if(!added) break;
+  }
+  return selected;
+}
+
+function recommendationConcentrationText(items){
+  const unique = [...new Map((items || []).map(item => [item.code,item])).values()];
+  if(!unique.length) return '';
+  const industries = new Map();
+  const themes = new Map();
+  unique.forEach(item => {
+    const industry = recommendationIndustry(item);
+    if(industry !== '行业待确认') industries.set(industry, (industries.get(industry) || 0)+1);
+    const names = new Set((item.rotationProfiles || []).map(profile => profile.name).filter(Boolean));
+    names.forEach(name => themes.set(name, (themes.get(name) || 0)+1));
+  });
+  const largestIndustry = [...industries].sort((a,b) => b[1]-a[1])[0];
+  const largestTheme = [...themes].sort((a,b) => b[1]-a[1])[0];
+  const details = [`名单覆盖 ${industries.size} 个已确认行业`];
+  if(largestIndustry) details.push(`最多为${largestIndustry[0]} ${largestIndustry[1]}/${unique.length}`);
+  if(largestTheme?.[1] > 1) details.push(`共同轮动主题 ${largestTheme[0]} ${largestTheme[1]}/${unique.length}`);
+  if(largestIndustry?.[1] > 1 || largestTheme?.[1] > 1) details.push('同向风险需合并评估，分行业展示不等于持仓分散');
+  return details.join('；');
+}
+
 function recommendationFactorText(item){
   const factors = item?.factorAnalysis;
   if(!factors || !Number.isFinite(Number(factors.score))) return '多因子数据不足';
@@ -215,10 +290,11 @@ function recommendationCardHtml(item, selectable=false){
   const industry = recommendationIndustry(item);
   const sectorLabel = item.factorAnalysis?.sectorProfile?.label || '板块待确认';
   const changeClass = Number.isFinite(item.changePct) ? pctClass(item.changePct) : 'neutral';
-  const scoreLabel = item.recommendationTier === '观察候选' ? '观察评分' : '推荐评分';
-  const verdictLabel = item.signal === '强势追踪' ? item.entryAssessment?.status : item.verdict;
-  const content = `<span class="market-stock-content"><b class="market-stock-head"><span class="market-stock-name">${escapeHtml(item.name)}</span><span class="code">${escapeHtml(item.code)}</span><span class="market-signal ${badgeClass(item.signal)}">${escapeHtml(item.signal || '待突破')}</span><span class="market-signal ${badgeClass(item.newsLabel)}">${escapeHtml(item.newsLabel || '消息中性')}</span><span class="market-current-price">${yuan(item.price)}</span><span class="market-current-change ${changeClass}">${formatPct(item.changePct)}</span></b>
-    <span>${escapeHtml(sectorLabel)} · ${escapeHtml(verdictLabel || '等待确认')} · ${scoreLabel} ${escapeHtml(item.signalScore ?? item.score)} · ${escapeHtml(recommendationCanslimText(item))} · ${escapeHtml(recommendationFactorText(item))} · MA30 ${yuan(item.ma30)} · 突破价 ${yuan(item.breakoutPrice)}</span>
+  const scoreLabel = ['观察候选','环境观察'].includes(item.recommendationTier) ? '观察评分' : '推荐评分';
+  const verdictLabel = item.signal === '强势追踪' || item.recommendationTier === '环境观察' ? item.entryAssessment?.status : item.verdict;
+  const confidence = item.dataConfidence ? `数据可信度 ${item.dataConfidence.label} ${item.dataConfidence.available}/${item.dataConfidence.total}` : '数据可信度待评估';
+  const content = `<span class="market-stock-content"><b class="market-stock-head"><span class="market-stock-name">${escapeHtml(item.name)}</span><span class="code">${escapeHtml(item.code)}</span><span class="market-signal ${badgeClass(item.signal)}">${escapeHtml(item.signal || '待突破')}</span><span class="market-signal ${badgeClass(item.newsLabel)}">${escapeHtml(item.newsLabel || '消息中性')}</span><span class="market-signal b-blue">${escapeHtml(item.holdingPeriod || '周期待评估')}</span><span class="market-current-price">${yuan(item.price)}</span><span class="market-current-change ${changeClass}">${formatPct(item.changePct)}</span></b>
+    <span>${escapeHtml(sectorLabel)} · ${escapeHtml(verdictLabel || '等待确认')} · ${scoreLabel} ${escapeHtml(item.signalScore ?? item.score)} · ${escapeHtml(confidence)} · ${escapeHtml(recommendationCanslimText(item))} · ${escapeHtml(recommendationFactorText(item))} · MA30 ${yuan(item.ma30)} · 突破价 ${yuan(item.breakoutPrice)}</span>
     <small>${escapeHtml(item.reason || '')}</small></span>`;
   if(selectable) return `<label class="market-recommendation market-stock-choice" data-market-industry="${escapeHtml(industry)}"><input type="checkbox" data-market-stock-choice="${escapeHtml(item.code)}" checked />${content}</label>`;
   return `<button class="market-recommendation" data-market-recommendation="${escapeHtml(item.code)}" data-market-industry="${escapeHtml(industry)}">${content}</button>`;
@@ -252,7 +328,7 @@ function renderMarketOverview(result){
   $('marketDown').textContent = result.breadth?.down ?? '--';
   $('marketFlat').textContent = result.breadth?.flat ?? '--';
   $('marketTurnover').textContent = money(result.turnover);
-  const rotationDetail = item => [item.rotationState, item.rotationTransition?.available || !item.capitalTrend?.available ? item.rotationTransition?.state : '', item.capitalStale ? '资金缓存待核验' : '', item.upRatio != null && Number.isFinite(Number(item.upRatio)) ? `上涨${(Number(item.upRatio) * 100).toFixed(0)}%` : '', item.capitalEstimated === false && !item.capitalStale && item.mainNetPct != null && Number.isFinite(Number(item.mainNetPct)) ? `净占比${Number(item.mainNetPct) >= 0 ? '+' : ''}${Number(item.mainNetPct).toFixed(2)}%` : '', item.capitalTrend?.available ? `5日净额${money(item.mainNet5)} / 10日净额${money(item.mainNet10)}` : '', item.capitalTradeDate ? `资金截至${item.capitalTradeDate}` : '', item.capitalRank && !item.capitalStale ? `资金第${item.capitalRank}` : '', item.leader ? `领涨 ${item.leader}` : ''].filter(Boolean).join(' · ');
+  const rotationDetail = item => [item.rotationPhase ? `${item.rotationPhase.phase}（可信度${item.rotationPhase.confidence}）` : item.rotationState, item.rotationTransition?.available || !item.capitalTrend?.available ? item.rotationTransition?.state : '', item.capitalStale ? '资金缓存待核验' : '', item.participation?.summary || (item.upRatio != null && Number.isFinite(Number(item.upRatio)) ? `上涨${(Number(item.upRatio) * 100).toFixed(0)}%` : ''), item.capitalEstimated === false && !item.capitalStale && item.mainNetPct != null && Number.isFinite(Number(item.mainNetPct)) ? `净占比${Number(item.mainNetPct) >= 0 ? '+' : ''}${Number(item.mainNetPct).toFixed(2)}%` : '', item.capitalTrend?.available ? `5日净额${money(item.mainNet5)} / 10日净额${money(item.mainNet10)}` : '', item.capitalTradeDate ? `资金截至${item.capitalTradeDate}` : '', item.capitalRank && !item.capitalStale ? `资金第${item.capitalRank}` : '', item.leader ? `领涨 ${item.leader}` : ''].filter(Boolean).join(' · ');
   const strong = (result.sectors || []).slice(0, 4).map(item => marketRow(item, formatPct(item.changePct), rotationDetail(item))).join('');
   const weak = (result.weakSectors || []).slice(0, 2).map(item => marketRow(item, formatPct(item.changePct), rotationDetail(item) || '回落')).join('');
   $('marketSectors').innerHTML = strong + weak || '<div class="market-row"><span>板块轮动暂不可用</span></div>';
@@ -311,7 +387,8 @@ function renderMarketOverview(result){
   $('marketRecommendationCoverage').textContent = coverage.scanned
     ? `全市场扫描 ${coverage.scanned} 只，初筛 ${coverage.prefiltered || 0} 只，本轮在线精筛 ${coverage.analyzed || 0} 只${fullMarketCoverage}，覆盖 ${coverage.industries || 0} 个已确认行业${unresolvedIndustryCoverage}${accumulationCoverage}${riskCoverage}${outcomeCoverage}；${tierSummary}实际展示 ${recommendations.length} 只（${signalSummary.join('，')}）${fallbackNote}`
     : '等待全市场扫描';
-  const visibleRecommendations = recommendations.slice(0, 10);
+  if(recommendations.length) $('marketRecommendationCoverage').textContent += `；${recommendationConcentrationText(recommendations)}`;
+  const visibleRecommendations = recommendationPreview(recommendations, 10);
   $('marketRecommendations').innerHTML = visibleRecommendations.length ? groupedRecommendationHtml(visibleRecommendations) : '<div class="market-row"><span>当前未筛出满足条件的候选</span></div>';
   $('addMarketRecommendations').textContent = `查看更多（${recommendations.length}）`;
   $('addMarketRecommendations').disabled = !recommendations.length;
@@ -327,8 +404,9 @@ function renderMarketOverview(result){
       : hasDirectSectorCapital
         ? '方案B正在使用最新板块资金重新计算，请稍候刷新。'
         : '真实板块主力资金暂不可用，本轮不生成强势追踪推荐。';
+  if(momentumRecommendations.length) $('marketMomentumCoverage').textContent += ` ${recommendationConcentrationText(momentumRecommendations)}。`;
   $('marketMomentumRecommendations').innerHTML = momentumRecommendations.length
-    ? groupedRecommendationHtml(momentumRecommendations.slice(0, 8))
+    ? groupedRecommendationHtml(recommendationPreview(momentumRecommendations, 8))
     : '<div class="market-row"><span>当前没有通过真实资金确认的强势追踪候选</span></div>';
   $('addMarketMomentumRecommendations').textContent = `查看更多（${momentumRecommendations.length}）`;
   $('addMarketMomentumRecommendations').disabled = !momentumRecommendations.length;
@@ -441,6 +519,16 @@ function stockTagsHtml(stock, className='badge'){
   return stockTagValues(stock).map(value => `<span class="${className} ${badgeClass(value)}">${escapeHtml(value)}</span>`).join('');
 }
 
+function stockHoldingPeriod(stock, historyResult=null){
+  return historyResult?.analysis?.holdingPeriod
+    || historyResult?.analysis?.holdingProfile?.primary
+    || historyResult?.investmentAnalysis?.holdingProfile?.primary
+    || stock?.holdingPeriod
+    || stock?.favoriteEntrySnapshot?.holdingPeriod
+    || stock?.holdingProfile?.primary
+    || '';
+}
+
 function closeMarketLabelPanel(){
   $('marketLabelPanel')?.classList.add('hidden');
 }
@@ -470,6 +558,7 @@ function normalizedMarketRecommendation(item){
     ...item,
     technicalScore: Number.isFinite(Number(item.technicalScore)) ? Number(item.technicalScore) : Number(item.score),
     score: Number.isFinite(recommendationScore) ? recommendationScore : item.score,
+    holdingPeriod:item.holdingPeriod || item.holdingProfile?.primary || '',
     type:item.signal || '市场推荐', status:item.newsLabel || '消息中性', focus:item.newsLabel || '消息中性',
     marketSignal:item.signal, reason:item.reason, news:item.newsContext?.summary || ''
   };
@@ -704,6 +793,8 @@ function applyAnalysisClassification(code){
     technicalScore: analysis.score,
     score: Number.isFinite(Number(stock.signalScore)) ? Number(stock.signalScore) : analysis.score,
     canslim: historyResult?.investmentAnalysis?.canslim || stock.canslim,
+    holdingProfile: analysis.holdingProfile || historyResult?.investmentAnalysis?.holdingProfile || stock.holdingProfile,
+    holdingPeriod: stockHoldingPeriod(stock, historyResult),
     status: updateStatusByQuote(stock),
     focus: stock.marketSignal && stock.newsLabel ? stock.newsLabel : analysis.score >= 72 ? '重点关注' : analysis.score >= 55 ? '趋势关注' : '观察关注'
   } : stock;
@@ -799,6 +890,7 @@ function stockCard(s, compact=false, showCheck=true){
     const score = stockAnalysisScore(s);
     const canslimScore = stockCanslimScore(s);
     const cumulativeChange = favoriteChangePct(s);
+    const holdingPeriod = stockHoldingPeriod(s, detailHistoryCache.get(s.code));
     return `<article class="stock-card compact-card label-stock-card ${s.pinned ? 'pinned-stock-card' : ''}" data-detail-code="${s.code}">
       <div class="stock-top">
         <div class="compact-stock-main">
@@ -807,7 +899,7 @@ function stockCard(s, compact=false, showCheck=true){
         <div class="price">${yuan(s.price)}</div>
       </div>
       <div class="compact-returns"><span class="compact-rating-group"><span class="compact-rating">评分 ${score == null ? '--' : escapeHtml(score)}</span><span class="compact-rating">CAN ${canslimScore == null ? '--' : escapeHtml(canslimScore)}</span></span><span class="compact-change-group"><span class="${cumulativeChange == null ? 'neutral' : pctClass(cumulativeChange)}" title="从加入当前标签时开始计算">累 ${formatPct(cumulativeChange)}</span><span class="${pctClass(s.changePct)}">今 ${formatPct(s.changePct)}</span></span></div>
-      <div class="compact-score">${s.pinned ? '<span class="compact-pinned">置顶</span>' : ''}${stockTagsHtml(s, 'compact-state')}</div>
+      <div class="compact-score">${s.pinned ? '<span class="compact-pinned">置顶</span>' : ''}${holdingPeriod ? `<span class="compact-state b-blue holding-period-tag">${escapeHtml(holdingPeriod)}</span>` : ''}${stockTagsHtml(s, 'compact-state')}</div>
     </article>`;
   }
   return `<article class="stock-card ${compact ? 'compact-card label-stock-card' : ''}" data-detail-code="${s.code}">
@@ -1492,6 +1584,10 @@ function investmentAnalysisHtml(result){
   const dimensions = canslim?.dimensions || [];
   const dimensionRows = dimensions.map(item => `<tr><td><b>${escapeHtml(item.key)} · ${escapeHtml(item.label)}</b></td><td>${item.available ? `${escapeHtml(item.score)}/${escapeHtml(item.max)}` : '数据不足'}</td><td>${escapeHtml(item.evidence || '--')}</td></tr>`).join('');
   const value = investment?.value || {};
+  const confidence = investment?.dataConfidence;
+  const confidenceText = confidence
+    ? `${confidence.label} ${confidence.available}/${confidence.total}${confidence.missing?.length ? `；缺失 ${confidence.missing.join('、')}` : ''}`
+    : '待评估';
   const quality = value.quality || financial?.quality || {};
   const financialRows = (financial?.rows || []).map(row => `<tr><td>${escapeHtml(row.report || '--')}</td><td>${row.eps == null ? '--' : formatNumber(row.eps,2)}</td><td>${row.epsGrowth == null ? '--' : formatPct(row.epsGrowth)}</td><td>${row.revenueGrowth == null ? '--' : formatPct(row.revenueGrowth)}</td><td>${row.profitGrowth == null ? '--' : formatPct(row.profitGrowth)}</td><td>${row.roe == null ? '--' : formatPct(row.roe)}</td><td>${row.cashPerShare == null ? '--' : formatNumber(row.cashPerShare,2)}</td></tr>`).join('');
   const risks = financial?.hardRisks || [];
@@ -1504,7 +1600,7 @@ function investmentAnalysisHtml(result){
       : '<p><b>财务红旗：</b>当前已获取指标未触发硬性恶化条件；仍不等于财务无风险。</p>';
   return `<section class="investment-framework">
     <h3>CANSLIM 与价值质量分析</h3>
-    <div class="analysis-verdict"><div class="analysis-score"><b>${escapeHtml(canslim?.score ?? '--')}</b><span>CANSLIM / 100</span></div><div><p><b>评分口径：</b>${escapeHtml(canslim?.scope || '个股实时分析')}；<b>可验证覆盖：</b>${escapeHtml(canslim?.available ?? 0)}/${escapeHtml(canslim?.total ?? 7)}维，原始得分 ${escapeHtml(canslim?.rawScore ?? '--')}/${escapeHtml(canslim?.availableMax ?? '--')}。</p><p>${escapeHtml(canslim?.note || '缺失项不推测。')}</p></div></div>
+    <div class="analysis-verdict"><div class="analysis-score"><b>${escapeHtml(canslim?.score ?? '--')}</b><span>CANSLIM / 100</span></div><div><p><b>评分口径：</b>${escapeHtml(canslim?.scope || '个股实时分析')}；<b>可验证覆盖：</b>${escapeHtml(canslim?.available ?? 0)}/${escapeHtml(canslim?.total ?? 7)}维，原始得分 ${escapeHtml(canslim?.rawScore ?? '--')}/${escapeHtml(canslim?.availableMax ?? '--')}。</p><p><b>综合数据可信度：</b>${escapeHtml(confidenceText)}。</p><p>${escapeHtml(canslim?.note || '缺失项不推测。')}</p></div></div>
     <div class="framework-table-wrap"><table class="framework-table"><thead><tr><th>维度</th><th>得分</th><th>真实数据依据</th></tr></thead><tbody>${dimensionRows || '<tr><td colspan="3">CANSLIM数据不足</td></tr>'}</tbody></table></div>
     <div class="value-summary"><p><b>价值综合分：</b>${escapeHtml(value.score ?? '--')}/100；<b>财务质量：</b>${qualityScore}；<b>估值分：</b>${escapeHtml(value.valuationScore ?? '--')}/100。</p>
       <p><b>PE / PB：</b>${value.pe == null ? '--' : formatNumber(value.pe,1)} / ${value.pb == null ? '--' : formatNumber(value.pb,1)}；<b>质量依据：</b>${escapeHtml(quality.evidence || '财务接口暂时不可用，本次不生成财务质量评分')}。</p>
@@ -1523,6 +1619,16 @@ function renderHistoryAnalysis(s, result){
   if(!a){
     box.innerHTML = '<div class="note inline-note">近3个月行情不足，暂不能生成趋势分析。</div>';
     return;
+  }
+  const holdingPeriod = stockHoldingPeriod(s, result);
+  const detailTags = document.querySelector(`[data-detail-tags-for="${s.code}"]`);
+  const holdingPeriodTag = detailTags?.querySelector('.holding-period-tag');
+  if(holdingPeriodTag && !holdingPeriod){
+    holdingPeriodTag.remove();
+  }else if(holdingPeriodTag){
+    holdingPeriodTag.textContent = holdingPeriod;
+  }else if(detailTags && holdingPeriod){
+    detailTags.insertAdjacentHTML('afterbegin', `<span class="badge b-blue holding-period-tag">${escapeHtml(holdingPeriod)}</span>`);
   }
   const capital = typeof s.mainNetInflow === 'number'
     ? `当前主力流入${metricValue(s.mainInflow, money)}、流出${metricValue(s.mainOutflow, money)}，${s.mainNetInflow >= 0 ? '净流入' : '净流出'}${money(Math.abs(s.mainNetInflow))}${typeof s.mainNetPct === 'number' ? `，净占比${formatPct(s.mainNetPct)}` : ''}。`
@@ -1548,6 +1654,10 @@ function renderHistoryAnalysis(s, result){
   const plan = a.tradePlan;
   const breakout = a.breakoutPotential || a.consolidationBreakout;
   const entryAssessment = a.entryAssessment;
+  const holdingProfile = a.holdingProfile || result?.investmentAnalysis?.holdingProfile || s.holdingProfile;
+  const holdingProfileHtml = holdingProfile?.profiles?.length
+    ? `<div class="holding-horizons">${holdingProfile.profiles.map(profile => `<div class="holding-horizon ${profile.label === holdingProfile.primary ? 'primary' : ''}"><b>${escapeHtml(profile.label)} · ${escapeHtml(profile.days)}</b><span>评分 ${escapeHtml(profile.score)}/100 · ${profile.qualified ? '条件匹配' : '仅观察'}</span><small>${escapeHtml(profile.basis)}</small></div>`).join('')}</div>`
+    : '';
   const entryAssessmentHtml = entryAssessment
     ? `<p class="entry-assessment ${escapeHtml(entryAssessment.tone || 'neutral')}"><b>当前入场结论：${escapeHtml(entryAssessment.status || '等待确认')}</b><span>${escapeHtml(entryAssessment.summary || '')}</span>${entryAssessment.structureSummary ? `<span><strong>吸筹 / 洗盘评估：</strong>${escapeHtml(entryAssessment.structureSummary)}</span>` : ''}<small>${(entryAssessment.evidence || []).map(escapeHtml).join(' · ')}</small></p>`
     : '<p class="entry-assessment neutral"><b>当前入场结论：数据待补充</b><span>关键价格、均线或量能数据不足，暂不形成入场结论。</span></p>';
@@ -1571,6 +1681,7 @@ function renderHistoryAnalysis(s, result){
       <div class="analysis-score"><b>${escapeHtml(displayedScore ?? '--')}</b><span>${scoreLabel}</span></div>
       <div><p><b>当前判断：</b>${escapeHtml(displayedVerdict || '等待确认')}</p><p>${escapeHtml(conclusion)}</p>${recommendationSnapshotHtml}</div>
     </div>
+    ${holdingProfileHtml}
     <div class="analysis-grid">
       ${entryAssessmentHtml}
       <p><b>趋势：</b>${escapeHtml(a.summary)}</p>
@@ -2299,6 +2410,7 @@ function renderDetailPanel(){
   const initialIndustry = reliableIndustry(s.sector);
   const chartPeriod = activeChartPeriod.get(s.code) || 'day';
   const forceLatest = forceDetailRefreshCode === s.code;
+  const holdingPeriod = stockHoldingPeriod(s, detailHistoryCache.get(s.code));
   if(forceLatest) forceDetailRefreshCode = null;
   panel.innerHTML = `<div class="detail-head">
       <div><h2>${escapeHtml(s.name)} <span>${s.code}</span></h2><p data-detail-sector="${s.code}">${escapeHtml(initialIndustry)}</p></div>
@@ -2328,7 +2440,7 @@ function renderDetailPanel(){
       <div><b data-quote-totalMarketCap-for="${s.code}">${marketCapValue(s.totalMarketCap)}</b><span>总市值</span></div>
       <div><b data-quote-floatMarketCap-for="${s.code}">${metricValue(s.floatMarketCap, money)}</b><span>流通市值</span></div>
     </div>
-    <div class="detail-tags">${stockTagsHtml(s)}</div>
+    <div class="detail-tags" data-detail-tags-for="${s.code}">${holdingPeriod ? `<span class="badge b-blue holding-period-tag">${escapeHtml(holdingPeriod)}</span>` : ''}${stockTagsHtml(s)}</div>
     ${simulatedTradePanel(s)}
     <div class="detail-chart">
       <div class="chart-head"><div class="chart-title"><h3>个股走势</h3><button class="small chart-refresh" data-chart-refresh="${s.code}" title="重新加载当前周期走势" aria-label="刷新个股走势">刷新</button></div><div class="chart-tabs">
