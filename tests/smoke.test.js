@@ -120,8 +120,12 @@ test('统一时点区分盘中、收盘和旧交易日', () => {
   assert.equal(chinaClockParts(intraday).date, '2026-09-14');
   assert.equal(resolveObservationPhase('2026-09-14', intraday).phase, 'intraday');
   assert.equal(resolveObservationPhase('2026-09-14', Date.parse('2026-09-14T07:10:00.000Z')).phase, 'closed');
+  assert.equal(resolveObservationPhase('2026-09-14', Date.parse('2026-09-14T07:10:00.000Z'), {isFinalBar:false}).phase, 'intraday');
+  assert.equal(resolveObservationPhase('2026-09-14', Date.parse('2026-09-14T07:10:00.000Z'), {sourceObservedAt:Date.parse('2026-09-14T06:55:00.000Z')}).phase, 'intraday');
   assert.equal(resolveObservationPhase('2026-09-11', intraday).phase, 'closed');
-  assert.match(marketSnapshotId({tradeDate:'2026-09-14',observedAt:intraday,universe:5900,source:'test'}), /^2026-09-14-/);
+  const snapshot=marketSnapshotId({tradeDate:'2026-09-14',observedAt:intraday,universe:5900,source:'test'});
+  assert.match(snapshot, /^2026-09-14-/);
+  assert.notEqual(snapshot, marketSnapshotId({tradeDate:'2026-09-14',observedAt:intraday+1,universe:5900,source:'test'}));
 });
 
 test('放量普跌中的局部板块单独分类，不误判成普涨或全面风险', () => {
@@ -643,7 +647,7 @@ test('趋势延续区分多日站稳、单日拉升和持续下跌', () => {
   assert.equal(analyzeTrendContinuation(falling).passed,false);
   falling[59]=make(15);
   assert.equal(analyzeTrendContinuation(falling).passed,false);
-  const candidate={signal:'已反弹',technicalScore:75,signalScore:70,qualityScore:75,analysis:{trendContinuation:persistent,distanceToBreakout:2,volumeRatio:1}};
+  const candidate={code:'600001',signal:'已反弹',technicalScore:75,signalScore:70,qualityScore:75,analysis:{trendContinuation:persistent,distanceToBreakout:2,volumeRatio:1}};
   assert.equal(recommendationGateDecision(candidate).passed,false);
   assert.equal(recommendationPassesWatchGate(candidate),true);
   const watches=finalizeRecommendationDisplay([],[candidate]);
@@ -2252,7 +2256,7 @@ test('强势追踪在风险扣分后重新检查综合评分，不用低分候�
   assert.deepEqual(finalizeMomentumRecommendations(rows).map(row => row.code), ['3']);
 });
 
-test('严格推荐不足时补足高质量横盘观察候选但不生成买入结论', () => {
+test('严格推荐与全部合格观察候选完整输出且不生成买入结论', () => {
   const strict = {
     code:'600001', signal:'突破确认', signalScore:72, technicalScore:80,
     qualityScore:82, entryAssessment:{allowed:true, status:'突破确认'}, reason:'突破确认；量价确认。'
@@ -2270,15 +2274,22 @@ test('严格推荐不足时补足高质量横盘观察候选但不生成买入�
   assert.equal(recommendationPassesWatchGate({...watches[0], signalScore:49}, true), false);
   assert.equal(recommendationPassesWatchGate({...watches[0], technicalScore:74}), false);
   assert.equal(recommendationPassesWatchGate({...watches[0], newsLabel:'消息谨慎'}), false);
-  const displayed = finalizeRecommendationDisplay([strict], watches, 6);
-  assert.equal(displayed.length, 6);
+  const displayed = finalizeRecommendationDisplay([strict], watches);
+  assert.equal(displayed.length, 9);
   assert.equal(displayed[0].recommendationTier, '严格推荐');
   assert.ok(displayed.slice(1).every(item => item.recommendationTier === '观察候选'));
   assert.ok(displayed.slice(1).every(item => item.signal === '横盘观察'));
   assert.ok(displayed.slice(1).every(item => item.entryAssessment.allowed === false));
   assert.ok(displayed.every(recommendationPassesDisplayGate));
   assert.equal(recommendationPassesWatchGate({...watches[0], qualityScore:72}), true);
-  assert.equal(finalizeRecommendationDisplay([strict], watches).length, 8);
+  assert.equal(finalizeRecommendationDisplay([strict, strict], [strict, ...watches, watches[0]]).length, 9);
+});
+
+test('收藏来源收益不参与公共推荐校准',()=>{
+  const row={code:'600001',label:'历史批次',favoriteBasePrice:10,price:8,favoriteAddedAt:'2026-08-01',signal:'待突破',outcomeOrigin:'favorite'};
+  const profile=summarizeRecommendationOutcomes([row],{now:Date.parse('2026-09-08')});
+  assert.equal(profile.sampleSize,0);
+  assert.equal(profile.excludedCount,1);
 });
 
 test('历史绝对收益和胜率很差时即使相对市场占优也必须降分', () => {

@@ -111,6 +111,7 @@ function favoriteOutcomeRows(){
     const industryBenchmarkPrice = currentSectors.get(String(industryBenchmark?.code || ''));
     return {
       code:stock.code,
+      outcomeOrigin:'favorite',
       label:label.name,
       favoriteBasePrice:stock.favoriteBasePrice,
       favoriteAddedAt:stock.favoriteAddedAt,

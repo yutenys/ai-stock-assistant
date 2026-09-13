@@ -8,6 +8,7 @@ const fs = require('fs');
 const http = require('http');
 const https = require('https');
 const { TextDecoder } = require('util');
+const crypto = require('crypto');
 
 const quoteCache = new Map();
 const companyProfileCache = new Map();
@@ -30,7 +31,7 @@ let marketDirectorySavedAt = 0;
 const CONTROLLED_VOLUME_MIN = 1.5;
 const CONTROLLED_VOLUME_MAX = 4;
 const SECTOR_CAPITAL_FALLBACK_MAX_AGE_MS = 72 * 60 * 60 * 1000;
-const RECOMMENDATION_MODEL_VERSION = '2026-09-13-unified-session-regime-v16';
+const RECOMMENDATION_MODEL_VERSION = '2026-09-13-p0-integrity-v17';
 
 function isControlledVolumeExpansion(value) {
   const ratio = Number(value);
@@ -430,20 +431,29 @@ function chinaClockParts(value = Date.now()) {
   return {date:`${get('year')}-${get('month')}-${get('day')}`, hour:Number(get('hour')), minute:Number(get('minute'))};
 }
 
-function resolveObservationPhase(tradeDate, observedAt = Date.now()) {
+function resolveObservationPhase(tradeDate, observedAt = Date.now(), { sourceObservedAt = null, isFinalBar = null } = {}) {
   const clock = chinaClockParts(observedAt);
   const date = String(tradeDate || '');
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return {phase:'unknown', label:'时点待确认', tradeDate:date, observedAt:new Date(observedAt).toISOString()};
   if (date < clock.date) return {phase:'closed', label:'历史收盘', tradeDate:date, observedAt:new Date(observedAt).toISOString()};
   if (date > clock.date) return {phase:'invalid', label:'交易日异常', tradeDate:date, observedAt:new Date(observedAt).toISOString()};
   const minutes = clock.hour * 60 + clock.minute;
-  const phase = minutes < 9 * 60 + 15 ? 'preopen' : minutes < 15 * 60 ? 'intraday' : 'closed';
+  const sourceTime = typeof sourceObservedAt === 'number' ? sourceObservedAt : Date.parse(sourceObservedAt || '');
+  const sourceClock = Number.isFinite(sourceTime) ? chinaClockParts(sourceTime) : null;
+  const sourceMinutes = sourceClock?.date === date ? sourceClock.hour * 60 + sourceClock.minute : null;
+  const clockClosed = minutes >= 15 * 60;
+  const sourceStillIntraday = sourceMinutes !== null && sourceMinutes < 15 * 60;
+  const phase = minutes < 9 * 60 + 15 ? 'preopen'
+    : !clockClosed || isFinalBar === false || sourceStillIntraday ? 'intraday' : 'closed';
   return {phase, label:phase === 'preopen' ? '开盘前' : phase === 'intraday' ? '盘中快照' : '当日收盘', tradeDate:date, observedAt:new Date(observedAt).toISOString()};
 }
 
-function marketSnapshotId({tradeDate = '', observedAt = Date.now(), universe = 0, source = ''} = {}) {
-  const timestamp = new Date(observedAt).toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
-  return `${tradeDate || 'unknown'}-${timestamp}-${Number(universe) || 0}-${String(source || 'mixed').replace(/\W+/g, '').slice(0, 16) || 'mixed'}`;
+function marketSnapshotId({tradeDate = '', observedAt = Date.now(), universe = 0, source = '', contentSignature = '', configVersion = RECOMMENDATION_MODEL_VERSION} = {}) {
+  const timestamp = new Date(observedAt).toISOString().replace(/[-:.TZ]/g, '').slice(0, 17);
+  const identity = JSON.stringify({tradeDate, observedAt:new Date(observedAt).toISOString(), universe:Number(universe) || 0,
+    source:String(source || 'mixed'), contentSignature:String(contentSignature || ''), configVersion:String(configVersion || '')});
+  const digest = crypto.createHash('sha256').update(identity).digest('hex').slice(0, 12);
+  return `${tradeDate || 'unknown'}-${timestamp}-${Number(universe) || 0}-${digest}`;
 }
 
 function shiftDate(isoDate, { days = 0, months = 0 } = {}) {
@@ -2680,6 +2690,10 @@ function summarizeRecommendationOutcomes(rows, { now = Date.now(), minimumAgeDay
   const seen = new Set();
   const eligible = [];
   for (const row of Array.isArray(rows) ? rows : []) {
+    if (row?.outcomeOrigin === 'favorite') {
+      excludedCount++;
+      continue;
+    }
     const label = String(row?.label || '').trim();
     if (label === '重点关注' || label.toLowerCase() === 'personal') {
       excludedCount++;
@@ -2974,14 +2988,23 @@ function recommendationPassesDisplayGate(item) {
     : recommendationPassesOutcomeGate(item);
 }
 
-function finalizeRecommendationDisplay(strictItems, watchItems, minimumCount = 8) {
-  const strict = (strictItems || []).map(item => item.entryAssessment?.contextRisks?.length
+function finalizeRecommendationDisplay(strictItems, watchItems) {
+  const seenCodes = new Set();
+  const strict = (strictItems || []).filter(item => {
+    const code = String(item?.code || '');
+    if (!code || seenCodes.has(code)) return false;
+    seenCodes.add(code);
+    return true;
+  }).map(item => item.entryAssessment?.contextRisks?.length
     ? {...item, recommendationTier:'环境观察', reason:`环境受限，仅作观察：${item.entryAssessment.contextRisks.join('、')}。${item.reason || ''}`}
     : {...item, recommendationTier:'严格推荐'});
-  const needed = Math.max(0, minimumCount - strict.length);
-  const watches = (watchItems || []).filter(item => recommendationPassesWatchGate(item, true))
+  const watches = (watchItems || []).filter(item => {
+    const code = String(item?.code || '');
+    if (!code || seenCodes.has(code) || !recommendationPassesWatchGate(item, true)) return false;
+    seenCodes.add(code);
+    return true;
+  })
     .sort((a, b) => Number(b.signalScore) - Number(a.signalScore) || Number(b.technicalScore) - Number(a.technicalScore))
-    .slice(0, needed)
     .map(item => ({
       ...item,
       signal: item.signal === '已反弹' ? '已反弹' : '横盘观察',
@@ -3542,14 +3565,17 @@ function selectMarketRecommendationCandidates({ rotationScreened = [], momentumS
   return candidates;
 }
 
-function finalizeMomentumRecommendations(items, limit = 8, perSector = 2) {
+function finalizeMomentumRecommendations(items, limit = Infinity, perSector = Infinity) {
   const sectorCounts = new Map();
+  const selectedCodes = new Set();
   const selected = [];
   const candidates = (items || []).filter(item => item.momentumDecision?.passed && !recommendationContextBlocked(item))
     .filter(item => Number.isFinite(Number(item.signalScore)) && Number(item.signalScore) >= 60)
     .sort((a, b) => Number(b.signalScore || 0) - Number(a.signalScore || 0)
       || Number(b.momentumDecision?.score || 0) - Number(a.momentumDecision?.score || 0));
   for (const item of candidates) {
+    const code = String(item?.code || '');
+    if (!code || selectedCodes.has(code)) continue;
     const sector = item.momentumDecision.profile?.name || '板块待确认';
     if ((sectorCounts.get(sector) || 0) >= perSector) continue;
     sectorCounts.set(sector, (sectorCounts.get(sector) || 0) + 1);
@@ -3569,6 +3595,7 @@ function finalizeMomentumRecommendations(items, limit = 8, perSector = 2) {
       },
       reason:`强势追踪：${item.momentumDecision.entryAssessment.summary}${item.reason ? ` 原稳健分析：${item.reason}` : ''}`
     });
+    selectedCodes.add(code);
     if (selected.length >= limit) break;
   }
   return selected;
