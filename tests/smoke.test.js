@@ -42,6 +42,8 @@ const {
   eastmoneyListRows,
   fetchEastmoneyListPages,
   chinaClockParts,
+  tencentQuoteObservedAt,
+  marketQuoteContentSignature,
   resolveObservationPhase,
   marketSnapshotId,
   classifyMarketRegime,
@@ -126,6 +128,14 @@ test('统一时点区分盘中、收盘和旧交易日', () => {
   const snapshot=marketSnapshotId({tradeDate:'2026-09-14',observedAt:intraday,universe:5900,source:'test'});
   assert.match(snapshot, /^2026-09-14-/);
   assert.notEqual(snapshot, marketSnapshotId({tradeDate:'2026-09-14',observedAt:intraday+1,universe:5900,source:'test'}));
+});
+
+test('腾讯行情原始时间参与收盘判断与快照内容身份', () => {
+  assert.equal(tencentQuoteObservedAt('20260914145501'), '2026-09-14T06:55:01.000Z');
+  assert.equal(tencentQuoteObservedAt('bad'), '');
+  const first=marketQuoteContentSignature([{code:'600001',tradeDate:'2026-09-14',quoteObservedAt:'2026-09-14T06:55:01.000Z',price:10,changePct:1,amount:100}]);
+  const second=marketQuoteContentSignature([{code:'600001',tradeDate:'2026-09-14',quoteObservedAt:'2026-09-14T06:55:02.000Z',price:10.1,changePct:2,amount:120}]);
+  assert.notEqual(first,second);
 });
 
 test('放量普跌中的局部板块单独分类，不误判成普涨或全面风险', () => {

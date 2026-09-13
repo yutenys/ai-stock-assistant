@@ -31,7 +31,7 @@ let marketDirectorySavedAt = 0;
 const CONTROLLED_VOLUME_MIN = 1.5;
 const CONTROLLED_VOLUME_MAX = 4;
 const SECTOR_CAPITAL_FALLBACK_MAX_AGE_MS = 72 * 60 * 60 * 1000;
-const RECOMMENDATION_MODEL_VERSION = '2026-09-13-p0-integrity-v17';
+const RECOMMENDATION_MODEL_VERSION = '2026-09-13-p0-integrity-v18';
 
 function isControlledVolumeExpansion(value) {
   const ratio = Number(value);
@@ -429,6 +429,24 @@ function chinaClockParts(value = Date.now()) {
   }).formatToParts(new Date(value));
   const get = type => parts.find(part => part.type === type)?.value || '';
   return {date:`${get('year')}-${get('month')}-${get('day')}`, hour:Number(get('hour')), minute:Number(get('minute'))};
+}
+
+function tencentQuoteObservedAt(value) {
+  const text = String(value || '');
+  if (!/^\d{14}$/.test(text)) return '';
+  const parsed = Date.parse(`${text.slice(0,4)}-${text.slice(4,6)}-${text.slice(6,8)}T${text.slice(8,10)}:${text.slice(10,12)}:${text.slice(12,14)}+08:00`);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : '';
+}
+
+function marketQuoteContentSignature(quotes = []) {
+  const content = quotes.map(row => [row.code, row.tradeDate, row.quoteObservedAt,
+    finiteNumber(row.price), finiteNumber(row.changePct), finiteNumber(row.amount)].join(':')).sort().join('|');
+  return crypto.createHash('sha256').update(content).digest('hex');
+}
+
+function latestQuoteObservedAt(quotes = []) {
+  const timestamps = quotes.map(row => Date.parse(row.quoteObservedAt || '')).filter(Number.isFinite);
+  return timestamps.length ? new Date(Math.max(...timestamps)).toISOString() : null;
 }
 
 function resolveObservationPhase(tradeDate, observedAt = Date.now(), { sourceObservedAt = null, isFinalBar = null } = {}) {
@@ -880,6 +898,7 @@ function normalizeTencentQuote(body) {
     mainNetPct: null,
     source: '腾讯实时行情',
     fetchedAt: new Date().toISOString(),
+    quoteObservedAt: tencentQuoteObservedAt(cols[30]),
     tradeDate: /^\d{8}/.test(String(cols[30] || '')) ? `${cols[30].slice(0, 4)}-${cols[30].slice(4, 6)}-${cols[30].slice(6, 8)}` : '',
     stale: false
   };
@@ -970,7 +989,8 @@ function parseTencentMarketQuote(body) {
     snapshotVolumeRatio: finiteNumber(cols[49]),
     upperLimit: finiteNumber(cols[47]),
     lowerLimit: finiteNumber(cols[48]),
-    tradeDate: /^\d{8}/.test(String(cols[30] || '')) ? `${cols[30].slice(0, 4)}-${cols[30].slice(4, 6)}-${cols[30].slice(6, 8)}` : ''
+    tradeDate: /^\d{8}/.test(String(cols[30] || '')) ? `${cols[30].slice(0, 4)}-${cols[30].slice(4, 6)}-${cols[30].slice(6, 8)}` : '',
+    quoteObservedAt: tencentQuoteObservedAt(cols[30])
   };
 }
 
@@ -3604,8 +3624,10 @@ function finalizeMomentumRecommendations(items, limit = Infinity, perSector = In
 async function buildMarketRecommendations(marketQuotes, force = false, outcomeProfile = null, marketContext = null, onProgress = () => {}) {
   const observedAt = Date.now();
   const recommendationTradeDate = (marketQuotes || []).map(item=>item.tradeDate).filter(Boolean).sort().at(-1) || '';
-  const observationPhase = resolveObservationPhase(recommendationTradeDate, observedAt);
-  const snapshotId = marketSnapshotId({tradeDate:recommendationTradeDate, observedAt, universe:marketQuotes?.length, source:'tencent-market'});
+  const sourceObservedAt = latestQuoteObservedAt(marketQuotes);
+  const observationPhase = marketContext?.observationPhase || resolveObservationPhase(recommendationTradeDate, observedAt, {sourceObservedAt});
+  const snapshotId = marketContext?.snapshotId || marketSnapshotId({tradeDate:recommendationTradeDate, observedAt,
+    universe:marketQuotes?.length, source:'tencent-market', contentSignature:marketQuoteContentSignature(marketQuotes)});
   const marketAssessmentContext = {
     breadth: (marketQuotes || []).reduce((counts, item) => {
       if (item.changePct > 0) counts.up++;
@@ -3896,8 +3918,7 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
   const strictQualityRecommendations = commonQualityRecommendations.filter(recommendationPassesOutcomeGate);
   const watchQualityRecommendations = commonQualityRecommendations
     .filter(item => !recommendationPassesOutcomeGate(item) && recommendationPassesWatchGate(item))
-    .sort((a, b) => Number(b.signalScore) - Number(a.signalScore) || Number(b.technicalScore) - Number(a.technicalScore))
-    .slice(0, 20);
+    .sort((a, b) => Number(b.signalScore) - Number(a.signalScore) || Number(b.technicalScore) - Number(a.technicalScore));
   const stableQualityRecommendations = [...strictQualityRecommendations, ...watchQualityRecommendations];
   const momentumQualityRecommendations = recommendations.filter(item => item.momentumDecision?.passed
     && !recommendationContextBlocked(item)
@@ -4155,8 +4176,10 @@ async function fetchMarketOverview(force = false, favoriteOutcomes = [], onProgr
     result.sectors ||= [];
     result.sectors = annotateSectorRotation(result.sectors, marketOverviewCache?.value || previousOverview, result.tradeDate);
     const regimeBaseline = previousOverview?.tradeDate && previousOverview.tradeDate < result.tradeDate ? previousOverview : null;
-    result.observationPhase = resolveObservationPhase(result.tradeDate, Date.parse(result.fetchedAt));
-    result.snapshotId = marketSnapshotId({tradeDate:result.tradeDate, observedAt:Date.parse(result.fetchedAt), universe:outcomeQuotes.length, source:'tencent-market'});
+    const sourceObservedAt = latestQuoteObservedAt(outcomeQuotes);
+    result.observationPhase = resolveObservationPhase(result.tradeDate, Date.parse(result.fetchedAt), {sourceObservedAt});
+    result.snapshotId = marketSnapshotId({tradeDate:result.tradeDate, observedAt:Date.parse(result.fetchedAt),
+      universe:outcomeQuotes.length, source:'tencent-market', contentSignature:marketQuoteContentSignature(outcomeQuotes)});
     result.marketRegime = classifyMarketRegime(result, regimeBaseline);
     outcomeProfile = summarizeRecommendationOutcomes(mergeRecommendationOutcomeBenchmarks(
       mergeRecommendationOutcomeQuotes(favoriteOutcomes, outcomeQuotes), result.indices || [], result.sectors), {requireFreshQuote:true});
@@ -6374,7 +6397,8 @@ async function fetchStockHistory({ code, name, industry = '', sector = '', force
   if (!history.length && errors.length) throw new Error(errors.join('；'));
   const stockObservedAt = Date.now();
   const stockTradeDate = history.at(-1)?.date || '';
-  const observationPhase = resolveObservationPhase(stockTradeDate, stockObservedAt);
+  const liveQuoteForTiming = quoteResult.status === 'fulfilled' ? quoteResult.value[0] : null;
+  const observationPhase = resolveObservationPhase(stockTradeDate, stockObservedAt, {sourceObservedAt:liveQuoteForTiming?.quoteObservedAt});
   let analysis = analyzeHistory(history, {observationPhase});
   const historicalFlow = fundFlowResult.status === 'fulfilled'
     ? { ...fundFlowResult.value }
@@ -6452,7 +6476,8 @@ async function fetchStockHistory({ code, name, industry = '', sector = '', force
   });
   analysis.holdingProfile = investmentAnalysis.holdingProfile;
   analysis.holdingPeriod = investmentAnalysis.holdingProfile.primary;
-  const snapshotId = marketSnapshotId({tradeDate:analysis.tradeDate, observedAt:stockObservedAt, universe:1, source:'stock-detail'});
+  const snapshotId = marketSnapshotId({tradeDate:analysis.tradeDate, observedAt:stockObservedAt, universe:1,
+    source:'stock-detail', contentSignature:marketQuoteContentSignature(liveQuote ? [liveQuote] : [])});
   analysis.scoreCard = buildStrategyScoreCard({
     analysis, technicalScore:analysis.score, canslim:investmentAnalysis.canslim,
     factorAnalysis:{score:investmentAnalysis.canslim?.score}, dataConfidence:investmentAnalysis.dataConfidence
@@ -6993,6 +7018,8 @@ module.exports = {
   eastmoneyListRows,
   fetchEastmoneyListPages,
   chinaClockParts,
+  tencentQuoteObservedAt,
+  marketQuoteContentSignature,
   resolveObservationPhase,
   marketSnapshotId,
   classifyMarketRegime,
