@@ -41,6 +41,11 @@ const {
   normalizeSectorCapitalRows,
   eastmoneyListRows,
   fetchEastmoneyListPages,
+  chinaClockParts,
+  resolveObservationPhase,
+  marketSnapshotId,
+  classifyMarketRegime,
+  buildStrategyScoreCard,
   mergeSectorCapitalRows,
   classifySectorRotationPhase,
   resolveStockRotationProfiles,
@@ -109,6 +114,71 @@ const {
 const {selectSectorMemberBoards, mergeFundFlowSnapshot} = require('../main.js');
 const {normalizeEastmoneyFundFlow, summarizeEastmoneyFundHistory, formatBusinessProducts, mapDataCenterCompanyProfile, emF10Code, dataCenterRows} = require('../main.js');
 Module._load = originalLoad;
+
+test('统一时点区分盘中、收盘和旧交易日', () => {
+  const intraday = Date.parse('2026-09-14T02:30:00.000Z');
+  assert.equal(chinaClockParts(intraday).date, '2026-09-14');
+  assert.equal(resolveObservationPhase('2026-09-14', intraday).phase, 'intraday');
+  assert.equal(resolveObservationPhase('2026-09-14', Date.parse('2026-09-14T07:10:00.000Z')).phase, 'closed');
+  assert.equal(resolveObservationPhase('2026-09-11', intraday).phase, 'closed');
+  assert.match(marketSnapshotId({tradeDate:'2026-09-14',observedAt:intraday,universe:5900,source:'test'}), /^2026-09-14-/);
+});
+
+test('放量普跌中的局部板块单独分类，不误判成普涨或全面风险', () => {
+  const result = classifyMarketRegime({breadth:{up:600,down:4500,flat:30},turnover:1.97e12,
+    indices:[{changePct:-1.1},{changePct:-.5}],limits:{upCount:40,downCount:8},
+    sectors:[{name:'元件',changePct:3.6,upRatio:.86,mainNetInflow:3.2e9,capitalEstimated:false,capitalStale:false}]}, {turnover:1.64e12});
+  assert.equal(result.key, 'localized-strength');
+  assert.equal(result.label, '放量普跌中的局部强势');
+  assert.equal(result.riskOff, false);
+  assert.equal(result.localized, true);
+});
+
+test('盘中越过突破位只进入观察，收盘数据才允许确认', () => {
+  const input={latestPrice:11,ma5:10.8,ma10:10.6,ma20:10.4,ma30:10.2,supportPrice:10,resistance:10.8,
+    volumeRatio:2,rsi14:60,breakoutStatus:'接近突破'};
+  const intraday=assessCurrentEntry({...input,observationPhase:{phase:'intraday',label:'盘中快照'}});
+  const closed=assessCurrentEntry({...input,observationPhase:{phase:'closed',label:'当日收盘'}});
+  assert.equal(intraday.allowed,false);
+  assert.equal(intraday.status,'盘中突破，等待收盘确认');
+  assert.equal(closed.allowed,true);
+  assert.equal(closed.status,'可分批入场');
+});
+
+test('统一评分快照保留各分数含义和模型版本', () => {
+  const card=buildStrategyScoreCard({technicalScore:76,signalScore:81,canslim:{score:69},factorAnalysis:{score:72},dataConfidence:{score:83}},
+    {snapshotId:'snap-1',tradeDate:'2026-09-11',observedAt:'2026-09-11T07:00:00Z'});
+  assert.deepEqual([card.technical,card.recommendation,card.canslim,card.factor,card.confidence],[76,81,69,72,83]);
+  assert.equal(card.snapshotId,'snap-1');
+  assert.equal(card.modelVersion,RECOMMENDATION_MODEL_VERSION);
+});
+
+test('消息形成可追溯事件且公司事件不向全市场外溢', () => {
+  const now='2026-09-11T08:00:00+08:00';
+  const company=summarizeNews([{title:'测试公司收到立案调查通知',publishedAt:'2026-09-11T07:00:00+08:00',link:'https://example.com/a'}], '', {subject:'测试公司',now,fetchedAt:now});
+  assert.equal(company.items[0].eventScope,'公司');
+  assert.equal(company.items[0].eventType,'公司风险');
+  assert.equal(company.items[0].evidenceLevel,'可追溯');
+  const market=summarizeNews([{title:'测试公司收到立案调查通知',publishedAt:'2026-09-11T07:00:00+08:00',link:'https://example.com/a'}], '', {scope:'market',now,fetchedAt:now});
+  assert.equal(market.available,false);
+});
+
+test('小样本强势板块降低轮动可信度', () => {
+  const phase=classifySectorRotationPhase({count:7,changePct:5.3,mainNetInflow:1e9,mainNetPct:13,
+    mainNet3:2e9,mainNet5:3e9,mainNet10:4e9,capitalEstimated:false,capitalStale:false,
+    participation:{breadthScore:90,topAmountShare:.2}});
+  assert.equal(phase.sampleLimited,true);
+  assert.equal(phase.confidence,'低');
+});
+
+test('普跌局部行情只放行已确认主线继续评估', () => {
+  const base={entryAssessment:{allowed:true,status:'可分批入场',summary:'技术成立',evidence:[]},verdict:'可关注',tradePlan:{enabled:true}};
+  const marketOverview={marketRegime:{localized:true,label:'普跌中的局部强势',strongSectors:['元件']},breadth:{up:600,down:4500},indices:[],sectors:[]};
+  const result=applyEntryContextAssessment(base,{marketOverview,newsContext:{signal:'中性',items:[]},marketNewsContext:{signal:'中性'},riskProfile:{status:'clear'},
+    subject:{industry:'电力',rotationProfiles:[{name:'电力',capitalEstimated:false,capitalStale:false,mainNetInflow:1e8,mainNetPct:1,rotationScore:60}]}});
+  assert.equal(result.entryAssessment.status,'普跌环境，非局部主线');
+  assert.equal(result.tradePlan.enabled,false);
+});
 
 test('公开资金分项使用超大单加大单且缺失不冒充零', () => {
   const result = normalizeEastmoneyFundFlow({f64:2488208,f65:2061930,f70:14272541,f71:15857306,f62:-1158487,f184:-1.09});
@@ -1417,6 +1487,12 @@ test('大盘分析返回指数、轮动、资金和涨跌停结构', { timeout: 
   assert.equal(typeof result.limits.upCount, 'number');
   assert.equal(typeof result.limits.downCount, 'number');
   assert.match(result.limits.date, /^\d{8}$/);
+  assert.equal(result.limits.observationOnly, true);
+  assert.match(result.limits.observationReason, /不生成买入许可/);
+  assert.ok(result.marketRegime?.key);
+  assert.ok(result.marketRegime?.evidence?.length >= 3);
+  assert.ok(result.snapshotId);
+  assert.ok(['preopen','intraday','closed'].includes(result.observationPhase?.phase));
   assert.match(result.source, /腾讯全市场行情/);
   assert.ok(Array.isArray(result.recommendations));
   if (!result.recommendations.length) {
@@ -1431,6 +1507,7 @@ test('大盘分析返回指数、轮动、资金和涨跌停结构', { timeout: 
   ].includes(item.signal)));
   assert.ok(result.recommendations.every(item => ['消息确认', '消息中性', '消息谨慎'].includes(item.newsLabel)));
   assert.ok(result.recommendations.every(item => Number.isFinite(item.signalScore) && item.reason.includes(item.signal)));
+  assert.ok(result.recommendations.every(item => item.scoreCard?.recommendation === item.signalScore && item.scoreCard?.snapshotId));
   assert.ok(result.recommendations.every(item => item.industry && item.industry !== '行业待确认'));
   assert.ok(result.recommendations.every(item => item.canslim?.total === 7));
   assert.ok(result.recommendations.every(item => {

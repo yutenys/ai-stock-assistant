@@ -147,6 +147,7 @@ function labelStockSnapshot(stock, existingStock=null){
         signal:stock.marketSignal || stock.signal || stock.type || stock.status,
         signalScore:stock.signalScore ?? null,
         technicalScore:stock.technicalScore ?? null,
+        scoreCard:stock.scoreCard ? JSON.parse(JSON.stringify(stock.scoreCard)) : null,
         holdingPeriod:stock.holdingPeriod || stock.holdingProfile?.primary || '',
         benchmarkIndices:(marketOverview?.indices || []).filter(index => Number(index.price) > 0)
           .map(index => ({code:index.code,name:index.name,price:Number(index.price)})),
@@ -293,8 +294,9 @@ function recommendationCardHtml(item, selectable=false){
   const scoreLabel = ['观察候选','环境观察'].includes(item.recommendationTier) ? '观察评分' : '推荐评分';
   const verdictLabel = item.signal === '强势追踪' || item.recommendationTier === '环境观察' ? item.entryAssessment?.status : item.verdict;
   const confidence = item.dataConfidence ? `数据可信度 ${item.dataConfidence.label} ${item.dataConfidence.available}/${item.dataConfidence.total}` : '数据可信度待评估';
-  const content = `<span class="market-stock-content"><b class="market-stock-head"><span class="market-stock-name">${escapeHtml(item.name)}</span><span class="code">${escapeHtml(item.code)}</span><span class="market-signal ${badgeClass(item.signal)}">${escapeHtml(item.signal || '待突破')}</span><span class="market-signal ${badgeClass(item.newsLabel)}">${escapeHtml(item.newsLabel || '消息中性')}</span><span class="market-signal b-blue">${escapeHtml(item.holdingPeriod || '周期待评估')}</span><span class="market-current-price">${yuan(item.price)}</span><span class="market-current-change ${changeClass}">${formatPct(item.changePct)}</span></b>
-    <span>${escapeHtml(sectorLabel)} · ${escapeHtml(verdictLabel || '等待确认')} · ${scoreLabel} ${escapeHtml(item.signalScore ?? item.score)} · ${escapeHtml(confidence)} · ${escapeHtml(recommendationCanslimText(item))} · ${escapeHtml(recommendationFactorText(item))} · MA30 ${yuan(item.ma30)} · 突破价 ${yuan(item.breakoutPrice)}</span>
+  const unifiedScore = item.scoreCard?.recommendation ?? item.signalScore ?? item.score;
+  const content = `<span class="market-stock-content"><b class="market-stock-head"><span class="market-stock-name">${escapeHtml(item.name)}</span><span class="code">${escapeHtml(item.code)}</span><span class="market-signal ${badgeClass(item.signal)}">${escapeHtml(item.signal || '待突破')}</span><span class="market-signal ${badgeClass(item.newsLabel)}">${escapeHtml(item.newsLabel || '消息中性')}</span><span class="market-signal b-blue">${escapeHtml(item.holdingPeriod || '周期待确认')}</span><span class="market-current-price">${yuan(item.price)}</span><span class="market-current-change ${changeClass}">${formatPct(item.changePct)}</span></b>
+    <span>${escapeHtml(sectorLabel)} · ${escapeHtml(verdictLabel || '等待确认')} · ${scoreLabel} ${escapeHtml(unifiedScore)} · ${escapeHtml(confidence)} · ${escapeHtml(recommendationCanslimText(item))} · ${escapeHtml(recommendationFactorText(item))} · MA30 ${yuan(item.ma30)} · 突破价 ${yuan(item.breakoutPrice)}</span>
     <small>${escapeHtml(item.reason || '')}</small></span>`;
   if(selectable) return `<label class="market-recommendation market-stock-choice" data-market-industry="${escapeHtml(industry)}"><input type="checkbox" data-market-stock-choice="${escapeHtml(item.code)}" checked />${content}</label>`;
   return `<button class="market-recommendation" data-market-recommendation="${escapeHtml(item.code)}" data-market-industry="${escapeHtml(industry)}">${content}</button>`;
@@ -318,7 +320,7 @@ function renderMarketOverview(result){
   latestMarketOverview = result;
   $('marketAnalysis').textContent = result.analysis || '市场分析暂不可用。';
   $('marketUpdated').textContent = result.fetchedAt
-    ? `${new Date(result.fetchedAt).toLocaleTimeString('zh-CN', {hour12:false})} · 自动刷新60秒`
+    ? `${result.observationPhase?.label || '时点待确认'} · ${new Date(result.fetchedAt).toLocaleTimeString('zh-CN', {hour12:false})} · 自动刷新60秒`
     : '等待更新';
   $('marketIndices').innerHTML = (result.indices || []).map(index => `<div class="market-index">
     <div><b>${escapeHtml(index.name)}</b><span> ${escapeHtml(index.code)}</span></div>
@@ -346,7 +348,8 @@ function renderMarketOverview(result){
   const downStocks = (limits.downStocks || []).slice(0, 4).map(item => item.name).join('、');
   $('marketLimits').innerHTML = `<div class="market-limit-summary"><span class="up">涨停 ${limits.upCount ?? '--'}</span><span class="down">跌停 ${limits.downCount ?? '--'}</span></div>
     ${upStocks ? `<div class="market-stocks"><b>涨停代表：</b>${escapeHtml(upStocks)}</div>` : ''}
-    ${downStocks ? `<div class="market-stocks"><b>跌停代表：</b>${escapeHtml(downStocks)}</div>` : ''}`;
+    ${downStocks ? `<div class="market-stocks"><b>跌停代表：</b>${escapeHtml(downStocks)}</div>` : ''}
+    ${limits.observationReason ? `<div class="market-stocks"><small>${escapeHtml(limits.observationReason)}</small></div>` : ''}`;
   const recommendations = result.recommendations || [];
   const momentumRecommendations = result.momentumRecommendations || [];
   latestMarketRecommendations = recommendations;
@@ -663,6 +666,20 @@ function portfolioMetrics(position){
   };
 }
 
+function portfolioRiskAssessment(position, stock, historyResult=null){
+  const metrics = portfolioMetrics(position);
+  const analysis = historyResult?.analysis || stock?.analysis || {};
+  const invalidation = Number(analysis?.tradePlan?.invalidationPrice || stock?.tradePlan?.invalidationPrice);
+  const contextRisks = analysis?.entryAssessment?.contextRisks || stock?.entryAssessment?.contextRisks || [];
+  if(Number.isFinite(invalidation) && invalidation > 0 && metrics.currentPrice < invalidation){
+    return {level:'high',label:'策略失效',summary:`现价低于失效价${yuan(invalidation)}，需独立复核持仓；与今日是否入选推荐无关。`};
+  }
+  if(contextRisks.length) return {level:'medium',label:'环境风险',summary:`${contextRisks.join('、')}；持仓按成本和原策略管理，不因今日未推荐直接卖出。`};
+  if(metrics.floatingPct <= -8) return {level:'medium',label:'亏损预警',summary:'浮亏达到8%，请核对原始失效条件与仓位风险。'};
+  if(!analysis?.tradeDate) return {level:'unknown',label:'待分析',summary:'尚无当前策略分析，不能用推荐缺席推导卖出结论。'};
+  return {level:'low',label:'跟踪中',summary:'当前未触发已知失效条件，继续按原策略和持仓成本跟踪。'};
+}
+
 function simulatedTradePanel(s){
   const position = portfolioPosition(s.code);
   const metrics = portfolioMetrics(position);
@@ -751,7 +768,8 @@ function executeSimulatedTrade(code, side, options={}){
   simulatedTrades.unshift({id:`${Date.now()}-${code}`, time:nowText(), side:side === 'buy' ? '买入' : '卖出', code, name:stock.name, price, quantity, amount, realizedPnl,
     entrySnapshot:side === 'buy' ? { capturedAt:new Date().toISOString(), signal:stock.marketSignal || stock.signal || stock.type,
       modelVersion:stock.recommendationModelVersion || '', technicalScore:stock.technicalScore ?? null,
-      signalScore:stock.signalScore ?? null, context:stock.recommendationContext ? JSON.parse(JSON.stringify(stock.recommendationContext)) : null,
+      signalScore:stock.signalScore ?? null, scoreCard:stock.scoreCard ? JSON.parse(JSON.stringify(stock.scoreCard)) : null,
+      context:stock.recommendationContext ? JSON.parse(JSON.stringify(stock.recommendationContext)) : null,
       labels:typeof labels === 'undefined' ? [] : labels.filter(label => label.stocks?.some(item => item.code === code)).map(label => label.name) } : null });
   simulatedTrades = simulatedTrades.slice(0, 500);
   saveState();
@@ -1027,12 +1045,16 @@ function renderPortfolioView(){
   const realizedPnl = portfolio.reduce((sum, position) => sum + (Number(position.realizedPnl) || 0), 0);
   const totalPnl = floatingPnl + realizedPnl;
   const allSelected = holdings.length > 0 && holdings.every(position => selected.has(position.code));
-  const rows = holdingMetrics.map(({stock, metrics}) => `<tr data-detail-code="${stock.code}" data-portfolio-code="${stock.code}">
+  const rows = holdingMetrics.map(({position, stock, metrics}) => {
+    const risk = portfolioRiskAssessment(position, stock, detailHistoryCache.get(stock.code));
+    return `<tr data-detail-code="${stock.code}" data-portfolio-code="${stock.code}">
     <td><input type="checkbox" data-portfolio-choice="${stock.code}" ${selected.has(stock.code) ? 'checked' : ''} /></td><td><b>${escapeHtml(stock.name)}</b><small>${stock.code}</small></td>
     <td>${metrics.quantity}股</td><td>${yuan(metrics.currentPrice)} / ${yuan(metrics.costPrice)}</td>
     <td>${money(metrics.marketValue)}</td><td class="${pctClass(metrics.floatingPnl)}"><b>${money(metrics.floatingPnl)}</b><small>${formatPct(metrics.floatingPct)}</small></td>
     <td class="${pctClass(metrics.realizedPnl)}">${money(metrics.realizedPnl)}</td><td class="${pctClass(metrics.totalPnl)}"><b>${money(metrics.totalPnl)}</b></td>
-  </tr>`).join('');
+    <td><b>${escapeHtml(risk.label)}</b><small>${escapeHtml(risk.summary)}</small></td>
+  </tr>`;
+  }).join('');
   const trades = simulatedTrades.slice(0, 20).map(trade => `<tr><td>${escapeHtml(trade.time)}</td><td>${escapeHtml(trade.name)}<small>${trade.code}</small></td><td class="${trade.side === '买入' ? 'up' : 'down'}">${trade.side}</td><td>${trade.quantity}股</td><td>${yuan(trade.price)}</td><td>${money(trade.amount)}</td><td class="${pctClass(trade.realizedPnl)}">${trade.side === '卖出' ? money(trade.realizedPnl) : '--'}</td></tr>`).join('');
   return `<section class="portfolio-view">
     <div class="portfolio-head"><div><h2>模拟持仓</h2><p>行情刷新后，持仓市值和浮动盈亏会按最新价格更新</p></div><div class="portfolio-head-actions"><button class="small" data-portfolio-refresh>刷新</button><span>${holdings.length} 只持仓</span></div></div>
@@ -1041,7 +1063,7 @@ function renderPortfolioView(){
       <div><span>持仓盈亏</span><b class="${pctClass(floatingPnl)}">${money(floatingPnl)}</b></div><div><span>已实现收益</span><b class="${pctClass(realizedPnl)}">${money(realizedPnl)}</b></div>
       <div><span>累计收益</span><b class="${pctClass(totalPnl)}">${money(totalPnl)}</b></div>
     </div>
-    ${rows ? `<div class="portfolio-batch-toolbar"><button class="small" data-portfolio-toggle>${allSelected ? '取消全选' : '全选'}</button><span>已选 ${holdings.filter(position => selected.has(position.code)).length} 只</span><label>每只买入金额<input data-portfolio-buy-amount type="number" min="100" step="100" value="10000" /></label><button class="sim-buy" data-portfolio-batch="buy">批量买入</button><label>卖出比例<select data-portfolio-sell-ratio><option value="0.25">1/4</option><option value="0.3333333333">1/3</option><option value="0.5">1/2</option><option value="1" selected>全部</option></select></label><button class="sim-sell" data-portfolio-batch="sell">批量卖出</button></div><div class="table-wrap"><table class="portfolio-table"><thead><tr><th>选</th><th>股票</th><th>持仓数量</th><th>现价 / 成本</th><th>市值</th><th>持仓盈亏</th><th>已实现</th><th>累计收益</th></tr></thead><tbody>${rows}</tbody></table></div>` : '<div class="portfolio-empty">暂无模拟持仓，可在个股详情中设置价格和金额后模拟买入。</div>'}
+    ${rows ? `<div class="portfolio-batch-toolbar"><button class="small" data-portfolio-toggle>${allSelected ? '取消全选' : '全选'}</button><span>已选 ${holdings.filter(position => selected.has(position.code)).length} 只</span><label>每只买入金额<input data-portfolio-buy-amount type="number" min="100" step="100" value="10000" /></label><button class="sim-buy" data-portfolio-batch="buy">批量买入</button><label>卖出比例<select data-portfolio-sell-ratio><option value="0.25">1/4</option><option value="0.3333333333">1/3</option><option value="0.5">1/2</option><option value="1" selected>全部</option></select></label><button class="sim-sell" data-portfolio-batch="sell">批量卖出</button></div><div class="table-wrap"><table class="portfolio-table"><thead><tr><th>选</th><th>股票</th><th>持仓数量</th><th>现价 / 成本</th><th>市值</th><th>持仓盈亏</th><th>已实现</th><th>累计收益</th><th>持仓风险</th></tr></thead><tbody>${rows}</tbody></table></div>` : '<div class="portfolio-empty">暂无模拟持仓，可在个股详情中设置价格和金额后模拟买入。</div>'}
     <div class="portfolio-trades"><h3>最近模拟成交</h3>${trades ? `<div class="table-wrap"><table><thead><tr><th>时间</th><th>股票</th><th>方向</th><th>数量</th><th>价格</th><th>金额</th><th>实现收益</th></tr></thead><tbody>${trades}</tbody></table></div>` : '<div class="portfolio-empty">暂无模拟成交记录</div>'}</div>
   </section>`;
 }
@@ -1636,6 +1658,8 @@ function renderHistoryAnalysis(s, result){
   const hasRecommendationScore = s.signalScore !== null && s.signalScore !== '' && Number.isFinite(Number(s.signalScore));
   const displayedScore = a.score;
   const scoreLabel = '当前技术评分 / 100';
+  const scoreCard = a.scoreCard || result?.investmentAnalysis?.scoreCard;
+  const scoreCardHtml = scoreCard ? `<p><b>统一评分快照：</b>技术 ${escapeHtml(scoreCard.technical ?? '--')}；推荐 ${escapeHtml(scoreCard.recommendation ?? '--')}；CANSLIM ${escapeHtml(scoreCard.canslim ?? '--')}；多因子 ${escapeHtml(scoreCard.factor ?? '--')}；数据可信度 ${escapeHtml(scoreCard.confidence ?? '--')}。<br><small>快照 ${escapeHtml(scoreCard.snapshotId || '--')}；这些分数含义不同，不相互替代。</small></p>` : '';
   const conclusion = a.combinedConclusion || a.summary;
   const displayedVerdict = a.verdict;
   const recommendationSnapshotHtml = hasRecommendationScore
@@ -1681,6 +1705,7 @@ function renderHistoryAnalysis(s, result){
       <div class="analysis-score"><b>${escapeHtml(displayedScore ?? '--')}</b><span>${scoreLabel}</span></div>
       <div><p><b>当前判断：</b>${escapeHtml(displayedVerdict || '等待确认')}</p><p>${escapeHtml(conclusion)}</p>${recommendationSnapshotHtml}</div>
     </div>
+    ${scoreCardHtml}
     ${holdingProfileHtml}
     <div class="analysis-grid">
       ${entryAssessmentHtml}
@@ -1706,7 +1731,7 @@ function renderHistoryAnalysis(s, result){
     ${investmentAnalysisHtml(result)}
     ${tradePlanHtml}
     <p><b>预计观察窗口：</b>${escapeHtml(a.entryWindow)} <b>持仓观察：</b>${escapeHtml(a.exitWindow)}</p>
-    <p><b>历史数据源：</b>${escapeHtml(a.source || result.source || '--')}；<b>最新交易日：</b>${escapeHtml(a.latestTradeDate || result.latestTradeDate || '--')}；<b>分析时间：</b>${a.analyzedAt ? escapeHtml(new Date(a.analyzedAt).toLocaleString('zh-CN', {hour12:false})) : '--'}</p>
+    <p><b>历史数据源：</b>${escapeHtml(a.source || result.source || '--')}；<b>最新交易日：</b>${escapeHtml(a.latestTradeDate || result.latestTradeDate || '--')}；<b>观察时点：</b>${escapeHtml(a.observationPhase?.label || result.observationPhase?.label || '待确认')}；<b>分析时间：</b>${a.analyzedAt ? escapeHtml(new Date(a.analyzedAt).toLocaleString('zh-CN', {hour12:false})) : '--'}</p>
     <div class="note inline-note">以上价格为历史行情、均线和波动率的条件演算，不考虑个人持仓成本、资金用途与风险承受能力，不保证触发价成交或获得收益。</div>`;
 }
 

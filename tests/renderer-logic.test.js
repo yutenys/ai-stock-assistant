@@ -172,3 +172,22 @@ test('个股分析过期缓存重新获取，强制刷新等待旧请求后发�
   assert.equal((await forced).value,2);
   assert.equal(context.detailHistoryPending.size,0);
 });
+
+test('持仓风险按原失效条件判断，不用今日推荐缺席推导卖出',()=>{
+  const context=harness(['portfolioMetrics','portfolioRiskAssessment'],{yuan:value=>`¥${value}`});
+  const position={quantity:100,costPrice:10,lastPrice:8.5,realizedPnl:0};
+  const breached=context.portfolioRiskAssessment(position,{}, {analysis:{tradeDate:'2026-09-11',tradePlan:{invalidationPrice:9}}});
+  assert.equal(breached.label,'策略失效');
+  position.lastPrice=9.5;
+  const unknown=context.portfolioRiskAssessment(position,{},null);
+  assert.equal(unknown.label,'待分析');
+  assert.match(unknown.summary,/不能用推荐缺席/);
+});
+
+test('推荐卡片优先使用统一评分快照并明确周期待确认',()=>{
+  const context=harness(['recommendationCardHtml'],{recommendationIndustry:()=>'',pctClass:()=>'',badgeClass:()=>'',
+    yuan:String,formatPct:String,escapeHtml:String,recommendationCanslimText:()=>'',recommendationFactorText:()=>''});
+  const html=context.recommendationCardHtml({code:'600001',name:'测试',signalScore:70,scoreCard:{recommendation:82},price:10});
+  assert.match(html,/推荐评分 82/);
+  assert.match(html,/周期待确认/);
+});
