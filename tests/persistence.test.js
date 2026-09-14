@@ -21,11 +21,13 @@ test('全市场任务按游标恢复、取消且不重复写已完成证券', as
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stock-job-'));
   const store = new ResearchJobStore(dir);
   await store.start({jobId:'job-1',analysisId:'a-1',tradeDate:'2026-09-14',total:3});
-  await store.recordBatch('job-1', [{code:'600001'},{code:'600002'}]);
-  await store.recordBatch('job-1', [{code:'600002'},{code:'600003'}]);
+  await store.recordBatch('job-1', [{code:'600001',factor:{code:'600001'}},{code:'600002',error:'timeout'}]);
+  await store.recordBatch('job-1', [{code:'600002',factor:{code:'600002'}},{code:'600003',error:'history missing'}]);
   let status = await store.status('job-1');
   assert.equal(status.completed, 3);
   assert.equal(status.cursor, 3);
+  assert.equal(status.valid, 2);
+  assert.equal(status.failed, 1);
   await store.cancel('job-1');
   status = await store.status('job-1');
   assert.equal(status.state, 'cancelled');

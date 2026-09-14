@@ -2106,6 +2106,7 @@ function attachStrategyPlatform(item, context = {}) {
     code:item.code,
     close:finiteNumber(item.price ?? analysis.latestPrice),
     high20:finiteNumber(analysis.breakoutPrice ?? analysis.consolidationBreakout?.boxHigh ?? item.high),
+    previousHigh20:finiteNumber(analysis.breakoutPrice ?? analysis.consolidationBreakout?.boxHigh),
     ma20:finiteNumber(analysis.ma20),
     ma30:finiteNumber(analysis.ma30),
     volumeRatio:finiteNumber(analysis.volumeRatio),
@@ -2122,7 +2123,8 @@ function attachStrategyPlatform(item, context = {}) {
   const evaluations = evaluateStrategyRegistry(factor, {
     sectorRotation:item.rotationProfiles?.find(profile => profile.confirmed || profile.qualified) || {},
     qualityScore:item.qualityScore ?? item.financialAnalysis?.quality?.score,
-    newsRisk:item.newsLabel === '消息谨慎'
+    newsRisk:item.newsLabel === '消息谨慎',
+    observationPhase:analysis.observationPhase || context.observationPhase || null
   });
   evaluations.push({
     id:'legacy-v18',
@@ -7140,6 +7142,8 @@ async function runFullMarketResearchJob(input = {}, onProgress = () => {}) {
   const snapshot = await fetchTencentMarketSnapshot();
   const tradeDate = snapshot.quotes.map(row => row.tradeDate).filter(Boolean).sort().at(-1);
   if (!tradeDate) throw new Error('全市场行情没有可用交易日');
+  const sourceObservedAt = Math.max(...snapshot.quotes.map(row => Date.parse(row.quoteObservedAt || row.fetchedAt || '') || 0));
+  const observationPhase = resolveObservationPhase(tradeDate, Date.now(), {sourceObservedAt});
   const modelKey = crypto.createHash('sha256').update(RECOMMENDATION_MODEL_VERSION).digest('hex').slice(0, 8);
   const jobId = input.jobId || `full-${tradeDate}-${modelKey}`;
   let manifest = await store.status(jobId);
@@ -7194,7 +7198,7 @@ async function runFullMarketResearchJob(input = {}, onProgress = () => {}) {
     complete:successful.length === snapshot.quotes.length
   });
   const candidates = factors.factors.map(factor => {
-    const evaluations = evaluateStrategyRegistry(factor);
+    const evaluations = evaluateStrategyRegistry(factor, {observationPhase});
     const decision = arbitrateStrategyResults(evaluations);
     return {code:factor.code, score:decision.score, status:decision.status, stage:decision.stage, horizon:decision.horizon,
       primaryStrategyId:decision.primaryStrategyId, rps20:factor.rps20, rps60:factor.rps60, rps120:factor.rps120, rps250:factor.rps250};
@@ -7226,7 +7230,7 @@ function fetchMarketOverviewInWorker(request, onProgress = () => {}) {
   marketProgressListeners.add(onProgress);
   if (!marketWorkerPending) {
     marketWorkerPending = new Promise((resolve, reject) => {
-      if (!marketWorker) marketWorker = new Worker(__filename, { workerData: { isPackaged:app.isPackaged, marketAnalysis:true } });
+      if (!marketWorker) marketWorker = new Worker(__filename, { workerData: { isPackaged:app.isPackaged, dataRoot:dataRootPath(), marketAnalysis:true } });
       const worker = marketWorker;
       const finish = (error, result) => {
         clearTimeout(timer);
@@ -7360,12 +7364,12 @@ ipcMain.handle('start-full-market-research', async (_event, request) => {
 ipcMain.handle('get-full-market-research-status', async () => fullMarketStatus || {state:'idle', completed:0, total:0});
 
 ipcMain.handle('cancel-full-market-research', async () => {
+  if (fullMarketWorker) await fullMarketWorker.terminate();
+  fullMarketWorker = null;
   if (fullMarketJobId) {
     const store = new ResearchJobStore(path.join(dataRootPath(), 'data', 'full-market-jobs'));
     try { fullMarketStatus = await store.cancel(fullMarketJobId); } catch {}
   }
-  if (fullMarketWorker) await fullMarketWorker.terminate();
-  fullMarketWorker = null;
   fullMarketStatus = {...(fullMarketStatus || {}), state:'cancelled', message:'全市场历史任务已取消，可稍后恢复'};
   appendLogLine({type:'warn', action:'full_market_research_cancel', message:'取消全市场历史任务', detail:{jobId:fullMarketJobId}});
   return fullMarketStatus;

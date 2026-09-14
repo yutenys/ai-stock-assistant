@@ -46,15 +46,24 @@ test('完整横截面生成20至250日RPS，单样本不伪造全市场RPS', () 
 test('独立策略可多重命中但裁决只给一个主状态并保留命中轨迹', () => {
   const factor = {
     code:'600001', returns:{d20:12,d60:24,d120:36,d250:50}, rps20:95,rps60:92,rps120:90,rps250:88,
-    close:12, ma20:11.2, ma30:10.9, high20:12.1, volumeRatio:1.8, drawdown20:-2, volatility20:1.8,
+    close:12, ma20:11.2, ma30:10.9, high20:12, previousHigh20:11.8, volumeRatio:1.8, drawdown20:-2, volatility20:1.8,
     dataCoverage:{history:1}
   };
-  const evaluations = evaluateStrategyRegistry(factor, {sectorRotation:{confirmed:true, score:82}, newsRisk:false});
+  const evaluations = evaluateStrategyRegistry(factor, {sectorRotation:{confirmed:true, score:82}, newsRisk:false, observationPhase:{phase:'closed'}});
   assert.ok(evaluations.filter(item => item.matched).length >= 2);
   const decision = arbitrateStrategyResults(evaluations, {hardRisk:false});
   assert.equal(decision.status, 'strict');
   assert.equal(decision.primaryStrategyId, evaluations.filter(item => item.matched).sort((a,b)=>b.score-a.score)[0].id);
   assert.equal(decision.matches.length, evaluations.filter(item => item.matched).length);
+});
+
+test('接近前高或盘中越过前高不能标记为突破确认', () => {
+  const factor = {code:'600001',returns:{d20:10,d60:20,d120:30,d250:40},rps20:95,rps60:90,rps120:80,rps250:70,
+    close:9.8,ma20:9.5,ma30:9.2,high20:10,previousHigh20:10,volumeRatio:1.8,drawdown20:-2,volatility20:2};
+  assert.equal(evaluateStrategyRegistry(factor, {observationPhase:{phase:'closed'}}).find(item => item.id === 'trend-breakout').matched, false);
+  factor.close = 10.2;
+  assert.equal(evaluateStrategyRegistry(factor, {observationPhase:{phase:'intraday'}}).find(item => item.id === 'trend-breakout').matched, false);
+  assert.equal(evaluateStrategyRegistry(factor, {observationPhase:{phase:'closed'}}).find(item => item.id === 'trend-breakout').matched, true);
 });
 
 test('硬风险覆盖策略高分，推荐和详情共享同一冻结展示模型', () => {

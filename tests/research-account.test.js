@@ -33,3 +33,14 @@ test('研究账户按最新可用报价计算真实权益和集中度', () => {
   assert.ok(marked.equity > 109000);
   assert.ok(marked.concentration.byIndustry[0].weight > .5);
 });
+
+test('研究账户部分行情缺失时保留上次有效估值并标记过期', () => {
+  let account = createResearchAccount({accountId:'r-1', initialCash:100000, rules});
+  account = executeResearchOrder(account, {side:'buy', code:'600001', price:10, quantity:5000, tradeDate:'2026-09-14'}).account;
+  account = markResearchAccount(account, [{code:'600001',price:12}], '2026-09-15');
+  const previousEquity = account.equity;
+  const marked = markResearchAccount(account, [], '2026-09-16');
+  assert.equal(marked.equity, previousEquity);
+  assert.equal(marked.positions[0].quoteStatus, 'stale');
+  assert.equal(marked.positions[0].tradeDate, '2026-09-15');
+});

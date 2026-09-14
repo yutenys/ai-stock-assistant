@@ -597,12 +597,14 @@ function renderFullMarketResearchStatus(status = {}){
   $('fullMarketResearchStatus').textContent = `${detail}${total ? ` · ${completed}/${total}` : ''}${status.historyCovered != null ? ` · 历史有效 ${status.historyCovered}` : ''}${status.failures ? ` · 缺失 ${status.failures}` : ''}`;
   $('cancelFullMarketResearch').disabled = !['starting','running'].includes(status.state);
   $('startFullMarketResearch').textContent = ['cancelled','failed'].includes(status.state) ? '恢复任务'
-    : status.state === 'completed' ? '重新采集' : status.state === 'running' ? '运行中' : '启动任务';
+    : status.state === 'completed' && Number(status.failures) > 0 ? '重试失败项'
+      : status.state === 'completed' ? '重新采集' : status.state === 'running' ? '运行中' : '启动任务';
 }
 
 async function startFullMarketResearch(){
   try{
-    const status = await window.stockApi?.startFullMarketResearch?.({force:latestFullMarketResearchStatus?.state === 'completed'});
+    const completed = latestFullMarketResearchStatus?.state === 'completed';
+    const status = await window.stockApi?.startFullMarketResearch?.({force:completed && !(Number(latestFullMarketResearchStatus?.failures) > 0)});
     renderFullMarketResearchStatus(status || {state:'starting'});
     notify('全市场历史任务已在后台启动，大盘刷新可继续使用', 'success');
   }catch(err){
@@ -1717,7 +1719,18 @@ function addOnlineStock(code){
 function findStockByCode(code){
   return stocks.find(x => x.code === code)
     || labels.flatMap(l => l.stocks || []).find(x => x.code === code)
-    || portfolioStock(portfolioPosition(code));
+    || portfolioStock(portfolioPosition(code))
+    || (() => {
+      const position = researchAccount?.positions?.find(item => item.code === code);
+      return position ? {
+        ...position,
+        code:position.code,
+        name:position.name || position.code,
+        sector:position.industry || '行业待确认',
+        type:'研究持仓', status:'持仓跟踪', focus:'研究账户',
+        price:Number(position.currentPrice ?? position.costPrice) || null
+      } : null;
+    })();
 }
 
 function analysisText(s){
