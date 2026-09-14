@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 
 const {
   createDataEnvelope,
+  detectBreakoutContext,
   buildFactorSnapshot,
   evaluateStrategyRegistry,
   arbitrateStrategyResults,
@@ -64,6 +65,28 @@ test('接近前高或盘中越过前高不能标记为突破确认', () => {
   factor.close = 10.2;
   assert.equal(evaluateStrategyRegistry(factor, {observationPhase:{phase:'intraday'}}).find(item => item.id === 'trend-breakout').matched, false);
   assert.equal(evaluateStrategyRegistry(factor, {observationPhase:{phase:'closed'}}).find(item => item.id === 'trend-breakout').matched, true);
+});
+
+test('首次回踩必须有近期放量突破且此前没有触及回踩区', () => {
+  const base = Array.from({length:25}, (_, index) => ({date:`2026-08-${String(index + 1).padStart(2, '0')}`,close:10,volume:1000}));
+  const rows = [...base,
+    {date:'2026-08-26',close:11,volume:2000},
+    {date:'2026-08-27',close:11.2,volume:1100},
+    {date:'2026-08-28',close:10.4,volume:900}
+  ];
+  const context = detectBreakoutContext(rows);
+  assert.equal(context.confirmed, true);
+  assert.equal(context.barsSinceBreakout, 2);
+  assert.equal(context.priorPullbackCount, 0);
+  const factor = {code:'600001',close:10.4,high20:11.2,ma20:10.15,ma30:10.1,volumeRatio:.9,rps60:80,breakoutContext:context};
+  const closed={observationPhase:{phase:'closed'}};
+  assert.equal(evaluateStrategyRegistry(factor,closed).find(item => item.id === 'first-pullback').matched, true);
+  assert.equal(evaluateStrategyRegistry({...factor,breakoutContext:{...context,priorPullbackCount:1}},closed)
+    .find(item => item.id === 'first-pullback').matched, false);
+  assert.equal(evaluateStrategyRegistry({...factor,breakoutContext:null},closed)
+    .find(item => item.id === 'first-pullback').matched, false);
+  assert.equal(evaluateStrategyRegistry(factor,{observationPhase:{phase:'intraday'}})
+    .find(item => item.id === 'first-pullback').matched, false);
 });
 
 test('硬风险覆盖策略高分，推荐和详情共享同一冻结展示模型', () => {

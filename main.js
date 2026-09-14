@@ -13,6 +13,7 @@ const {atomicWriteJson, readJsonWithBackup, ResearchJobStore, StockHistoryStore}
 const {createResearchAccount, executeResearchOrder, markResearchAccount} = require('./lib/research-account');
 const {
   buildFactorSnapshot,
+  detectBreakoutContext,
   evaluateStrategyRegistry,
   arbitrateStrategyResults,
   buildAnalysisViewModel,
@@ -42,7 +43,7 @@ let marketDirectorySavedAt = 0;
 const CONTROLLED_VOLUME_MIN = 1.5;
 const CONTROLLED_VOLUME_MAX = 4;
 const SECTOR_CAPITAL_FALLBACK_MAX_AGE_MS = 72 * 60 * 60 * 1000;
-const RECOMMENDATION_MODEL_VERSION = '2026-09-14-strategy-platform-v19';
+const RECOMMENDATION_MODEL_VERSION = '2026-09-14-strategy-platform-v20';
 const RESEARCH_ACCOUNT_RULES = Object.freeze({
   commissionRate:.00025,
   minimumCommission:5,
@@ -1238,7 +1239,7 @@ function assessSectorCapitalTrend(row) {
     : net <= 0 ? net5 > 0 ? '流入后退潮' : '资金持续偏弱'
       : confirmed ? '持续流入' : recovering ? '阶段回流待确认' : '当日转入待确认';
   const amount = value => value === null ? '未提供' : `${value < 0 ? '-' : '+'}${formatCapitalAmount(value)}`;
-  return {available, confirmed, weakening, phase, prior2Net, prior4Net, prior5Net,
+  return {available, confirmed, recovering, weakening, phase, prior2Net, prior4Net, prior5Net,
     scoreAdjustment:!valid ? 0 : weakening ? -12 : confirmed ? 6 : available && net > 0 ? -3 : 0,
     summary:`${phase}；真实主力净额当日${amount(net)}、3日${amount(net3)}、5日${amount(net5)}、10日${amount(net10)}；前5日${amount(prior5Net)}、近5日剔除当日${amount(prior4Net)}（滚动窗口不相加，不代表连续每日流入）`};
 }
@@ -1248,7 +1249,8 @@ function classifySectorRotationPhase(row) {
   const breadth = finiteNumber(row?.participation?.breadthScore);
   const concentration = finiteNumber(row?.participation?.topAmountShare);
   const crowded = Number(row?.changePct) >= 5 || Number(row?.mainNetPct) >= 8;
-  const concentrated = Boolean(row?.participation?.divergent) || concentration !== null && concentration >= .45;
+  const concentrated = Boolean(row?.participation?.divergent || row?.participation?.capitalConcentrated)
+    || concentration !== null && concentration >= .45;
   const phase = trend.weakening ? '退潮'
     : trend.confirmed && crowded && breadth !== null && breadth >= 65 ? '拥挤加速'
       : trend.confirmed && concentrated ? '龙头集中'
@@ -1266,7 +1268,7 @@ function classifySectorRotationPhase(row) {
     crowded,
     concentrated,
     sampleSize, sampleLimited,
-    summary:`${phase}；资金${trend.phase}${breadth === null ? '，成分广度未取得' : `，广度评分${Math.round(breadth)}`}${concentration === null ? '' : `，最大单股成交占比${(concentration * 100).toFixed(0)}%`}${sampleLimited ? `，仅${sampleSize}只成分，按小样本降置信度` : ''}`
+    summary:`${phase}；资金${trend.phase}${breadth === null ? '，成分广度未取得' : `，广度评分${Math.round(breadth)}`}${concentration === null ? '' : `，最大单股成交占比${(concentration * 100).toFixed(0)}%`}${row?.participation?.capitalConcentrated ? '，板块净流入由少数个股主导' : ''}${sampleLimited ? `，仅${sampleSize}只成分，按小样本降置信度` : ''}`
   };
 }
 
@@ -1386,10 +1388,13 @@ async function fetchSectorCapitalFlow(force = false) {
   const rankByType = type => rows.filter(item => item.boardType === type).sort((a, b) => Number(b.mainNetInflow) - Number(a.mainNetInflow));
   for (const type of ['industry', 'concept']) rankByType(type).forEach((item, index) => { item.capitalRank = index + 1; });
   const memberBoards = selectSectorMemberBoards(rows);
-  const memberResults = await settleWithConcurrency(memberBoards, 5, fetchSectorBoardMemberCodes);
+  const memberResults = await settleWithConcurrency(memberBoards, 5, board => fetchSectorBoardMemberCodes(board, force));
   memberResults.forEach((result, index) => {
     const board = memberBoards[index];
-    if (result.status === 'fulfilled') board.memberCodes = result.value;
+    if (result.status === 'fulfilled') {
+      board.memberCodes = result.value.codes;
+      board.memberCapital = result.value.capital;
+    }
     else warnings.push(`${board.name}成分获取失败：${result.reason?.message || result.reason}`);
   });
   const value = {
@@ -1426,19 +1431,47 @@ function selectSectorMemberBoards(rows, limit = 20) {
   return selected;
 }
 
-async function fetchSectorBoardMemberCodes(board) {
-  const cacheName = `sector-members-v2-${board.code}`;
-  const cached = readDiskCache(cacheName, 6 * 60 * 60 * 1000);
-  if (cached?.length) return cached;
+async function fetchSectorBoardMemberCodes(board, force = false) {
+  const cacheName = `sector-members-v3-${board.code}`;
+  const cached = force ? null : readDiskCache(cacheName, 60 * 1000);
+  if (cached?.codes?.length) return cached;
   const params = new URLSearchParams({
     pn:'1', pz:'100', po:'1', np:'1', fltt:'2', invt:'2', fid:'f3',
-    fs:`b:${board.code}`, fields:'f12', _:String(Date.now())
+    fs:`b:${board.code}`, fields:'f12,f14,f62,f184,f124', _:String(Date.now())
   });
   const response = await fetchEastmoneyListPages(params, 4000);
   const codes = [...new Set(response.rows.map(row => String(row.f12 || '').slice(-6)).filter(code => /^\d{6}$/.test(code)))];
   if (!codes.length) throw new Error(`${board.name}成分返回为空`);
-  writeDiskCache(cacheName, codes);
-  return codes;
+  const rawFlows = response.rows.map(row => ({
+    code:String(row.f12 || '').slice(-6), name:String(row.f14 || ''), mainNetInflow:finiteNumber(row.f62),
+    tradeDate:Number(row.f124) > 0 ? new Date(Number(row.f124) * 1000).toISOString().slice(0, 10) : ''
+  })).filter(row => /^\d{6}$/.test(row.code) && row.mainNetInflow !== null);
+  const tradeDate = rawFlows.map(row => row.tradeDate).filter(Boolean).sort().at(-1) || '';
+  const flows = rawFlows.filter(row => !tradeDate || row.tradeDate === tradeDate);
+  const positive = flows.filter(row => row.mainNetInflow > 0).sort((a, b) => b.mainNetInflow - a.mainNetInflow);
+  const positiveTotal = positive.reduce((sum, row) => sum + row.mainNetInflow, 0);
+  const top = positive[0] || null;
+  const boardNet = finiteNumber(board.mainNetInflow);
+  const coverage = flows.length / codes.length;
+  const dateAligned = !board.capitalTradeDate || !tradeDate || board.capitalTradeDate === tradeDate;
+  const capital = {
+    available:codes.length >= 5 && coverage >= .6 && boardNet !== null && dateAligned,
+    coverage,
+    tradeDate,
+    dateAligned,
+    observed:flows.length,
+    total:codes.length,
+    topCode:top?.code || '',
+    topName:top?.name || '',
+    topPositiveInflow:top?.mainNetInflow ?? null,
+    topPositiveShare:top && positiveTotal > 0 ? top.mainNetInflow / positiveTotal : null,
+    exLeaderNetInflow:top && boardNet !== null ? boardNet - top.mainNetInflow : null
+  };
+  capital.concentrated = Boolean(capital.available && boardNet > 0 && top
+    && (capital.topPositiveShare >= .5 || capital.exLeaderNetInflow <= 0));
+  const value = {codes, capital};
+  writeDiskCache(cacheName, value);
+  return value;
 }
 
 function sectorQuoteStats(memberCodes, marketQuotes) {
@@ -1490,9 +1523,12 @@ function mergeSectorCapitalRows(rotation, capitalRows, marketQuotes = [], tradeD
     const peerAmounts = (stats.amounts || []).filter(value => finiteNumber(value) !== null && value >= 0);
     const totalAmount = peerAmounts.reduce((sum, value) => sum + value, 0);
     const topAmountShare = totalAmount > 0 ? Math.max(...peerAmounts) / totalAmount : null;
+    const capitalConcentration = row.memberCapital?.available ? row.memberCapital : null;
+    const capitalConcentrated = Boolean(capitalConcentration?.concentrated);
     const divergent = breadthAvailable && breadthCount >= 5 && Number(stats.upRatio) < .5 && topAmountShare >= .5;
     const participation = {available:breadthAvailable, count:breadthCount, coverage, breadthScore, topAmountShare, divergent,
-      summary:breadthAvailable ? `有效成分${breadthCount}只，上涨${Math.round(Number(stats.upRatio) * breadthCount)}只${breadthCount < 5 ? '，小样本' : ''}${coverage < 1 ? `，覆盖${Math.round(coverage * 100)}%` : ''}${topAmountShare !== null ? `，最大单股成交占比${(topAmountShare * 100).toFixed(0)}%` : ''}${divergent ? '，少数个股拉动，多数成分下跌' : ''}` : '成分广度未取得，不据此确认板块扩散'};
+      capitalConcentrated, capitalConcentration,
+      summary:breadthAvailable ? `有效成分${breadthCount}只，上涨${Math.round(Number(stats.upRatio) * breadthCount)}只${breadthCount < 5 ? '，小样本' : ''}${coverage < 1 ? `，覆盖${Math.round(coverage * 100)}%` : ''}${topAmountShare !== null ? `，最大单股成交占比${(topAmountShare * 100).toFixed(0)}%` : ''}${divergent ? '，少数个股拉动，多数成分下跌' : ''}${capitalConcentrated ? `，剔除最大资金贡献股${capitalConcentration.topName || capitalConcentration.topCode || ''}后板块净额${formatCapitalAmount(capitalConcentration.exLeaderNetInflow)}，资金扩散不足` : ''}` : '成分广度未取得，不据此确认板块扩散'};
     const changePct = finiteNumber(row.changePct) ?? finiteNumber(stats.changePct) ?? 0;
     const flowRankScore = direct ? percentileScore(directValues, mainNetInflow) : Number(stats.rotationScore || 50);
     const flowRatioScore = direct && mainNetPct !== null ? clampRecommendationScore(50 + mainNetPct * 3) : 50;
@@ -1500,7 +1536,8 @@ function mergeSectorCapitalRows(rotation, capitalRows, marketQuotes = [], tradeD
     const capitalTrend = assessSectorCapitalTrend(row);
     const rotationPhase = classifySectorRotationPhase({...row,changePct,participation});
     const rotationScore = direct
-      ? clampRecommendationScore(flowRankScore * .4 + flowRatioScore * .25 + breadthScore * .2 + changeScore * .15 + capitalTrend.scoreAdjustment - (divergent ? 6 : 0))
+      ? clampRecommendationScore(flowRankScore * .4 + flowRatioScore * .25 + breadthScore * .2 + changeScore * .15 + capitalTrend.scoreAdjustment
+        - (divergent ? 6 : 0) - (capitalConcentrated ? 10 : 0))
       : Number(stats.rotationScore || 50);
     mergedByName.set(name, {
       ...stats,
@@ -1569,6 +1606,28 @@ function annotateSectorRotation(sectors, previous, tradeDate) {
   const priorByName = new Map((previous?.sectors || []).map(row=>[row.name,row]));
   return (sectors || []).map(row=>{
     const prior = priorByName.get(row.name);
+    const sameTradeDate = previous?.tradeDate === tradeDate;
+    const currentNet = !row.capitalEstimated && !row.capitalStale ? finiteNumber(row.mainNetInflow) : null;
+    const priorNet = sameTradeDate && prior && !prior.capitalEstimated && !prior.capitalStale ? finiteNumber(prior.mainNetInflow) : null;
+    const previousPeak = sameTradeDate ? finiteNumber(prior?.rotationIntraday?.peakMainNetInflow) : null;
+    const peakMainNetInflow = [currentNet, priorNet, previousPeak].filter(value => value !== null)
+      .reduce((peak, value) => Math.max(peak, value), -Infinity);
+    const intradayAvailable = currentNet !== null && Number.isFinite(peakMainNetInflow);
+    const retreatAmount = intradayAvailable ? Math.max(0, peakMainNetInflow - currentNet) : null;
+    const retreatRatio = intradayAvailable && peakMainNetInflow > 0 ? retreatAmount / peakMainNetInflow : null;
+    const retreating = Boolean(sameTradeDate && peakMainNetInflow >= 1e8 && retreatAmount >= 1e8 && retreatRatio >= .4);
+    const rotationIntraday = {
+      available:intradayAvailable,
+      peakMainNetInflow:intradayAvailable ? peakMainNetInflow : null,
+      currentMainNetInflow:currentNet,
+      retreatAmount,
+      retreatRatio,
+      retreating,
+      state:!intradayAvailable ? '盘中资金轨迹待积累' : retreating ? '盘中资金明显回撤' : '盘中资金未见明显回撤',
+      summary:!intradayAvailable ? `${row.name}缺少同交易日可比资金快照`
+        : retreating ? `${row.name}同日主力净流入从峰值${formatCapitalAmount(peakMainNetInflow)}回落至${formatCapitalAmount(currentNet)}，回撤${(retreatRatio * 100).toFixed(0)}%`
+          : `${row.name}当前主力净额${formatCapitalAmount(currentNet)}，同日资金未见明显峰值回撤`
+    };
     // Repeated intraday refreshes must not be reported as separate trading days.
     const baseline = previous?.tradeDate === tradeDate ? prior?.rotationTransition?.baseline
       : previous?.tradeDate && previous.tradeDate < tradeDate && prior ? {
@@ -1582,7 +1641,9 @@ function annotateSectorRotation(sectors, previous, tradeDate) {
     const delta = comparable ? roundMetric(row.rotationScore-baseline.score) : null;
     const state = !comparable ? '轮动持续性待验证'
       : delta >= 8 ? '较前次升温' : delta <= -8 ? '较前次降温' : '轮动相对稳定';
-    return {...row,rotationTransition:{available:comparable,baseline,delta,state,
+    return {...row, rotationIntraday,
+      rotationState:retreating ? '盘中资金回撤' : row.rotationState,
+      rotationTransition:{available:comparable,baseline,delta,state,
       summary:comparable ? `${row.name}相对${baseline.date}轮动评分变化${delta >= 0 ? '+' : ''}${delta}，${state}（非收益预测）`
         : `${row.name}缺少同口径跨交易日快照，不能仅凭单日涨幅确认持续轮动`}};
   });
@@ -1592,7 +1653,8 @@ function selectRotationPriorityCandidates(scored, sectors, options = {}) {
   const limit = Number(options.limit) || 40;
   const perSector = Number(options.perSector) || 4;
   const sectorLimit = Number(options.sectorLimit) || 5;
-  const eligibleSectors = (sectors || []).filter(item => !item.capitalStale && !assessSectorCapitalTrend(item).weakening && (item.capitalEstimated
+  const eligibleSectors = (sectors || []).filter(item => !item.capitalStale && !item.rotationIntraday?.retreating
+    && !assessSectorCapitalTrend(item).weakening && (item.capitalEstimated
     ? Number(item.rotationScore) >= 72
     : Number(item.mainNetInflow) > 0 && Number(item.mainNetPct || 0) > 0))
     .sort((a, b) => Number(a.capitalEstimated) - Number(b.capitalEstimated)
@@ -1622,7 +1684,8 @@ function selectRotationPriorityCandidates(scored, sectors, options = {}) {
 }
 
 function momentumRecommendationDecision(item) {
-  const profile = (item?.rotationProfiles || []).find(row => !row.capitalEstimated && !row.capitalStale && !assessSectorCapitalTrend(row).weakening && Number(row.mainNetInflow) > 0 && Number(row.mainNetPct) > 0);
+  const profile = (item?.rotationProfiles || []).find(row => !row.capitalEstimated && !row.capitalStale && !row.rotationIntraday?.retreating
+    && !assessSectorCapitalTrend(row).weakening && Number(row.mainNetInflow) > 0 && Number(row.mainNetPct) > 0);
   const nearHigh = Number(item?.high) > 0 ? Number(item.price) / Number(item.high) : 0;
   const changePct = Number(item?.changePct || 0);
   const volumeRatio = Number(item?.snapshotVolumeRatio ?? item?.analysis?.volumeRatio);
@@ -2113,6 +2176,7 @@ function attachStrategyPlatform(item, context = {}) {
     ma30:finiteNumber(analysis.ma30),
     volumeRatio:finiteNumber(analysis.volumeRatio),
     drawdown20:finiteNumber(analysis.pathMetrics?.drawdowns?.[20] ?? analysis.distanceToBreakout),
+    breakoutContext:analysis.breakoutContext || null,
     volatility20:finiteNumber(analysis.consolidationBreakout?.boxAmplitudePct),
     returns:{d20:finiteNumber(analysis.return20), d60:finiteNumber(analysis.return60), d120:finiteNumber(analysis.pathMetrics?.returns?.[120]), d250:finiteNumber(analysis.pathMetrics?.returns?.[250])},
     rps20:leadership,
@@ -2464,7 +2528,7 @@ function classifyMarketRegime(overview = {}, previous = null) {
   const turnover = finiteNumber(overview.turnover), previousTurnover = finiteNumber(previous?.turnover);
   const turnoverChangePct = turnover !== null && previousTurnover !== null && previousTurnover > 0
     ? (turnover / previousTurnover - 1) * 100 : null;
-  const strongSectors = (overview.sectors || []).filter(row => Number(row.changePct) >= 1.5
+  const strongSectors = (overview.sectors || []).filter(row => !row.rotationIntraday?.retreating && Number(row.changePct) >= 1.5
     && Number(row.upRatio) >= .65 && (!row.capitalStale && !row.capitalEstimated ? Number(row.mainNetInflow) > 0 : Number(row.rotationScore) >= 65));
   const limitUp = Number(overview?.limits?.upCount || 0), limitDown = Number(overview?.limits?.downCount || 0);
   const broadWeak = upRatio !== null && upRatio <= .35 || indexAverage !== null && indexAverage <= -1;
@@ -2521,12 +2585,15 @@ function applyEntryContextAssessment(analysis, { newsContext = null, riskProfile
   if (relatedSector?.rotationTransition?.summary) evidence.push(relatedSector.rotationTransition.summary);
   if (relatedSector?.capitalTrend?.available) evidence.push(relatedSector.capitalTrend.summary);
   if (relatedSector?.participation?.summary) evidence.push(relatedSector.participation.summary);
+  const sectorRetreating = Boolean(relatedSector?.rotationIntraday?.retreating);
+  if (relatedSector?.rotationIntraday?.summary) evidence.push(relatedSector.rotationIntraday.summary);
   const sectorWeak = relatedSector && !relatedSector.capitalStale && (directSectorCapital
     ? assessSectorCapitalTrend(relatedSector).weakening || Number(relatedSector.mainNetInflow) < 0 && Number(relatedSector.mainNetPct || 0) < 0
     : Number(relatedSector.rotationScore) <= 38 && Number(relatedSector.changePct) <= -2 && Number(relatedSector.upRatio) <= .3);
 
   const contextRisks = [riskProfile?.status === 'risk' ? '公司风险' : '', newsSignal === '偏谨慎' ? '个股消息风险' : '',
     marketNewsSignal === '偏谨慎' ? '大盘消息风险' : '', marketWeak ? '大盘偏弱' : '', outsideLocalizedMainline ? '局部主线外' : '', sectorWeak ? '板块退潮' : '',
+    sectorRetreating ? '板块盘中资金回撤' : '',
     usGrowthRisk ? '美股科技风险' : '', relatedSector?.participation?.divergent ? '板块少数个股拉动' : ''].filter(Boolean);
   const technicalRisk = ['破位', '爆量观察', '结构偏弱', '公司风险'].includes(entry.status);
   let entryAssessment = {
@@ -2547,6 +2614,8 @@ function applyEntryContextAssessment(analysis, { newsContext = null, riskProfile
     entryAssessment = { ...entryAssessment, allowed:false, status:'普跌环境，非局部主线', tone:'warning', summary:`${entryAssessment.summary} 当前属于${marketOverview.marketRegime.label}，该股未落在已确认局部强势板块，只保留观察。` };
   } else if (sectorWeak && !technicalRisk) {
     entryAssessment = { ...entryAssessment, allowed: false, status: '板块退潮，等待确认', tone: 'warning', summary: `${entryAssessment.summary} 所属板块当日或最近3日资金转弱，等待资金回流并核验上涨广度。` };
+  } else if (sectorRetreating && !technicalRisk) {
+    entryAssessment = { ...entryAssessment, allowed:false, status:'板块资金回撤，等待确认', tone:'warning', summary:`${entryAssessment.summary} ${relatedSector.rotationIntraday.summary}，不按盘中峰值确认主线。` };
   } else if (usGrowthRisk && !technicalRisk) {
     entryAssessment = { ...entryAssessment, allowed: false, status: '美股科技风险待确认', tone: 'warning', summary: `${entryAssessment.summary} 海外科技风险偏高，等待A股价格、量能和阶段资金重新确认。` };
   } else if (relatedSector?.participation?.divergent && !technicalRisk) {
@@ -6501,6 +6570,7 @@ function analyzeHistory(history, options = {}) {
   const phase = rising ? '震荡上行' : falling ? '下行整理' : latest.close >= ma20 ? '反弹修复' : '区间震荡';
   const direction = periodReturn >= 0 ? '上涨' : '下跌';
   const accumulationSetup = analyzeAccumulationSetup(rows);
+  const breakoutContext = detectBreakoutContext(rows);
   const consolidationBreakout = analyzeConsolidationBreakout(rows);
   const trendContinuation = analyzeTrendContinuation(rows);
   const pathMetrics = analyzePathMetrics(history);
@@ -6570,7 +6640,7 @@ function analyzeHistory(history, options = {}) {
     reboundSignal, reboundScore, reboundReason, bottomDate: bottomRow.date,
     bottomPrice: roundMetric(bottomRow.low), bottomDrawdown: roundMetric(bottomDrawdown, 1),
     reboundFromBottom: roundMetric(reboundFromBottom, 1), bottomRangePosition: roundMetric(bottomRangePosition, 1),
-    daysSinceBottom, macdImproving, shortAverageImproving, accumulationSetup, consolidationBreakout,
+    daysSinceBottom, macdImproving, shortAverageImproving, accumulationSetup, consolidationBreakout, breakoutContext,
     entryWindow: falling ? '等待趋势条件触发，通常至少观察5-15个交易日。' : '未来3-10个交易日，条件未触发则继续等待。',
     exitWindow: '入场后1-4周持续观察，价格与成交量条件优先于固定日期。'
   };

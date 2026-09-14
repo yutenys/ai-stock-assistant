@@ -354,6 +354,19 @@ test('板块单股成交集中且多数下跌应标记分化并降低轮动分',
   assert.match(context.entryAssessment.summary,/少数个股拉动/);
 });
 
+test('板块净流入被单股撑起时剔除龙头复核并降低轮动等级',()=>{
+  const quotes=Array.from({length:10},(_,i)=>({code:String(600001+i),price:10,changePct:2,amount:1e8}));
+  const base={name:'测试行业',mainNetInflow:1e8,mainNetPct:4,changePct:2,memberCodes:quotes.map(row=>row.code),
+    mainNet3:3e8,mainNet5:5e8,mainNet10:9e8};
+  const normal=mergeSectorCapitalRows({sectors:[]},[base],quotes).sectors[0];
+  const concentrated=mergeSectorCapitalRows({sectors:[]},[{...base,memberCapital:{available:true,concentrated:true,
+    coverage:1,topName:'龙头股',topPositiveShare:.8,exLeaderNetInflow:-2e7}}],quotes).sectors[0];
+  assert.equal(concentrated.participation.capitalConcentrated,true);
+  assert.ok(concentrated.rotationScore<normal.rotationScore);
+  assert.equal(concentrated.rotationPhase.phase,'龙头集中');
+  assert.match(concentrated.participation.summary,/剔除最大资金贡献股龙头股.*资金扩散不足/);
+});
+
 test('等待技术确认的股票也必须记录环境风险且关闭交易计划',()=>{
   const analysis={verdict:'可关注',tradePlan:{enabled:true},entryAssessment:{allowed:false,status:'等待确认',summary:'接近突破',evidence:[]}};
   const result=applyEntryContextAssessment(analysis,{subject:{industry:'半导体'},
@@ -411,6 +424,9 @@ test('阶段回流和当日拉升不能冒充跨阶段持续流入',()=>{
   const build=extra=>mergeSectorCapitalRows({sectors:[]},[{...row,...extra}]).sectors[0].capitalTrend;
   assert.equal(build({}).confirmed,false);
   assert.match(build({}).phase,/阶段回流/);
+  assert.equal(build({}).recovering,true);
+  const recoveringSector=mergeSectorCapitalRows({sectors:[]},[{...row,name:'回流行业'}]).sectors[0];
+  assert.equal(recoveringSector.rotationPhase.phase,'试探回流');
   assert.equal(build({mainNet10:10e8}).confirmed,true);
   assert.equal(build({mainNet10:10e8,mainNet3:.5e8}).confirmed,false);
   assert.equal(build({mainNet3:-1e8,mainNetPct3:-5,capitalStale:true}).weakening,false);
@@ -693,6 +709,21 @@ test('轮动对照使用跨交易日同口径基线而非重复刷新', () => {
   assert.equal(again[0].rotationTransition.delta,20);
   assert.equal(annotateSectorRotation(current,null,'2026-09-04')[0].rotationTransition.available,false);
   assert.equal(annotateSectorRotation([{...current[0],capitalEstimated:false}],old,'2026-09-04')[0].rotationTransition.available,false);
+});
+
+test('同交易日资金从峰值明显回撤时不再作为轮动主线确认',()=>{
+  const previous={tradeDate:'2026-09-14',sectors:[{name:'元件',rotationScore:82,changePct:3,
+    mainNetInflow:10e8,mainNetPct:4,capitalEstimated:false,capitalStale:false}]};
+  const sector=annotateSectorRotation([{name:'元件',rotationScore:68,changePct:2,upRatio:.7,
+    mainNetInflow:2e8,mainNetPct:1,capitalEstimated:false,capitalStale:false}],previous,'2026-09-14')[0];
+  assert.equal(sector.rotationIntraday.retreating,true);
+  assert.equal(sector.rotationIntraday.retreatRatio,.8);
+  assert.equal(sector.rotationState,'盘中资金回撤');
+  assert.deepEqual(selectRotationPriorityCandidates([{code:'600001',industry:'元件',price:10,high:10,changePct:2,amount:1e8}],[sector]),[]);
+  const analysis=applyEntryContextAssessment({verdict:'可关注',tradePlan:{enabled:true},entryAssessment:{allowed:true,status:'可关注',summary:'技术确认'}},
+    {subject:{industry:'元件',rotationProfiles:[sector]},marketOverview:{sectors:[sector]}});
+  assert.equal(analysis.entryAssessment.allowed,false);
+  assert.ok(analysis.entryAssessment.contextRisks.includes('板块盘中资金回撤'));
 });
 
 test('趋势延续区分多日站稳、单日拉升和持续下跌', () => {
