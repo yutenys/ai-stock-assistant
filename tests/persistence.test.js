@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const {atomicWriteJson, readJsonWithBackup, ResearchJobStore} = require('../lib/persistence');
+const {atomicWriteJson, readJsonWithBackup, ResearchJobStore, StockHistoryStore} = require('../lib/persistence');
 
 test('原子JSON保存保留上一版备份且可在主文件损坏后恢复', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stock-state-'));
@@ -47,4 +47,21 @@ test('全市场任务按游标恢复、取消且不重复写已完成证券', as
   const resumed = await store.resume('job-1');
   assert.equal(resumed.state, 'running');
   assert.equal(resumed.completed, 3);
+});
+
+test('股票历史仓库按交易日增量合并、覆盖同日快照并限制长度', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stock-history-'));
+  const store = new StockHistoryStore(dir, 3);
+  await store.merge('600001', [
+    {date:'2026-09-10',close:10}, {date:'2026-09-11',close:11}, {date:'2026-09-12',close:12}
+  ], {source:'full', fullRefresh:true});
+  const result = await store.merge('600001', [
+    {date:'2026-09-12',close:12.5}, {date:'2026-09-14',close:13}
+  ], {source:'incremental',tradeDate:'2026-09-14'});
+  assert.deepEqual(result.bars.map(row => [row.date,row.close]), [
+    ['2026-09-11',11],['2026-09-12',12.5],['2026-09-14',13]
+  ]);
+  assert.equal(result.lastDate,'2026-09-14');
+  assert.ok(result.fullFetchedAt);
+  await assert.rejects(() => store.read('../bad'), /股票代码无效/);
 });

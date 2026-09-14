@@ -92,17 +92,26 @@ function safeHttpUrl(value){
   }
 }
 
-function saveState(){
+async function saveState({successMessage = ''} = {}){
   const state = {schemaVersion:2, updatedAt:new Date().toISOString(), labels, activeLabel, labelSorts, portfolio, simulatedTrades};
+  let browserSaved = false;
   try{
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-    addLog('info', '已保存本地数据');
+    browserSaved = true;
   }catch(err){
     addLog('error', `保存本地数据失败：${err.message || err}`);
   }
-  window.stockApi?.saveUserState?.(state).then(result => {
-    if(result?.ok === false) notify(`本地数据文件保存失败：${result.error || '请检查磁盘权限'}`, 'error');
-  }).catch(err => notify(`本地数据文件保存失败：${err.message || err}`, 'error'));
+  try{
+    if(!window.stockApi?.saveUserState) throw new Error('持久化接口不可用');
+    const result = await window.stockApi.saveUserState(state);
+    if(result?.ok !== true) throw new Error(result?.error || '请检查磁盘权限');
+    addLog('info', '本地数据文件已确认保存');
+    if(successMessage) notify(successMessage, 'success');
+    return {ok:true, browserSaved, file:result.file || ''};
+  }catch(err){
+    notify(`本地数据文件保存失败：${err.message || err}${browserSaved ? '；当前操作仅保留在浏览器缓存' : ''}`, 'error');
+    return {ok:false, browserSaved, error:err.message || String(err)};
+  }
 }
 
 function favoriteOutcomeRows(){
@@ -602,10 +611,23 @@ function renderFullMarketResearchStatus(status = {}){
       : status.state === 'completed' ? '重新采集' : status.state === 'running' ? '运行中' : '启动任务';
 }
 
+function fullMarketResearchPriorityCodes(){
+  return [...new Set([
+    ...labels.flatMap(label => (label.stocks || []).map(stock => stock.code)),
+    ...portfolio.map(position => position.code),
+    ...latestMarketRecommendations.map(stock => stock.code),
+    ...latestMarketWatchRecommendations.map(stock => stock.code),
+    ...latestMarketMomentumRecommendations.map(stock => stock.code)
+  ].map(String).filter(code => /^\d{6}$/.test(code)))];
+}
+
 async function startFullMarketResearch(){
   try{
     const completed = latestFullMarketResearchStatus?.state === 'completed';
-    const status = await window.stockApi?.startFullMarketResearch?.({force:completed && !(Number(latestFullMarketResearchStatus?.failures) > 0)});
+    const status = await window.stockApi?.startFullMarketResearch?.({
+      force:completed && !(Number(latestFullMarketResearchStatus?.failures) > 0),
+      priorityCodes:fullMarketResearchPriorityCodes()
+    });
     renderFullMarketResearchStatus(status || {state:'starting'});
     notify('全市场历史任务已在后台启动，大盘刷新可继续使用', 'success');
   }catch(err){
@@ -716,10 +738,9 @@ function saveMarketRecommendations(){
     return {...label, stocks:[...byCode.values()]};
   });
   activeLabel ||= [...targetLabels][0];
-  saveState();
+  saveState({successMessage:`已将 ${selectedStocks.length} 只推荐股添加到 ${targetLabels.size} 个标签`});
   renderLabels();
   closeMarketLabelPanel();
-  notify(`已将 ${selectedStocks.length} 只推荐股添加到 ${targetLabels.size} 个标签`, 'success');
 }
 function pctClass(v){ return Number(v) >= 0 ? 'up' : 'down'; }
 function checked(code){ return selected.has(code) ? 'checked' : ''; }
@@ -961,9 +982,8 @@ function executeSimulatedTrade(code, side, options={}){
       signalScore:stock.signalScore ?? null, scoreCard:stock.scoreCard ? JSON.parse(JSON.stringify(stock.scoreCard)) : null,
       context:stock.recommendationContext ? JSON.parse(JSON.stringify(stock.recommendationContext)) : null,
       labels:typeof labels === 'undefined' ? [] : labels.filter(label => label.stocks?.some(item => item.code === code)).map(label => label.name) } : null });
-  saveState();
+  saveState({successMessage:options.quiet ? '' : `模拟${side === 'buy' ? '买入' : '卖出'}成功：${stock.name} ${quantity}股，成交金额${money(amount)}`});
   addLog('action', `模拟${side === 'buy' ? '买入' : '卖出'}成交`, {code, name:stock.name, price, quantity, amount, realizedPnl});
-  if(!options.quiet) notify(`模拟${side === 'buy' ? '买入' : '卖出'}成功：${stock.name} ${quantity}股，成交金额${money(amount)}`, 'success');
   if(options.render !== false) renderStocks();
   return true;
 }
@@ -1306,7 +1326,8 @@ function executePortfolioBatch(side){
     if(executeSimulatedTrade(position.code, side, {price, amount, quantity, quiet:true, render:false})) completed += 1;
   });
   selected = new Set([...selected].filter(code => Number(portfolioPosition(code)?.quantity) > 0));
-  notify(`批量${side === 'buy' ? '买入' : '卖出'}完成：${completed}/${targets.length} 只`, completed ? 'success' : 'warn');
+  if(completed) saveState({successMessage:`批量${side === 'buy' ? '买入' : '卖出'}完成：${completed}/${targets.length} 只`});
+  else notify(`批量${side === 'buy' ? '买入' : '卖出'}未成交`, 'warn');
   renderStocks();
 }
 
@@ -1484,12 +1505,11 @@ function finishLabelEditing(){
       delete labelSorts[oldName];
     }
     activeLabel = newName;
-    notify(`标签已重命名为「${newName}」`, 'success');
+    saveState({successMessage:`标签已重命名为「${newName}」`});
   }
   labelEditMode = false;
   labelNameDraft = '';
   selected.clear();
-  saveState();
   renderStocks();
 }
 
@@ -1558,8 +1578,7 @@ function renderLabels(){
     selected.clear();
     labelEditMode = false;
     labelNameDraft = '';
-    notify(`已删除标签「${name}」`, 'success');
-    saveState();
+    saveState({successMessage:`已删除标签「${name}」`});
     renderStocks();
     setTimeout(() => {
       window.focus();
@@ -1598,8 +1617,7 @@ function togglePinnedLabelStock(){
   const stock = label?.stocks.find(item => item.code === code);
   if(!stock) return closeLabelStockMenu();
   stock.pinned = !stock.pinned;
-  notify(`${stock.name} 已${stock.pinned ? '置顶' : '取消置顶'}`, 'success');
-  saveState();
+  saveState({successMessage:`${stock.name} 已${stock.pinned ? '置顶' : '取消置顶'}`});
   closeLabelStockMenu();
   renderLabels();
 }
@@ -1611,8 +1629,7 @@ function removeContextLabelStock(){
   if(!stock) return closeLabelStockMenu();
   label.stocks = label.stocks.filter(item => item.code !== code);
   selected.delete(code);
-  notify(`已从标签「${label.name}」删除 ${stock.name}`, 'success');
-  saveState();
+  saveState({successMessage:`已从标签「${label.name}」删除 ${stock.name}`});
   closeLabelStockMenu();
   renderLabels();
 }
@@ -1658,8 +1675,7 @@ function saveStockLabels(){
     return {...label, stocks: [...withoutStock, savedStock]};
   });
   if(!activeLabel && labels.length) activeLabel = labels[0].name;
-  notify(`已保存 ${stock.name} 的标签`, 'success');
-  saveState();
+  saveState({successMessage:`已保存 ${stock.name} 的标签`});
   closeStockLabelPanel();
   renderStocks();
 }
@@ -1709,8 +1725,7 @@ function addOnlineStock(code){
   const stock = defaultStockFromSearch(item);
   stocks.push(stock);
   currentViewSource = 'search';
-  notify(`已添加 ${stock.name} ${stock.code} 到股票池`, 'success');
-  saveState();
+  saveState({successMessage:`已添加 ${stock.name} ${stock.code} 到股票池`});
   selected = new Set([code]);
   activeDetailCode = code;
   renderStocks();
@@ -3191,8 +3206,8 @@ $('confirmAdd').onclick = () => {
   }else{
     labels.push({name, stocks:picked.map(stock => labelStockSnapshot(stock))});
   }
-  notify(`已将 ${picked.length} 只股票增量添加到标签「${name}」`, 'success');
-  activeLabel = name; selected.clear(); $('addPanel').classList.add('hidden'); saveState(); renderStocks(); $('searchInput').focus();
+  activeLabel = name; selected.clear(); $('addPanel').classList.add('hidden');
+  saveState({successMessage:`已将 ${picked.length} 只股票增量添加到标签「${name}」`}); renderStocks(); $('searchInput').focus();
 };
 $('cardView').onclick = () => { view='card'; renderStocks(); };
 $('tableView').onclick = () => { view='table'; renderStocks(); };
@@ -3208,8 +3223,7 @@ $('deleteSelectedFromLabel').onclick = () => {
   if(!labelEditMode || !hasSelectedInLabel) return;
   labels = labels.map(l => l.name === activeLabel ? {...l, stocks:l.stocks.filter(s => !selected.has(s.code))} : l);
   selected.clear();
-  notify(`已从标签「${activeLabel}」删除选中股票`, 'success');
-  saveState();
+  saveState({successMessage:`已从标签「${activeLabel}」删除选中股票`});
   renderStocks();
 };
 if($('clearLogs')){

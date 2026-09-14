@@ -9,7 +9,7 @@ const http = require('http');
 const https = require('https');
 const { TextDecoder } = require('util');
 const crypto = require('crypto');
-const {atomicWriteJson, readJsonWithBackup, ResearchJobStore} = require('./lib/persistence');
+const {atomicWriteJson, readJsonWithBackup, ResearchJobStore, StockHistoryStore} = require('./lib/persistence');
 const {createResearchAccount, executeResearchOrder, markResearchAccount} = require('./lib/research-account');
 const {
   buildFactorSnapshot,
@@ -287,7 +287,9 @@ const industryFallbacks = {
 };
 
 function dataRootPath() {
- if (!isMainThread && workerData?.dataRoot) return workerData.dataRoot;
+  if (!isMainThread && workerData?.dataRoot) return workerData.dataRoot;
+  const override = String(process.env.STOCK_ASSISTANT_DATA_ROOT || '').trim();
+  if (override && path.isAbsolute(override)) return path.resolve(override);
   if (!app.isPackaged) return __dirname;
   try {
     return app.getPath?.('userData') || path.dirname(process.execPath);
@@ -7139,6 +7141,7 @@ ipcMain.handle('fetch-stock-fund-flow', async (_event, request) => {
 async function runFullMarketResearchJob(input = {}, onProgress = () => {}) {
   const root = path.join(dataRootPath(), 'data', 'full-market-jobs');
   const store = new ResearchJobStore(root);
+  const historyStore = new StockHistoryStore(path.join(dataRootPath(), 'data', 'market-history'));
   const snapshot = await fetchTencentMarketSnapshot();
   const tradeDate = snapshot.quotes.map(row => row.tradeDate).filter(Boolean).sort().at(-1);
   if (!tradeDate) throw new Error('全市场行情没有可用交易日');
@@ -7161,7 +7164,13 @@ async function runFullMarketResearchJob(input = {}, onProgress = () => {}) {
   }
   const existing = await store.readResults(jobId);
   const completedCodes = new Set(existing.filter(item => item.factor).map(item => item.code));
-  const remaining = snapshot.quotes.filter(item => !completedCodes.has(item.code));
+  const priorityCodes = new Map((input.priorityCodes || []).filter(code => /^\d{6}$/.test(String(code)))
+    .map((code, index) => [String(code), index]));
+  const remaining = snapshot.quotes.filter(item => !completedCodes.has(item.code)).sort((left, right) => {
+    const leftPriority = priorityCodes.has(left.code) ? priorityCodes.get(left.code) : Number.MAX_SAFE_INTEGER;
+    const rightPriority = priorityCodes.has(right.code) ? priorityCodes.get(right.code) : Number.MAX_SAFE_INTEGER;
+    return leftPriority - rightPriority || left.code.localeCompare(right.code);
+  });
   onProgress({...manifest, stage:'history', message:`全市场历史任务：已完成 ${existing.length}/${snapshot.quotes.length}`});
   for (let offset = 0; offset < remaining.length; offset += 20) {
     const current = await store.status(jobId);
@@ -7169,17 +7178,35 @@ async function runFullMarketResearchJob(input = {}, onProgress = () => {}) {
     const batch = remaining.slice(offset, offset + 20);
     const settled = await settleWithConcurrency(batch, 6, async quote => {
       try {
-        let history;
-        try {
-          history = await fetchTencentHistory(quote.code, 320);
-        } catch {
-          history = await fetchSinaHistory(quote.code, 320);
+        const stored = await historyStore.read(quote.code);
+        const fullRefreshAge = Date.now() - Date.parse(stored?.fullFetchedAt || '');
+        const fullRefresh = !stored?.bars?.length || !stored?.fullFetchedAt
+          || !Number.isFinite(fullRefreshAge) || fullRefreshAge > 30 * 24 * 60 * 60 * 1000;
+        let fetched = [];
+        if (fullRefresh || stored?.lastDate !== tradeDate) {
+          const days = fullRefresh ? 320 : 30;
+          try {
+            fetched = await fetchTencentHistory(quote.code, days);
+          } catch (tencentError) {
+            try {
+              fetched = await fetchSinaHistory(quote.code, days);
+            } catch (sinaError) {
+              if (!stored?.bars?.length) throw new Error(`${tencentError.message || tencentError}；${sinaError.message || sinaError}`);
+            }
+          }
         }
-        history = mergeQuoteIntoHistory(history, quote);
-        const factor = buildFactorSnapshot([{code:quote.code, history}], {universeSize:1}).factors[0];
+        const history = mergeQuoteIntoHistory(fetched.length ? fetched : stored?.bars || [], quote);
+        const completedFullRefresh = fullRefresh && fetched.length > 0;
+        const saved = await historyStore.merge(quote.code, history, {
+          source:fetched.length ? '腾讯/新浪前复权日线' : stored?.source || '本地增量历史',
+          tradeDate,
+          fullRefresh:completedFullRefresh
+        });
+        const factor = buildFactorSnapshot([{code:quote.code, history:saved.bars}], {universeSize:1}).factors[0];
         if (!factor || factor.dataCoverage.bars < 60) throw new Error(`历史样本不足：${factor?.dataCoverage?.bars || 0}`);
         delete factor.history;
-        return {code:quote.code, name:quote.name, tradeDate, factor};
+        return {code:quote.code, name:quote.name, tradeDate, factor,
+          historyMode:completedFullRefresh ? 'full' : fetched.length ? 'incremental' : 'cached'};
       } catch (error) {
         return {code:quote.code, name:quote.name, tradeDate, error:error.message || String(error)};
       }
@@ -7522,6 +7549,7 @@ app.on('window-all-closed', () => {
 });
 
 module.exports = {
+  dataRootPath,
   dataCenterRows,
   emF10Code,
   normalizeEastmoneyFundFlow,

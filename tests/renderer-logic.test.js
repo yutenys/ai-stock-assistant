@@ -17,6 +17,26 @@ function harness(names, values={}) {
   return context;
 }
 
+test('保存成功提示等待磁盘回执，失败时不误报成功',async()=>{
+  const notices=[];
+  let complete;
+  const context=harness(['saveState'],{
+    STORAGE_KEY:'test-state',labels:[],activeLabel:'',labelSorts:{},portfolio:[],simulatedTrades:[],
+    localStorage:{setItem(){}},addLog(){},notify:(message,type)=>notices.push({message,type}),
+    window:{stockApi:{saveUserState:()=>new Promise(resolve=>{complete=resolve;})}}
+  });
+  const pending=context.saveState({successMessage:'标签保存成功'});
+  assert.equal(notices.length,0);
+  complete({ok:true,file:'state.json'});
+  assert.equal((await pending).ok,true);
+  assert.deepEqual(notices,[{message:'标签保存成功',type:'success'}]);
+  context.window.stockApi.saveUserState=async()=>({ok:false,error:'disk full'});
+  const failed=await context.saveState({successMessage:'不应出现'});
+  assert.equal(failed.ok,false);
+  assert.equal(notices.some(item=>item.message==='不应出现'),false);
+  assert.match(notices.at(-1).message,/disk full/);
+});
+
 test('环境观察卡片使用观察评分并展示当前环境限制',()=>{
   const context=harness(['recommendationCardHtml'],{recommendationIndustry:()=>'',pctClass:()=>'',badgeClass:()=>'',
     yuan:String,formatPct:String,escapeHtml:String,recommendationCanslimText:()=>'',recommendationFactorText:()=>''});
@@ -41,6 +61,17 @@ test('推荐首屏按行业选代表股，不让行业分组截断遮蔽其他�
   assert.equal(items.length,13);
   assert.equal(context.recommendationPreview([...items,items[0]],20).length,13);
   assert.equal(context.recommendationPreview([],10).length,0);
+});
+
+test('全市场后台任务优先处理收藏、持仓和当前推荐且去重',()=>{
+  const context=harness(['fullMarketResearchPriorityCodes'],{
+    labels:[{stocks:[{code:'600001'},{code:'600002'}]}],
+    portfolio:[{code:'600002'},{code:'600003'}],
+    latestMarketRecommendations:[{code:'600004'}],
+    latestMarketWatchRecommendations:[{code:'bad'}],
+    latestMarketMomentumRecommendations:[{code:'600001'},{code:'600005'}]
+  });
+  assert.deepEqual([...context.fullMarketResearchPriorityCodes()],['600001','600002','600003','600004','600005']);
 });
 
 test('推荐集中度按完整名单和共同轮动主题统计，不把首屏分散当作风险分散',()=>{

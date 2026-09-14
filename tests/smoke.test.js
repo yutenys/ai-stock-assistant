@@ -24,6 +24,7 @@ Module._load = function(request, parent, isMain) {
 };
 
 const {
+  dataRootPath,
   RECOMMENDATION_MODEL_VERSION,
   finiteNumber,
   requestText,
@@ -123,6 +124,20 @@ const {
 const {selectSectorMemberBoards, mergeFundFlowSnapshot} = require('../main.js');
 const {normalizeEastmoneyFundFlow, summarizeEastmoneyFundHistory, formatBusinessProducts, mapDataCenterCompanyProfile, emF10Code, dataCenterRows} = require('../main.js');
 Module._load = originalLoad;
+
+test('显式绝对数据根目录覆盖开发和测试默认路径', () => {
+  const previous = process.env.STOCK_ASSISTANT_DATA_ROOT;
+  const explicitRoot = path.resolve(__dirname, '.temporary-data-root');
+  try {
+    process.env.STOCK_ASSISTANT_DATA_ROOT = explicitRoot;
+    assert.equal(dataRootPath(), explicitRoot);
+    process.env.STOCK_ASSISTANT_DATA_ROOT = 'relative-path-is-not-accepted';
+    assert.equal(dataRootPath(), path.resolve(__dirname, '..'));
+  } finally {
+    if (previous === undefined) delete process.env.STOCK_ASSISTANT_DATA_ROOT;
+    else process.env.STOCK_ASSISTANT_DATA_ROOT = previous;
+  }
+});
 
 test('统一时点区分盘中、收盘和旧交易日', () => {
   const intraday = Date.parse('2026-09-14T02:30:00.000Z');
