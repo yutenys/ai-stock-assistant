@@ -4307,7 +4307,7 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
       watchQualified: groupedRecommendations.filter(item => ['观察候选','环境观察'].includes(item.recommendationTier)).length,
       outcomeFeedback: recommendationOutcomeMetadata(outcomeProfile),
       modelVersion: RECOMMENDATION_MODEL_VERSION,
-      strategyExperiment:{mode:'shadow',evaluated:strategyExperimentRows.length,matches:strategyMatches,statuses:strategyStatuses},
+      strategyExperiment:{mode:'shadow',published:strategyExperimentRows.length,matches:strategyMatches,statuses:strategyStatuses},
       snapshotId,
       observationPhase,
       marketRegime:marketAssessmentContext.marketRegime,

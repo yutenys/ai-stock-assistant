@@ -392,8 +392,9 @@ function renderMarketOverview(result){
   };
   const experimentMatches = Object.entries(experiment.matches || {}).sort((a,b) => b[1] - a[1])
     .map(([id,count]) => `${strategyNames[id] || id} ${count}`).join(' · ');
-  $('strategyExperimentSummary').textContent = experiment.evaluated != null
-    ? `${coverage.modelVersion || '当前模型'} · 影子模式 · 已评估 ${experiment.evaluated} 条${experimentMatches ? ` · ${experimentMatches}` : ' · 暂无策略命中'}；命中数不是收益率。`
+  const experimentPublished = experiment.published ?? experiment.evaluated;
+  $('strategyExperimentSummary').textContent = experimentPublished != null
+    ? `${coverage.modelVersion || '当前模型'} · 影子模式 · 已发布 ${experimentPublished} 条${experimentMatches ? ` · ${experimentMatches}` : ' · 暂无策略命中'}；命中数不是收益率。`
     : '本轮尚无可发布的策略实验摘要。';
   const fallbackNote = coverage.cachedFallback ? `；沿用${coverage.cachedAt ? new Date(coverage.cachedAt).toLocaleString('zh-CN', {hour12:false}) : '最近一次'}成功推荐` : '';
   const signals = recommendations.reduce((counts, item) => {
@@ -869,6 +870,7 @@ async function executeResearchTrade(code, side){
     });
     researchAccount = result?.account || researchAccount;
     if(!result?.ok) throw new Error(result?.reason || result?.error || '委托被拒绝');
+    await loadResearchAccount(true);
     notify(`研究账户${side === 'buy' ? '买入' : '卖出'}成交：${stock.name} ${quantity}股`, 'success');
     renderStocks();
   }catch(error){

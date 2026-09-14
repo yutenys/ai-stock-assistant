@@ -17,6 +17,19 @@ test('原子JSON保存保留上一版备份且可在主文件损坏后恢复', a
   assert.equal(restored.recoveredFromBackup, true);
 });
 
+test('损坏的主文件不会覆盖上一版有效备份', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stock-backup-'));
+  const file = path.join(dir, 'state.json');
+  await atomicWriteJson(file, {version:1});
+  await atomicWriteJson(file, {version:2});
+  fs.writeFileSync(file, '{broken', 'utf8');
+  await atomicWriteJson(file, {version:3});
+  fs.writeFileSync(file, '{broken-again', 'utf8');
+  const restored = await readJsonWithBackup(file);
+  assert.equal(restored.value.version, 1);
+  assert.equal(restored.recoveredFromBackup, true);
+});
+
 test('全市场任务按游标恢复、取消且不重复写已完成证券', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stock-job-'));
   const store = new ResearchJobStore(dir);
