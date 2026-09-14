@@ -459,3 +459,11 @@ R2依赖顺序：状态与身份契约 → 持久化/后台任务 → 全市场�
 [S2]: https://github.com/sngyai/Sequoia-X/blob/444c0db69ff36b46ef2b22ab265051d60c16029d/sequoia_x/strategy/turtle_trade.py
 [S3]: https://github.com/sngyai/Sequoia-X/blob/444c0db69ff36b46ef2b22ab265051d60c16029d/sequoia_x/strategy/rps_breakout.py
 [S4]: https://github.com/sngyai/Sequoia-X/blob/444c0db69ff36b46ef2b22ab265051d60c16029d/sequoia_x/strategy/limit_up_shakeout.py
+
+## 17. R2.1落地状态（2026-09-14）
+
+代码版本 `2026-09-14-strategy-platform-v19` 已完成方案中的工程闭环：数据状态契约、内容快照身份、收盘最终性校验、原子持久化与备份、可恢复全市场后台任务、20/60/120/250日横截面因子、独立策略注册表、统一风险裁决、三池展示、冻结保存快照、消息首次发现生命周期、用户数据迁移、证据约束AI入口、现金受限回放和独立研究账户。
+
+全市场历史任务与大盘快速刷新分离；任务失败股票会在恢复时重试。后台结果未补齐资金、消息和未来风险时只发布到观察候选，不能进入严格推荐。旧模拟持仓保持原口径，研究账户单独记录费用、T+1、现金、持仓、成交和拒绝原因。
+
+“全部落地”指设计中的软件能力和确定性测试已实现，不代表收益目标已被验证。依赖跨市场周期的冻结信号、历史新闻和当时可见财务数据的样本外收益验收仍只能随时间积累；当前不得用少量收藏或单日行情声称策略有效。

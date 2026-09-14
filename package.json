@@ -5,7 +5,7 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "test": "node --test tests/smoke.test.js tests/renderer-logic.test.js tests/strategy-replay.test.js",
+    "test": "node --test tests/smoke.test.js tests/renderer-logic.test.js tests/strategy-replay.test.js tests/strategy-platform.test.js tests/persistence.test.js tests/research-account.test.js",
     "test:ui": "electron tests/ui-smoke.js",
     "pack": "electron-builder --dir",
     "dist": "npm version patch --no-git-tag-version && electron-builder --win portable"
@@ -27,7 +27,8 @@
       "preload.js",
       "index.html",
       "renderer.js",
-      "styles.css"
+      "styles.css",
+      "lib/**/*"
     ],
     "win": {
       "target": [

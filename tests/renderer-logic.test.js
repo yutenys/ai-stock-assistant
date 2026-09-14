@@ -191,3 +191,48 @@ test('推荐卡片优先使用统一评分快照并明确周期待确认',()=>{
   assert.match(html,/推荐评分 82/);
   assert.match(html,/周期待确认/);
 });
+
+test('新版模拟交易不再静默截断500条历史记录',()=>{
+  const position={code:'600001',quantity:100,costPrice:10,realizedPnl:0};
+  const history=Array.from({length:500},(_,index)=>({id:String(index)}));
+  const context=harness(['executeSimulatedTrade'],{
+    portfolio:[position],simulatedTrades:history,findStockByCode:()=>({code:'600001',name:'测试',price:10}),labels:[],
+    portfolioPosition:()=>position,document:{querySelector:()=>null},nowText:()=>'',money:String
+  });
+  assert.equal(context.executeSimulatedTrade('600001','buy',{price:10,amount:1000,quiet:true,render:false}),true);
+  assert.equal(context.simulatedTrades.length,501);
+});
+
+test('推荐结果严格、观察、强势三池互斥且不截断',()=>{
+  const context=harness(['marketRecommendationPools']);
+  const stable=[
+    {code:'1',recommendationTier:'严格推荐'},
+    {code:'2',recommendationTier:'观察候选'},
+    {code:'3',recommendationTier:'环境观察'}
+  ];
+  const momentum=[{code:'4',recommendationTier:'强势追踪'}];
+  const pools=context.marketRecommendationPools(stable,momentum);
+  assert.deepEqual(pools.strict.map(item=>item.code),['1']);
+  assert.deepEqual(pools.watch.map(item=>item.code),['2','3']);
+  assert.equal(pools.momentum.map(item=>item.code).join(','),'4');
+});
+
+test('打开一键保存后冻结分析版本和股票内容',()=>{
+  const context=harness(['createMarketSaveSnapshot']);
+  const rows=[{code:'600001',price:10,analysisId:'a-1',scoreCard:{recommendation:80}}];
+  const frozen=context.createMarketSaveSnapshot('strict',rows,'a-1');
+  rows[0].price=11;
+  rows[0].scoreCard.recommendation=60;
+  assert.equal(frozen.track,'strict');
+  assert.equal(frozen.analysisId,'a-1');
+  assert.equal(frozen.rows[0].price,10);
+  assert.equal(frozen.rows[0].scoreCard.recommendation,80);
+});
+
+test('标签状态在盘中越过突破位时不能显示已突破',()=>{
+  const context=harness(['updateStatusByQuote'],{detailHistoryCache:new Map([['600001',{analysis:{
+    breakoutPrice:10,score:80,ma5:10.8,ma10:10.5,ma20:10.2,ma30:10,return5:2,volumeRatio:2,
+    observationPhase:{phase:'intraday',label:'盘中快照'}
+  }}]])});
+  assert.equal(context.updateStatusByQuote({code:'600001',price:10.5}),'盘中突破，等待收盘确认');
+});

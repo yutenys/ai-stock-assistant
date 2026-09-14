@@ -47,18 +47,29 @@
         <section class="market-section"><h3>涨跌停</h3><div id="marketLimits"></div></section>
         <section class="market-section market-recommendation-section">
           <div class="market-recommendation-tabs" role="tablist" aria-label="推荐方案切换">
-            <button id="marketStableTab" class="market-recommendation-tab active" role="tab" aria-selected="true" aria-controls="marketStablePanel">方案A · 稳健轮动 <span id="marketStableCount">0</span></button>
-            <button id="marketMomentumTab" class="market-recommendation-tab" role="tab" aria-selected="false" aria-controls="marketMomentumPanel">方案B · 强势追踪 <span id="marketMomentumCount">0</span></button>
+            <button id="marketStableTab" class="market-recommendation-tab active" role="tab" aria-selected="true" aria-controls="marketStablePanel">严格推荐 <span id="marketStableCount">0</span></button>
+            <button id="marketWatchTab" class="market-recommendation-tab" role="tab" aria-selected="false" aria-controls="marketWatchPanel">观察候选 <span id="marketWatchCount">0</span></button>
+            <button id="marketMomentumTab" class="market-recommendation-tab" role="tab" aria-selected="false" aria-controls="marketMomentumPanel">强势追踪 <span id="marketMomentumCount">0</span></button>
           </div>
           <div id="marketStablePanel" role="tabpanel" aria-labelledby="marketStableTab">
             <div class="market-section-title"><h3>稳健轮动推荐</h3><button id="addMarketRecommendations" class="small">查看更多</button></div>
             <div id="marketRecommendationCoverage" class="market-coverage"></div><div id="marketRecommendations"></div>
+          </div>
+          <div id="marketWatchPanel" class="hidden" role="tabpanel" aria-labelledby="marketWatchTab">
+            <div class="market-section-title"><h3>观察候选</h3><button id="addMarketWatchRecommendations" class="small">查看更多</button></div>
+            <div id="marketWatchCoverage" class="market-coverage"></div><div id="marketWatchRecommendations"></div>
           </div>
           <div id="marketMomentumPanel" class="hidden" role="tabpanel" aria-labelledby="marketMomentumTab">
             <div class="market-section-title"><h3>强势追踪推荐</h3><button id="addMarketMomentumRecommendations" class="small">查看更多</button></div>
             <div id="marketMomentumCoverage" class="market-coverage"></div><div id="marketMomentumRecommendations"></div>
           </div>
         </section>
+        <section class="market-section full-market-research">
+          <div class="market-section-title"><h3>全市场历史任务</h3><div><button id="startFullMarketResearch" class="small">启动 / 恢复</button><button id="cancelFullMarketResearch" class="small" disabled>取消</button></div></div>
+          <div id="fullMarketResearchStatus" class="market-coverage">尚未启动；任务在后台运行，不阻塞大盘刷新。</div>
+          <progress id="fullMarketResearchProgress" max="1" value="0"></progress>
+        </section>
+        <section class="market-section strategy-experiment"><h3>策略影子实验</h3><div id="strategyExperimentSummary" class="market-coverage">等待本轮策略评估。</div></section>
         <section class="market-section"><h3>市场消息</h3><div id="marketNews"></div></section>
         <div id="marketError" class="note inline-note hidden"></div>
       </aside>
@@ -124,6 +135,7 @@
               </div>
             </div>
             <div class="market-label-toolbar"><b id="marketRecommendationListTitle">推荐股票</b><button id="toggleMarketStocks" class="small">取消全选</button></div>
+            <div id="marketSaveSnapshotMeta" class="market-coverage"></div>
             <div id="marketStockChoices" class="market-stock-choices"></div>
           </div>
         </div>

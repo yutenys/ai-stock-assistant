@@ -2,6 +2,11 @@ const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
 const os = require('os');
 
+process.on('unhandledRejection', error => {
+  console.error(error?.stack || error);
+  app.exit(1);
+});
+
 app.setPath('userData', path.join(os.tmpdir(), `ai-stock-assistant-ui-smoke-${process.pid}`));
 app.disableHardwareAcceleration();
 
@@ -13,7 +18,22 @@ app.whenReady().then(async () => {
   let newsRequestCount = 0;
   let historyRequestCount = 0;
   let liveNewsRequestCount = 0;
+  let savedUserState = null;
+  let researchAccount = null;
   ipcMain.handle('append-operation-log', async () => true);
+  ipcMain.handle('load-user-state', async () => ({value:savedUserState,recoveredFromBackup:false}));
+  ipcMain.handle('save-user-state', async (_event, state) => { savedUserState = state; return {ok:true}; });
+  ipcMain.handle('load-research-account', async () => ({value:researchAccount,recoveredFromBackup:false}));
+  ipcMain.handle('create-research-account', async (_event, request) => {
+    researchAccount = {accountId:'ui-test',initialCash:Number(request.initialCash),cash:Number(request.initialCash),positions:[],orders:[],fills:[],realizedPnl:0,rules:{commissionRate:.00025,minimumCommission:5,stampDutyRate:.0005,transferFeeRate:.00001,lotSize:100,tPlusOne:true}};
+    return {ok:true,account:researchAccount};
+  });
+  ipcMain.handle('execute-research-order', async () => ({ok:false,error:'UI测试未执行研究委托',account:researchAccount}));
+  ipcMain.handle('mark-research-account', async () => ({ok:true,account:researchAccount}));
+  ipcMain.handle('get-full-market-research-status', async () => ({state:'idle',completed:0,total:0}));
+  ipcMain.handle('start-full-market-research', async () => ({state:'running',completed:0,total:5000}));
+  ipcMain.handle('cancel-full-market-research', async () => ({state:'cancelled',completed:0,total:5000}));
+  ipcMain.handle('search-a-share-stocks', async () => []);
   ipcMain.handle('run-industry-workflow', async () => ({
     subject: '中药',
     stocks: [{ code: '603567', name: '珍宝岛', sector: '线上搜索', type: '待观察', status: '已突破', focus: '搜索添加', holdingPeriod:'短线', reason: '测试数据', news: '等待刷新' }],
@@ -240,7 +260,10 @@ app.whenReady().then(async () => {
     }
   });
   win.webContents.on('console-message', (_event, level, message) => {
-    if (level >= 2 && !message.includes('No handler registered')) errors.push(message);
+    if (level >= 2 && !message.includes('No handler registered')) {
+      errors.push(message);
+      console.error(`[renderer] ${message}`);
+    }
   });
   await win.loadFile(path.join(__dirname, '..', 'index.html'));
   await win.webContents.executeJavaScript(`localStorage.clear(); location.reload()`);
@@ -764,12 +787,14 @@ app.whenReady().then(async () => {
     }));
     const recommendations = [...make('A',6,'证券'),...make('B',3,'多元金融'),...make('C',3,'银行'),...make('D',1,'电力')];
     renderMarketOverview({...previous,recommendations});
-    const codes = [...document.querySelectorAll('#marketRecommendations [data-market-recommendation]')].map(node => node.dataset.marketRecommendation);
+    document.getElementById('marketWatchTab').click();
+    const codes = [...document.querySelectorAll('#marketWatchRecommendations [data-market-recommendation]')].map(node => node.dataset.marketRecommendation);
     if(codes.length !== 10 || !codes.includes('D0')) throw new Error('Representative preview omitted an eligible industry');
     if(!document.getElementById('marketRecommendationCoverage').textContent.includes('证券 6/13')) throw new Error('Concentration must use the full list');
-    document.getElementById('addMarketRecommendations').click();
+    document.getElementById('addMarketWatchRecommendations').click();
     if(document.querySelectorAll('[data-market-stock-choice]').length !== 13) throw new Error('Full recommendation list lost candidates');
     document.getElementById('closeMarketLabelPanel').click();
+    document.getElementById('marketStableTab').click();
     renderMarketOverview(previous);
   })()`);
   const backToTopState = await win.webContents.executeJavaScript(`(async () => {
@@ -963,7 +988,7 @@ app.whenReady().then(async () => {
     && state.marketBatchLabelState.momentumModal.count === 1
     && JSON.stringify(state.marketBatchLabelState.momentumModal.codes) === JSON.stringify(['603151'])
     && JSON.stringify(state.marketBatchLabelState.momentumSavedCodes) === JSON.stringify(['603151'])
-    && /方案B[\s\S]*1 只/.test(state.marketBatchLabelState.momentumModal.title)
+    && /强势追踪股票[\s\S]*1 只/.test(state.marketBatchLabelState.momentumModal.title)
     && state.marketBatchLabelState.choiceCount === 13
     && state.marketBatchLabelState.labelsAboveStocks
     && state.marketBatchLabelState.recommendationTitle.includes('13 只')

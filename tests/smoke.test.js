@@ -34,9 +34,11 @@ const {
   mapSinaFinancialData,
   buildFinancialAnalysis,
   buildIndividualInvestmentAnalysis,
+  attachStrategyPlatform,
   splitDataCenterFinancialRows,
   buildCanslimFromFactors,
   buildRecommendationFactorContext,
+  buildDetailFactorAnalysis,
   buildIndustryRotationFromQuotes,
   normalizeSectorCapitalRows,
   eastmoneyListRows,
@@ -45,6 +47,9 @@ const {
   tencentQuoteObservedAt,
   marketQuoteContentSignature,
   resolveObservationPhase,
+  crossSectionPercentile,
+  buildAiEvidencePrompt,
+  validateAiExplanation,
   marketSnapshotId,
   classifyMarketRegime,
   buildStrategyScoreCard,
@@ -66,6 +71,7 @@ const {
   mergeRecommendationOutcomeQuotes,
   mergeRecommendationOutcomeBenchmarks,
   summarizeRecommendationOutcomes,
+  recommendationOutcomeMetadata,
   assessRecommendationHorizons,
   recommendationDataConfidence,
   weightedRecommendationScore,
@@ -102,6 +108,7 @@ const {
   analyzeCapitalWindows,
   analyzePathMetrics,
   selectFullMarketScreening,
+  buildBackgroundWatchRecommendations,
   assessBreakoutQuality,
   assessReboundQuality,
   annotateSectorRotation,
@@ -121,13 +128,39 @@ test('统一时点区分盘中、收盘和旧交易日', () => {
   const intraday = Date.parse('2026-09-14T02:30:00.000Z');
   assert.equal(chinaClockParts(intraday).date, '2026-09-14');
   assert.equal(resolveObservationPhase('2026-09-14', intraday).phase, 'intraday');
-  assert.equal(resolveObservationPhase('2026-09-14', Date.parse('2026-09-14T07:10:00.000Z')).phase, 'closed');
+  assert.equal(resolveObservationPhase('2026-09-14', Date.parse('2026-09-14T07:10:00.000Z')).phase, 'unknown');
+  assert.equal(resolveObservationPhase('2026-09-14', Date.parse('2026-09-14T07:10:00.000Z'), {isFinalBar:true}).phase, 'closed');
   assert.equal(resolveObservationPhase('2026-09-14', Date.parse('2026-09-14T07:10:00.000Z'), {isFinalBar:false}).phase, 'intraday');
   assert.equal(resolveObservationPhase('2026-09-14', Date.parse('2026-09-14T07:10:00.000Z'), {sourceObservedAt:Date.parse('2026-09-14T06:55:00.000Z')}).phase, 'intraday');
   assert.equal(resolveObservationPhase('2026-09-11', intraday).phase, 'closed');
   const snapshot=marketSnapshotId({tradeDate:'2026-09-14',observedAt:intraday,universe:5900,source:'test'});
   assert.match(snapshot, /^2026-09-14-/);
   assert.notEqual(snapshot, marketSnapshotId({tradeDate:'2026-09-14',observedAt:intraday+1,universe:5900,source:'test'}));
+});
+
+test('横截面百分位按平均秩处理并拒绝不足样本', () => {
+  assert.equal(crossSectionPercentile([10], 10), null);
+  assert.equal(crossSectionPercentile([10, 10, 10], 10), 50);
+  assert.equal(crossSectionPercentile([1, 2, 2, 4], 2), 50);
+  assert.equal(crossSectionPercentile([1, 2, 3, 4], 4), 100);
+});
+
+test('AI解释只能引用当前快照的证据编号', () => {
+  const prompt = buildAiEvidencePrompt({code:'600001',analysisId:'a-1',evidence:[{id:'E1',text:'近20日上涨5%'},{id:'E2',text:'主力净流入'}]});
+  assert.match(prompt,/a-1/);
+  assert.match(prompt,/E1/);
+  assert.equal(validateAiExplanation('趋势偏强 [E1]，资金确认 [E2]。',['E1','E2']).valid,true);
+  assert.equal(validateAiExplanation('目标价20元 [E9]。',['E1','E2']).valid,false);
+});
+
+test('统一策略附加不依赖资讯函数的局部变量', () => {
+  const result = attachStrategyPlatform({
+    code:'600001', price:10, signalScore:68, reason:'趋势改善',
+    analysis:{latestPrice:10, ma20:9.5, ma30:9.2, breakoutPrice:10.2, volumeRatio:1.8, return20:6, return60:12}
+  }, {snapshotId:'snapshot-1'});
+  assert.equal(result.analysisId, 'snapshot-1');
+  assert.ok(Array.isArray(result.strategyEvaluations));
+  assert.ok(result.strategyDecision);
 });
 
 test('腾讯行情原始时间参与收盘判断与快照内容身份', () => {
@@ -1137,7 +1170,7 @@ test('大盘推荐多因子只使用可验证数据并按板块聚合', () => {
 });
 
 test('大盘推荐在风险接口失败但没有已核验风险时降分保留候选', () => {
-  const item = { code: '600001', score: 80, signalScore: 80, reason: '待突破。' };
+  const item = { code: '600001', score: 80, signalScore: 80, reason: '待突破。', scoreCard:{recommendation:80,snapshotId:'snap-risk'} };
   const unverified = evaluateRecommendationRisk(item, {
     status: 'unknown', summary: '限售解禁数据未确认',
     st: { status: 'clear' }, reduction: { status: 'clear' }, unlock: { status: 'unknown' },
@@ -1145,6 +1178,8 @@ test('大盘推荐在风险接口失败但没有已核验风险时降分保留�
   });
   assert.equal(unverified.status, 'unverified');
   assert.equal(unverified.item.signalScore, 72);
+  assert.equal(unverified.item.scoreCard.recommendation, 72);
+  assert.equal(unverified.item.scoreCard.snapshotId, 'snap-risk');
   assert.equal(unverified.item.riskUnverified, true);
   assert.match(unverified.item.reason, /限售解禁数据未确认/);
 
@@ -1158,6 +1193,37 @@ test('大盘推荐在风险接口失败但没有已核验风险时降分保留�
   });
   assert.equal(allUnknown.status, 'unverified');
   assert.equal(allUnknown.item.signalScore, 66);
+});
+
+test('后台全市场结果可发布超过160只观察候选且不冒充严格推荐', () => {
+  const tradeDate='2026-09-14';
+  const scored=Array.from({length:220},(_,index)=>({code:String(600000+index),name:`测试${index}`,industry:`行业${index%12}`,price:10,changePct:1,amount:1e8}));
+  const screening={tradeDate,generatedAt:'2026-09-14T07:00:00.000Z',modelVersion:RECOMMENDATION_MODEL_VERSION,analysisId:'full-1',
+    complete:true,historyCovered:220,universe:220,candidates:scored.map((item,index)=>({code:item.code,status:index%3?'watch':'strict',score:70,stage:'接近突破',horizon:'波段',rps20:80}))};
+  const rows=buildBackgroundWatchRecommendations(scored,screening,tradeDate,Date.parse('2026-09-14T08:00:00.000Z'));
+  assert.equal(rows.length,220);
+  assert.ok(rows.every(item=>item.recommendationTier==='观察候选' && item.entryAssessment.allowed===false));
+});
+
+test('详情多因子评分独立于CANSLIM且缺失项不按中性满配', () => {
+  const factor = buildDetailFactorAnalysis({score:82,return20:8,return60:18,volumeRatio:1.8,ma20:10,ma30:9.5,latestPrice:11},
+    {available:true,estimated:false,stale:false,mainNetInflow:1e8,netRatio:2}, {rotationScore:76});
+  assert.ok(factor.available >= 4);
+  assert.ok(factor.score >= 70);
+  const missing = buildDetailFactorAnalysis({}, null, null);
+  assert.equal(missing.score, null);
+  assert.equal(missing.available, 0);
+});
+
+test('收藏反馈为空时仍保留稳定签名供缓存复用', () => {
+  const profile = summarizeRecommendationOutcomes([{
+    code:'600001', label:'历史收藏', outcomeOrigin:'favorite', favoriteBasePrice:10,
+    price:11, favoriteAddedAt:'2026-09-01T00:00:00.000Z'
+  }], {now:Date.parse('2026-09-10T00:00:00.000Z')});
+  const metadata = recommendationOutcomeMetadata(profile);
+  assert.equal(metadata.sampleSize, 0);
+  assert.equal(metadata.excludedCount, 1);
+  assert.equal(metadata.signature, profile.signature);
 });
 
 test('本轮大盘推荐为空时保留最近成功推荐并刷新行情', () => {

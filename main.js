@@ -9,6 +9,15 @@ const http = require('http');
 const https = require('https');
 const { TextDecoder } = require('util');
 const crypto = require('crypto');
+const {atomicWriteJson, readJsonWithBackup, ResearchJobStore} = require('./lib/persistence');
+const {createResearchAccount, executeResearchOrder, markResearchAccount} = require('./lib/research-account');
+const {
+  buildFactorSnapshot,
+  evaluateStrategyRegistry,
+  arbitrateStrategyResults,
+  buildAnalysisViewModel,
+  mergeEventLifecycle
+} = require('./lib/strategy-platform');
 
 const quoteCache = new Map();
 const companyProfileCache = new Map();
@@ -21,6 +30,8 @@ const stockFundFlowHistoryCache = new Map();
 const stockRiskCache = new Map();
 const marketNewsCache = new Map();
 const marketHistoryCache = new Map();
+const newsLifecycleCache = new Map();
+let newsLifecycleLoaded = false;
 let marketOverviewCache = null;
 let stockDirectoryCache = null;
 let stockDirectoryFetchedAt = 0;
@@ -31,7 +42,17 @@ let marketDirectorySavedAt = 0;
 const CONTROLLED_VOLUME_MIN = 1.5;
 const CONTROLLED_VOLUME_MAX = 4;
 const SECTOR_CAPITAL_FALLBACK_MAX_AGE_MS = 72 * 60 * 60 * 1000;
-const RECOMMENDATION_MODEL_VERSION = '2026-09-13-p0-integrity-v18';
+const RECOMMENDATION_MODEL_VERSION = '2026-09-14-strategy-platform-v19';
+const RESEARCH_ACCOUNT_RULES = Object.freeze({
+  commissionRate:.00025,
+  minimumCommission:5,
+  stampDutyRate:.0005,
+  transferFeeRate:.00001,
+  lotSize:100,
+  tPlusOne:true,
+  effectiveFrom:'2023-08-28',
+  source:'研究回放默认费用假设，使用前需按实际券商与交易所规则复核'
+});
 
 function isControlledVolumeExpansion(value) {
   const ratio = Number(value);
@@ -265,22 +286,35 @@ const industryFallbacks = {
   ]
 };
 
+function dataRootPath() {
+ if (!isMainThread && workerData?.dataRoot) return workerData.dataRoot;
+  if (!app.isPackaged) return __dirname;
+  try {
+    return app.getPath?.('userData') || path.dirname(process.execPath);
+  } catch {
+    return path.dirname(process.execPath);
+  }
+}
+
 function logFilePath() {
   const date = new Date().toLocaleDateString('en-CA');
-  const baseDir = app.isPackaged ? path.dirname(process.execPath) : __dirname;
-  return path.join(baseDir, 'logs', `${date}.log`);
+  return path.join(dataRootPath(), 'logs', `${date}.log`);
 }
 
 function cacheFilePath(name) {
-  const baseDir = app.isPackaged ? path.dirname(process.execPath) : __dirname;
-  return path.join(baseDir, 'cache', `${name}.json`);
+  return path.join(dataRootPath(), 'cache', `${name}.json`);
 }
 
 function readDiskCache(name, maxAgeMs = 7 * 24 * 60 * 60 * 1000) {
   try {
     const file = cacheFilePath(name);
     if (!fs.existsSync(file)) return null;
-    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    let parsed;
+    try {
+      parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch {
+      parsed = JSON.parse(fs.readFileSync(`${file}.bak`, 'utf8'));
+    }
     if (!parsed?.savedAt || Date.now() - parsed.savedAt > maxAgeMs) return null;
     return parsed.data || null;
   } catch {
@@ -290,8 +324,9 @@ function readDiskCache(name, maxAgeMs = 7 * 24 * 60 * 60 * 1000) {
 
 function writeDiskCache(name, data) {
   const file = cacheFilePath(name);
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.promises.writeFile(file, JSON.stringify({ savedAt: Date.now(), data }, null, 2), 'utf8').catch(() => {});
+  atomicWriteJson(file, { savedAt: Date.now(), data }).catch(error => {
+    appendLogLine({type:'error', action:'disk_cache_write_failed', message:`缓存写入失败：${name}`, stack:error.stack || String(error)});
+  });
 }
 
 function appendLogLine(entry) {
@@ -308,8 +343,7 @@ function appendLogLine(entry) {
 function appendRecommendationLedger(result) {
   const date = new Date(result?.fetchedAt || Date.now());
   const month = Number.isFinite(date.getTime()) ? date.toLocaleDateString('en-CA').slice(0, 7) : new Date().toLocaleDateString('en-CA').slice(0, 7);
-  const baseDir = app.isPackaged ? path.dirname(process.execPath) : __dirname;
-  const file = path.join(baseDir, 'data', 'recommendation-ledger', `${month}.jsonl`);
+  const file = path.join(dataRootPath(), 'data', 'recommendation-ledger', `${month}.jsonl`);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.promises.appendFile(file, `${JSON.stringify(buildRecommendationLedgerEntry(result))}\n`, 'utf8').catch(error => {
     appendLogLine({type:'error', action:'recommendation_ledger_failed', message:'推荐账本写入失败', stack:error.stack || String(error)});
@@ -462,8 +496,44 @@ function resolveObservationPhase(tradeDate, observedAt = Date.now(), { sourceObs
   const clockClosed = minutes >= 15 * 60;
   const sourceStillIntraday = sourceMinutes !== null && sourceMinutes < 15 * 60;
   const phase = minutes < 9 * 60 + 15 ? 'preopen'
-    : !clockClosed || isFinalBar === false || sourceStillIntraday ? 'intraday' : 'closed';
-  return {phase, label:phase === 'preopen' ? '开盘前' : phase === 'intraday' ? '盘中快照' : '当日收盘', tradeDate:date, observedAt:new Date(observedAt).toISOString()};
+    : !clockClosed || isFinalBar === false || sourceStillIntraday ? 'intraday'
+      : isFinalBar === true || sourceMinutes !== null ? 'closed' : 'unknown';
+  const label = phase === 'preopen' ? '开盘前'
+    : phase === 'intraday' ? '盘中快照'
+      : phase === 'closed' ? '当日收盘' : '收盘待确认';
+  return {phase, label, tradeDate:date, observedAt:new Date(observedAt).toISOString()};
+}
+
+function buildAiEvidencePrompt({code = '', analysisId = '', evidence = []} = {}) {
+  const rows = (evidence || []).filter(item => item?.id && item?.text).map(item => `[${item.id}] ${item.text}`);
+  return `股票代码：${code}\n分析快照：${analysisId}\n证据：\n${rows.join('\n')}\n\n请只依据以上证据解释趋势、资金、消息冲突和条件化风险。每个判断必须引用证据编号，不给保证性结论或确定目标价。`;
+}
+
+function validateAiExplanation(text, evidenceIds = []) {
+  const allowed = new Set(evidenceIds.map(String));
+  const references = [...String(text || '').matchAll(/\[([^\]]+)\]/g)].map(match => match[1]);
+  const unsupported = references.filter(id => !allowed.has(id));
+  return {valid:Boolean(String(text || '').trim()) && references.length > 0 && unsupported.length === 0, references, unsupported};
+}
+
+function postJson(url, body, headers = {}, timeout = 30000) {
+  return new Promise((resolve, reject) => {
+    const target = new URL(url);
+    if (target.protocol !== 'https:') return reject(new Error('AI服务地址必须使用 HTTPS'));
+    const payload = Buffer.from(JSON.stringify(body));
+    const req = https.request(target, {method:'POST', timeout, headers:{'Content-Type':'application/json','Content-Length':payload.length,...headers}}, response => {
+      const chunks = [];
+      response.on('data', chunk => chunks.push(chunk));
+      response.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        if (response.statusCode < 200 || response.statusCode >= 300) return reject(new Error(`AI服务 HTTP ${response.statusCode}：${text.slice(0, 200)}`));
+        try { resolve(JSON.parse(text)); } catch { reject(new Error('AI服务返回非 JSON 数据')); }
+      });
+    });
+    req.on('timeout', () => req.destroy(new Error('AI解释请求超时')));
+    req.on('error', reject);
+    req.end(payload);
+  });
 }
 
 function marketSnapshotId({tradeDate = '', observedAt = Date.now(), universe = 0, source = '', contentSignature = '', configVersion = RECOMMENDATION_MODEL_VERSION} = {}) {
@@ -1642,7 +1712,7 @@ function summarizeNews(news, sinceDate = '', options = {}) {
     ['亏损', 1.2], ['下滑', 1], ['风险', .6]
   ];
   const seen = new Set();
-  const normalized = sortNewsNewestFirst(news || []).filter(item => {
+  let normalized = sortNewsNewestFirst(news || []).filter(item => {
     if (options.scope === 'market' && !isMarketWideNews(item)) return false;
     const timestamp = newsTimestamp(item?.publishedAt);
     if (timestamp > now || since && timestamp < since) return false;
@@ -1685,6 +1755,18 @@ function summarizeNews(news, sinceDate = '', options = {}) {
       positiveTerms: positive.map(([term]) => term), negativeTerms: negative.map(([term]) => term)
     };
   });
+  const lifecycleKey = String(options.lifecycleKey || '');
+  if (lifecycleKey) {
+    if (!newsLifecycleLoaded) {
+      const saved = readDiskCache('news-event-lifecycle', 365 * 24 * 60 * 60 * 1000) || {};
+      Object.entries(saved).forEach(([key, rows]) => newsLifecycleCache.set(key, Array.isArray(rows) ? rows : []));
+      newsLifecycleLoaded = true;
+    }
+    const incoming = normalized.map(({eventId:ignoredId, firstSeenAt:ignoredFirstSeen, ...item}) => item);
+    normalized = mergeEventLifecycle(newsLifecycleCache.get(lifecycleKey) || [], incoming, fetchedAt).slice(0, 50);
+    newsLifecycleCache.set(lifecycleKey, normalized);
+    writeDiskCache('news-event-lifecycle', Object.fromEntries(newsLifecycleCache));
+  }
   const items = normalized.slice(0, 6);
   const relevantItems = normalized.filter(item => item.relevance >= .5);
   const rawScore = relevantItems.reduce((sum, item) => sum + item.weightedScore, 0);
@@ -1849,6 +1931,17 @@ function percentileScore(values, value) {
   return clampRecommendationScore((below / valid.length) * 100);
 }
 
+function crossSectionPercentile(values, value) {
+  const valid = values.map(finiteNumber).filter(item => item !== null).sort((a, b) => a - b);
+  const numericValue = finiteNumber(value);
+  if (valid.length < 2 || numericValue === null) return null;
+  if (valid[0] === valid.at(-1)) return 50;
+  const below = valid.filter(item => item < numericValue).length;
+  const equal = valid.filter(item => item === numericValue).length;
+  const averageRank = below + (Math.max(1, equal) + 1) / 2;
+  return clampRecommendationScore(((averageRank - 1) / (valid.length - 1)) * 100);
+}
+
 function resolveRecommendationIndustry(item, directoryByCode = null) {
   const code = String(item?.code || '').slice(-6);
   const candidates = [
@@ -1977,7 +2070,10 @@ function buildRecommendationLedgerEntry(result) {
     holdingPeriod:item.holdingPeriod, holdingDays:item.holdingProfile?.days,
     dataConfidence:item.dataConfidence, entryStatus:item.entryAssessment?.status,
     price:item.price, tradeDate:item.analysis?.tradeDate || result?.tradeDate || '',
-    scoreCard:item.scoreCard || null, context:item.recommendationContext || null
+    analysisId:item.analysisId || item.scoreCard?.snapshotId || '',
+    scoreCard:item.scoreCard || null, context:item.recommendationContext || null,
+    strategyDecision:item.strategyDecision || null,
+    strategyEvaluations:item.strategyEvaluations || []
   });
   return {
     schemaVersion:1,
@@ -2001,6 +2097,50 @@ function attachRecommendationMetadata(item) {
     holdingPeriod:holdingProfile.primary
   };
   return {...result, scoreCard:buildStrategyScoreCard(result)};
+}
+
+function attachStrategyPlatform(item, context = {}) {
+  const analysis = item.analysis || {};
+  const leadership = finiteNumber(item.factorAnalysis?.factors?.leadership?.score);
+  const factor = {
+    code:item.code,
+    close:finiteNumber(item.price ?? analysis.latestPrice),
+    high20:finiteNumber(analysis.breakoutPrice ?? analysis.consolidationBreakout?.boxHigh ?? item.high),
+    ma20:finiteNumber(analysis.ma20),
+    ma30:finiteNumber(analysis.ma30),
+    volumeRatio:finiteNumber(analysis.volumeRatio),
+    drawdown20:finiteNumber(analysis.pathMetrics?.drawdowns?.[20] ?? analysis.distanceToBreakout),
+    volatility20:finiteNumber(analysis.consolidationBreakout?.boxAmplitudePct),
+    returns:{d20:finiteNumber(analysis.return20), d60:finiteNumber(analysis.return60), d120:finiteNumber(analysis.pathMetrics?.returns?.[120]), d250:finiteNumber(analysis.pathMetrics?.returns?.[250])},
+    rps20:leadership,
+    rps60:leadership,
+    rps120:leadership,
+    rps250:leadership,
+    rpsScope:'current-candidate-sample',
+    dataCoverage:{history:Number(analysis.historyCoverage || 0)}
+  };
+  const evaluations = evaluateStrategyRegistry(factor, {
+    sectorRotation:item.rotationProfiles?.find(profile => profile.confirmed || profile.qualified) || {},
+    qualityScore:item.qualityScore ?? item.financialAnalysis?.quality?.score,
+    newsRisk:item.newsLabel === '消息谨慎'
+  });
+  evaluations.push({
+    id:'legacy-v18',
+    matched:true,
+    score:clampRecommendationScore(item.signalScore ?? item.score),
+    stage:item.signal || item.entryAssessment?.status || '待确认',
+    horizon:item.holdingPeriod || item.holdingProfile?.primary || '周期待确认',
+    reasons:[item.reason || item.entryAssessment?.summary || '现有策略通过'],
+    evidenceIds:['legacy-analysis']
+  });
+  const decision = arbitrateStrategyResults(evaluations, {
+    hardRisk:item.riskProfile?.status === 'risk',
+    hardRiskReason:item.riskProfile?.summary,
+    marketRisk:context.marketRegime?.riskOff || item.recommendationTier === '环境观察'
+  });
+  const analysisId = item.scoreCard?.snapshotId || item.recommendationContext?.snapshotId || context.snapshotId || '';
+  const result = {...item, analysisId, strategyEvaluations:evaluations, strategyDecision:decision};
+  return {...result, analysisViewModel:buildAnalysisViewModel(result, {decision, evaluations})};
 }
 
 function recommendationIndustryGroupKey(item, directoryByCode = null) {
@@ -2039,6 +2179,40 @@ function buildRecommendationFactorContext(items) {
     }];
   }));
   return { breadth: { up, down, ratio: breadthRatio }, marketScore, sectorProfiles };
+}
+
+function buildDetailFactorAnalysis(analysis = {}, fundFlow = null, sector = null) {
+  const factors = [];
+  const add = (key, score, evidence) => {
+    const value = finiteNumber(score);
+    if (value !== null) factors.push({key, score:clampRecommendationScore(value), evidence});
+  };
+  add('technical', analysis.score, `技术评分${analysis.score}`);
+  if (finiteNumber(analysis.return20) !== null || finiteNumber(analysis.return60) !== null) {
+    add('momentum', 50 + Number(analysis.return20 || 0) * 1.2 + Number(analysis.return60 || 0) * .5,
+      `近20日${signedPercent(analysis.return20)}，近60日${signedPercent(analysis.return60)}`);
+  }
+  if (finiteNumber(analysis.latestPrice) !== null && finiteNumber(analysis.ma20) !== null && finiteNumber(analysis.ma30) !== null) {
+    add('trend', analysis.latestPrice >= analysis.ma20 && analysis.ma20 >= analysis.ma30 ? 82 : analysis.latestPrice >= analysis.ma30 ? 58 : 28,
+      `现价${analysis.latestPrice}，MA20 ${analysis.ma20}，MA30 ${analysis.ma30}`);
+  }
+  if (finiteNumber(analysis.volumeRatio) !== null) {
+    add('volume', isControlledVolumeExpansion(analysis.volumeRatio) ? 82 : isExplosiveVolume(analysis.volumeRatio) ? 25 : 52,
+      `量比${analysis.volumeRatio}`);
+  }
+  if (fundFlow?.available && !fundFlow.estimated && !fundFlow.stale && finiteNumber(fundFlow.mainNetInflow) !== null) {
+    add('capital', Number(fundFlow.mainNetInflow) > 0 ? 72 + Math.min(18, Math.max(0, Number(fundFlow.netRatio || 0) * 3)) : 28,
+      `阶段主力净额${fundFlow.mainNetInflow}`);
+  }
+  if (finiteNumber(sector?.rotationScore) !== null) add('sectorRotation', sector.rotationScore, `板块轮动评分${sector.rotationScore}`);
+  return {
+    score:factors.length ? clampRecommendationScore(average(factors.map(item => item.score))) : null,
+    available:factors.length,
+    total:6,
+    missing:['technical','momentum','trend','volume','capital','sectorRotation'].filter(key => !factors.some(item => item.key === key)),
+    factors,
+    scope:'当前个股快照多因子；缺失项不计分'
+  };
 }
 
 function formatCapitalAmount(value) {
@@ -2859,6 +3033,29 @@ function summarizeRecommendationOutcomes(rows, { now = Date.now(), minimumAgeDay
   return profile;
 }
 
+function recommendationOutcomeMetadata(profile) {
+  if (!profile) return null;
+  return {
+    sampleSize: profile.sampleSize,
+    attributedCount: profile.attributedCount,
+    unattributedCount: profile.unattributedCount,
+    excludedCount: profile.excludedCount,
+    immatureCount: profile.immatureCount,
+    recentCohortCount: profile.recentCohortCount,
+    recentWindowDays: profile.recentWindowDays,
+    recentExtended: profile.recentExtended,
+    signature: profile.signature,
+    marketRisk: profile.marketRisk,
+    byFamily: profile.byFamily,
+    bySignal: profile.bySignal,
+    byScoreBand: profile.byScoreBand,
+    byTechnicalScoreBand: profile.byTechnicalScoreBand,
+    byHorizon: profile.byHorizon,
+    byRecentSignal: profile.byRecentSignal,
+    byRecentTechnicalScoreBand: profile.byRecentTechnicalScoreBand
+  };
+}
+
 function outcomeComparison(stats, minimumCount = 1) {
   const benchmarkCoverage = prefix => Number(stats[`${prefix}BenchmarkCount`]) >= minimumCount
     && Number(stats[`${prefix}BenchmarkCount`]) >= Number(stats.count) * .6;
@@ -3323,6 +3520,7 @@ function evaluateRecommendationRisk(item, riskProfile) {
       ...item,
       score: signalScore,
       signalScore,
+      scoreCard: item.scoreCard ? { ...item.scoreCard, recommendation: signalScore } : item.scoreCard,
       riskProfile,
       riskUnverified: true,
       reason: `${item.reason} ${riskProfile.summary}（风险数据未完整返回，已降${penalty}分保留并标记未确认）。`
@@ -3517,6 +3715,39 @@ function selectFullMarketScreening(scored, screening, tradeDate, now = Date.now(
   const byCode=new Map((scored || []).map(item=>[item.code,item]));
   return [...new Set(screening.codes || [])].map(code=>byCode.get(code))
     .filter(item=>item && item.tradeDate===tradeDate && item.amount>=3e7 && item.price>0 && item.high>0);
+}
+
+function buildBackgroundWatchRecommendations(scored, screening, tradeDate, now = Date.now()) {
+  const generatedAt = Date.parse(screening?.generatedAt || '');
+  if (!Array.isArray(screening?.candidates) || screening.modelVersion !== RECOMMENDATION_MODEL_VERSION
+    || screening.tradeDate !== tradeDate || !Number.isFinite(generatedAt) || generatedAt > now || now - generatedAt > 86400000) return [];
+  const byCode = new Map((scored || []).map(item => [item.code, item]));
+  return screening.candidates.map(candidate => {
+    const quote = byCode.get(candidate.code);
+    if (!quote || !['strict','watch'].includes(candidate.status)) return null;
+    const industry = resolveRecommendationIndustry(quote);
+    if (industry === '行业待确认') return null;
+    const signalScore = clampRecommendationScore(candidate.score);
+    const item = {
+      ...quote,
+      industry,
+      signal:candidate.stage || '观察候选',
+      signalScore,
+      score:signalScore,
+      recommendationTier:'观察候选',
+      newsLabel:'消息中性',
+      newsContext:{signal:'中性',available:false,summary:'后台全市场因子阶段尚未补齐个股消息，严格推荐前需重新核验。'},
+      holdingPeriod:candidate.horizon || '周期待确认',
+      analysisId:screening.analysisId,
+      fullMarketFactor:{rps20:candidate.rps20,rps60:candidate.rps60,rps120:candidate.rps120,rps250:candidate.rps250,scope:screening.complete ? 'full-market' : 'partial-market'},
+      entryAssessment:{allowed:false,status:'等待实时资金、消息和公司风险确认',tone:'neutral',summary:'全市场历史因子已通过；严格推荐前仍需补齐实时资金、消息和未来半年公司风险。',evidence:['后台全市场历史任务']},
+      reason:`后台${screening.complete ? '全市场' : '部分市场'}历史因子：${candidate.stage || '策略命中'}，RPS20 ${candidate.rps20 ?? '--'}；仅进入观察池。`,
+      strategyDecision:{status:'watch',primaryStrategyId:candidate.primaryStrategyId,stage:candidate.stage,horizon:candidate.horizon,score:signalScore,matches:[]}
+    };
+    item.scoreCard = buildStrategyScoreCard(item, {snapshotId:screening.analysisId,tradeDate,observedAt:screening.generatedAt});
+    item.analysisViewModel = buildAnalysisViewModel(item, {decision:item.strategyDecision,evaluations:[],view:'recommendation'});
+    return item;
+  }).filter(Boolean);
 }
 
 function selectMarketRecommendationCandidates({ rotationScreened = [], momentumScreened = [], breakoutScreened = [], consolidationScreened = [], reboundScreened = [], fullMarketScreened = [] }, limit = 120) {
@@ -3779,7 +4010,7 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
       ? new Date(Date.now() - 21 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
       : item.analysis.bottomDate;
     const newsContext = newsResult.status === 'fulfilled'
-      ? summarizeNews(newsResult.value.news, windowStart, { subject: item.name, code: item.code, ...newsResult.value })
+      ? summarizeNews(newsResult.value.news, windowStart, { subject: item.name, code: item.code, lifecycleKey:`stock:${item.code}`, ...newsResult.value })
       : summarizeNews([], windowStart);
     const contextualAnalysis = applyEntryContextAssessment(capitalAnalysis, {
       newsContext, marketNewsContext: marketAssessmentContext.marketNewsContext,
@@ -3966,7 +4197,7 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
   const momentumResolution = filterResolvedRecommendations(finalizeMomentumRecommendations(riskApprovedRecommendations.filter(item =>
     item.momentumDecision?.passed && item.newsLabel !== '消息谨慎'
     && item.riskProfile?.status !== 'risk')));
-  const momentumRecommendations = momentumResolution.items;
+  let momentumRecommendations = momentumResolution.items;
   const riskScoreRejected = stableRiskApprovedRecommendations.length
     - strictRiskApprovedRecommendations.length - watchRiskApprovedRecommendations.length;
   riskUnverifiedIncluded = finalRiskApprovedRecommendations.filter(item => item.riskUnverified).length;
@@ -3989,7 +4220,12 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
       if (item) balancedRecommendations.push(item);
     });
   }
-  const groupedRecommendations = groupRecommendationsByIndustry(balancedRecommendations);
+  let groupedRecommendations = groupRecommendationsByIndustry(balancedRecommendations)
+    .map(item => attachStrategyPlatform(item, marketAssessmentContext));
+  momentumRecommendations = momentumRecommendations.map(item => attachStrategyPlatform(item, marketAssessmentContext));
+  const backgroundWatch = buildBackgroundWatchRecommendations(scored, fullMarketScreening, tradeDate);
+  const publishedCodes = new Set([...groupedRecommendations, ...momentumRecommendations].map(item => item.code));
+  groupedRecommendations = [...groupedRecommendations, ...backgroundWatch.filter(item => !publishedCodes.has(item.code))];
   const selectedCodesForLedger = new Set([...groupedRecommendations, ...momentumRecommendations].map(item => item.code));
   const rejectedCandidates = [
     ...stableResolution.rejected,
@@ -4010,6 +4246,16 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
     counts[recommendationSignalFamily(item.signal)] += 1;
     return counts;
   }, { bottomWaiting: 0, rebounded: 0, breakout: 0, structure: 0, other: 0 });
+  const strategyExperimentRows = [...groupedRecommendations, ...momentumRecommendations];
+  const strategyMatches = {};
+  const strategyStatuses = {};
+  strategyExperimentRows.forEach(item => {
+    const matchedIds = (item.strategyEvaluations || []).filter(row => row.matched).map(row => row.id);
+    if (!matchedIds.length && item.strategyDecision?.primaryStrategyId) matchedIds.push(item.strategyDecision.primaryStrategyId);
+    [...new Set(matchedIds)].forEach(id => { strategyMatches[id] = (strategyMatches[id] || 0) + 1; });
+    const status = item.strategyDecision?.status || item.recommendationTier || 'unverified';
+    strategyStatuses[status] = (strategyStatuses[status] || 0) + 1;
+  });
   return {
     recommendations: groupedRecommendations,
     momentumRecommendations,
@@ -4051,32 +4297,19 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
       rotationCandidates:rotationScreened.length,
       rotationBoards:marketAssessmentContext.sectors.filter(item=>item.memberCodes?.length).map(item=>({code:item.code,name:item.name,count:item.memberCodes.length,phase:item.capitalTrend?.phase,tradeDate:item.capitalTradeDate})),
       sectorCapitalWindows:marketAssessmentContext.sectors.filter(item=>item.capitalTrend?.available).length,
-      fullMarketCandidates:fullMarketScreened.length,
-      fullMarketHistoryCovered:fullMarketScreened.length ? Number(fullMarketScreening.historyCovered) || 0 : 0,
+      fullMarketCandidates:backgroundWatch.length || fullMarketScreened.length,
+      fullMarketHistoryCovered:Number(fullMarketScreening?.historyCovered) || 0,
       momentumCandidates:momentumScreened.length,
       momentumQualified:momentumRecommendations.length,
       strictQualified: groupedRecommendations.filter(item => !['观察候选','环境观察'].includes(item.recommendationTier)).length,
       watchQualified: groupedRecommendations.filter(item => ['观察候选','环境观察'].includes(item.recommendationTier)).length,
-      outcomeFeedback: outcomeProfile?.sampleSize ? {
-        sampleSize: outcomeProfile.sampleSize,
-        attributedCount: outcomeProfile.attributedCount,
-        unattributedCount: outcomeProfile.unattributedCount,
-        excludedCount: outcomeProfile.excludedCount,
-        immatureCount: outcomeProfile.immatureCount,
-        recentCohortCount: outcomeProfile.recentCohortCount,
-        recentWindowDays: outcomeProfile.recentWindowDays,
-        recentExtended: outcomeProfile.recentExtended,
-        signature: outcomeProfile.signature,
-        marketRisk: outcomeProfile.marketRisk,
-        byFamily: outcomeProfile.byFamily,
-        byRecentSignal: outcomeProfile.byRecentSignal,
-        byRecentTechnicalScoreBand: outcomeProfile.byRecentTechnicalScoreBand
-      } : null,
+      outcomeFeedback: recommendationOutcomeMetadata(outcomeProfile),
       modelVersion: RECOMMENDATION_MODEL_VERSION,
+      strategyExperiment:{mode:'shadow',evaluated:strategyExperimentRows.length,matches:strategyMatches,statuses:strategyStatuses},
       snapshotId,
       observationPhase,
       marketRegime:marketAssessmentContext.marketRegime,
-      factorModel: 'A股适配CANSLIM + 价值质量 + 个股阶段资金 + 行业/概念板块真实主力资金轮动 + 实时消息风险 + 美股风险修正 + 稳健/强势双轨推荐（缺失项不计分）',
+      factorModel: '全市场横截面因子 + 独立策略注册表 + 统一风险裁决 + 板块资金轮动 + 实时消息与海外风险修正（三池独立，缺失项不计分）',
       qualified: groupedRecommendations.length
     }
   };
@@ -4148,7 +4381,7 @@ async function fetchMarketOverview(force = false, favoriteOutcomes = [], onProgr
     result.turnover = snapshotResult.value.turnover;
     result.errors.push(...snapshotResult.value.errors.map(error => `全市场行情部分失败：${error}`));
     const newsPromise = fetchMarketNews(force);
-    const marketNewsContextPromise = newsPromise.then(value => summarizeNews(value.news, '', { ...value, scope:'market' })).catch(() => summarizeNews([]));
+    const marketNewsContextPromise = newsPromise.then(value => summarizeNews(value.news, '', { ...value, scope:'market', lifecycleKey:'market' })).catch(() => summarizeNews([]));
     const [capitalResult, sectorsResult] = await Promise.allSettled([
       fetchSectorCapitalFlow(force),
       fetchTencentMarketSectors(snapshotResult.value.quotes)
@@ -4214,7 +4447,7 @@ async function fetchMarketOverview(force = false, favoriteOutcomes = [], onProgr
     }
     else result.errors.push(`技术形态候选分析失败：${recommendationsResult.reason?.message || recommendationsResult.reason}`);
     if (newsResult.status === 'fulfilled') {
-      result.newsContext = summarizeNews(newsResult.value.news, '', { ...newsResult.value, scope:'market' });
+      result.newsContext = summarizeNews(newsResult.value.news, '', { ...newsResult.value, scope:'market', lifecycleKey:'market' });
       const newsIssues = classifyMarketNewsIssues(newsResult.value);
       result.errors.push(...newsIssues.errors);
       result.warnings.push(...newsIssues.warnings);
@@ -6411,14 +6644,14 @@ async function fetchStockHistory({ code, name, industry = '', sector = '', force
   let newsContext = summarizeNews([]);
   try {
     if (newsResult.status === 'rejected') throw newsResult.reason;
-    newsContext = summarizeNews(newsResult.value.news, '', { subject: name, code: cacheKey, ...newsResult.value });
+    newsContext = summarizeNews(newsResult.value.news, '', { subject: name, code: cacheKey, lifecycleKey:`stock:${cacheKey}`, ...newsResult.value });
     errors.push(...(newsResult.value.errors || []));
   } catch (err) {
     errors.push(`消息面分析失败：${err.message || err}`);
   }
   let marketNewsContext = summarizeNews([]);
   if (marketNewsResult.status === 'fulfilled') {
-    marketNewsContext = summarizeNews(marketNewsResult.value.news, '', { ...marketNewsResult.value, scope:'market' });
+    marketNewsContext = summarizeNews(marketNewsResult.value.news, '', { ...marketNewsResult.value, scope:'market', lifecycleKey:'market' });
     errors.push(...(marketNewsResult.value.errors || []));
   } else {
     errors.push(`大盘实时消息分析失败：${marketNewsResult.reason?.message || marketNewsResult.reason}`);
@@ -6476,13 +6709,39 @@ async function fetchStockHistory({ code, name, industry = '', sector = '', force
   });
   analysis.holdingProfile = investmentAnalysis.holdingProfile;
   analysis.holdingPeriod = investmentAnalysis.holdingProfile.primary;
+  const detailSectorProfile = resolveStockRotationProfiles({code:cacheKey,name,industry:resolvedIndustry,sector}, analysisMarketOverview.sectors)[0] || null;
+  const detailFactorAnalysis = buildDetailFactorAnalysis(analysis, fundFlowPeriod, detailSectorProfile);
   const snapshotId = marketSnapshotId({tradeDate:analysis.tradeDate, observedAt:stockObservedAt, universe:1,
     source:'stock-detail', contentSignature:marketQuoteContentSignature(liveQuote ? [liveQuote] : [])});
   analysis.scoreCard = buildStrategyScoreCard({
     analysis, technicalScore:analysis.score, canslim:investmentAnalysis.canslim,
-    factorAnalysis:{score:investmentAnalysis.canslim?.score}, dataConfidence:investmentAnalysis.dataConfidence
+    factorAnalysis:detailFactorAnalysis, dataConfidence:investmentAnalysis.dataConfidence
   }, {snapshotId, tradeDate:analysis.tradeDate, observedAt:new Date(stockObservedAt).toISOString(), observationPhase});
   investmentAnalysis.scoreCard = analysis.scoreCard;
+  investmentAnalysis.factorAnalysis = detailFactorAnalysis;
+  const platformDetail = attachStrategyPlatform({
+    code:cacheKey,
+    name,
+    price:liveQuote?.price ?? analysis.latestPrice,
+    analysis,
+    score:analysis.score,
+    signalScore:analysis.scoreCard.recommendation,
+    scoreCard:analysis.scoreCard,
+    factorAnalysis:detailFactorAnalysis,
+    qualityScore:financialAnalysis?.quality?.score,
+    riskProfile,
+    holdingPeriod:analysis.holdingPeriod,
+    signal:analysis.entryAssessment?.status,
+    reason:analysis.entryAssessment?.summary
+  }, {snapshotId, marketRegime:analysisMarketOverview.marketRegime});
+  analysis.strategyDecision = platformDetail.strategyDecision;
+  analysis.strategyEvaluations = platformDetail.strategyEvaluations;
+  analysis.analysisViewModel = buildAnalysisViewModel(platformDetail, {
+    decision:platformDetail.strategyDecision,
+    evaluations:platformDetail.strategyEvaluations,
+    view:'detail'
+  });
+  investmentAnalysis.strategyDecision = analysis.strategyDecision;
   const breakoutConclusion = analysis.breakoutPotential?.available
     ? `横盘突破评估：${analysis.breakoutPotential.status}${analysis.breakoutPotential.trigger ? `，${analysis.breakoutPotential.trigger}` : ''}。` : '';
   analysis.combinedConclusion = `${analysis.verdict}（技术评分${analysis.score}/100，CANSLIM可验证得分${investmentAnalysis.canslim.score ?? '--'}/100）。${analysis.entryAssessment?.summary || analysis.buyCondition}${analysis.capitalSetupAssessment.summary}${breakoutConclusion}个股消息经发布时间与相关性加权后${newsContext.signal}，大盘实时消息${marketNewsContext.signal}；${newsContext.signal === '偏谨慎' || marketNewsContext.signal === '偏谨慎' ? '近期风险信息未充分消化，需降低优先级。' : '暂未发现与技术条件明显冲突的近期风险信息。'}未来半年公司风险：${riskProfile.summary}。`;
@@ -6875,6 +7134,90 @@ ipcMain.handle('fetch-stock-fund-flow', async (_event, request) => {
   }
 });
 
+async function runFullMarketResearchJob(input = {}, onProgress = () => {}) {
+  const root = path.join(dataRootPath(), 'data', 'full-market-jobs');
+  const store = new ResearchJobStore(root);
+  const snapshot = await fetchTencentMarketSnapshot();
+  const tradeDate = snapshot.quotes.map(row => row.tradeDate).filter(Boolean).sort().at(-1);
+  if (!tradeDate) throw new Error('全市场行情没有可用交易日');
+  const modelKey = crypto.createHash('sha256').update(RECOMMENDATION_MODEL_VERSION).digest('hex').slice(0, 8);
+  const jobId = input.jobId || `full-${tradeDate}-${modelKey}`;
+  let manifest = await store.status(jobId);
+  if (!manifest || input.force) {
+    manifest = await store.start({
+      jobId,
+      analysisId:input.analysisId || marketSnapshotId({tradeDate, observedAt:Date.now(), universe:snapshot.quotes.length,
+        source:'full-market-research', contentSignature:marketQuoteContentSignature(snapshot.quotes)}),
+      tradeDate,
+      total:snapshot.quotes.length,
+      modelVersion:RECOMMENDATION_MODEL_VERSION
+    });
+  } else if (manifest.state !== 'completed') {
+    manifest = await store.resume(jobId);
+  }
+  const existing = await store.readResults(jobId);
+  const completedCodes = new Set(existing.filter(item => item.factor).map(item => item.code));
+  const remaining = snapshot.quotes.filter(item => !completedCodes.has(item.code));
+  onProgress({...manifest, stage:'history', message:`全市场历史任务：已完成 ${existing.length}/${snapshot.quotes.length}`});
+  for (let offset = 0; offset < remaining.length; offset += 20) {
+    const current = await store.status(jobId);
+    if (current?.state === 'cancelled') return current;
+    const batch = remaining.slice(offset, offset + 20);
+    const settled = await settleWithConcurrency(batch, 6, async quote => {
+      try {
+        let history;
+        try {
+          history = await fetchTencentHistory(quote.code, 320);
+        } catch {
+          history = await fetchSinaHistory(quote.code, 320);
+        }
+        history = mergeQuoteIntoHistory(history, quote);
+        const factor = buildFactorSnapshot([{code:quote.code, history}], {universeSize:1}).factors[0];
+        if (!factor || factor.dataCoverage.bars < 60) throw new Error(`历史样本不足：${factor?.dataCoverage?.bars || 0}`);
+        delete factor.history;
+        return {code:quote.code, name:quote.name, tradeDate, factor};
+      } catch (error) {
+        return {code:quote.code, name:quote.name, tradeDate, error:error.message || String(error)};
+      }
+    });
+    const rows = settled.map((result, index) => result.status === 'fulfilled' ? result.value
+      : {code:batch[index].code, name:batch[index].name, tradeDate, error:result.reason?.message || String(result.reason)});
+    manifest = await store.recordBatch(jobId, rows);
+    onProgress({...manifest, stage:'history', message:`全市场历史任务：已完成 ${manifest.completed}/${manifest.total}`});
+  }
+  const records = await store.readResults(jobId);
+  const successful = records.filter(item => item.factor);
+  const factors = buildFactorSnapshot(successful, {
+    analysisId:manifest.analysisId,
+    tradeDate,
+    universeSize:snapshot.quotes.length,
+    complete:successful.length === snapshot.quotes.length
+  });
+  const candidates = factors.factors.map(factor => {
+    const evaluations = evaluateStrategyRegistry(factor);
+    const decision = arbitrateStrategyResults(evaluations);
+    return {code:factor.code, score:decision.score, status:decision.status, stage:decision.stage, horizon:decision.horizon,
+      primaryStrategyId:decision.primaryStrategyId, rps20:factor.rps20, rps60:factor.rps60, rps120:factor.rps120, rps250:factor.rps250};
+  }).filter(item => ['strict', 'watch'].includes(item.status));
+  const screening = {
+    complete:factors.complete,
+    partial:!factors.complete,
+    tradeDate,
+    generatedAt:new Date().toISOString(),
+    modelVersion:RECOMMENDATION_MODEL_VERSION,
+    analysisId:manifest.analysisId,
+    universe:snapshot.quotes.length,
+    historyCovered:successful.length,
+    failures:records.length - successful.length,
+    codes:candidates.map(item => item.code),
+    candidates
+  };
+  await atomicWriteJson(cacheFilePath('full-market-screening'), {savedAt:Date.now(), data:screening});
+  manifest = await store.complete(jobId);
+  onProgress({...manifest, stage:'complete', message:`全市场任务完成：历史覆盖 ${successful.length}/${snapshot.quotes.length}`});
+  return {...manifest, historyCovered:successful.length, failures:screening.failures};
+}
+
 let marketWorker = null;
 let marketWorkerPending = null;
 const marketProgressListeners = new Set();
@@ -6934,7 +7277,64 @@ if (!isMainThread && workerData?.marketAnalysis) {
   });
 }
 
-app.on('before-quit', () => { marketWorker?.terminate(); });
+if (!isMainThread && workerData?.fullMarketResearch) {
+  runFullMarketResearchJob(workerData.request || {}, progress => parentPort.postMessage({progress}))
+    .then(result => parentPort.postMessage({result}))
+    .catch(error => parentPort.postMessage({error:error.stack || error.message}));
+}
+
+let fullMarketWorker = null;
+let fullMarketJobId = '';
+let fullMarketStatus = null;
+
+function startFullMarketResearch(request = {}, sender = null) {
+  if (fullMarketWorker) return fullMarketStatus || {state:'running', jobId:fullMarketJobId};
+  fullMarketStatus = {state:'starting', completed:0, total:0, message:'正在启动全市场历史任务'};
+  fullMarketWorker = new Worker(__filename, {workerData:{
+    isPackaged:app.isPackaged,
+    dataRoot:dataRootPath(),
+    fullMarketResearch:true,
+    request
+  }});
+  fullMarketWorker.on('message', message => {
+    if (message.progress) {
+      fullMarketStatus = message.progress;
+      fullMarketJobId = message.progress.jobId || fullMarketJobId;
+      if (sender && !sender.isDestroyed()) sender.send('full-market-research-progress', fullMarketStatus);
+    } else if (message.result) {
+      fullMarketStatus = message.result;
+      fullMarketJobId = message.result.jobId || fullMarketJobId;
+      if (sender && !sender.isDestroyed()) sender.send('full-market-research-progress', fullMarketStatus);
+      fullMarketWorker?.terminate();
+      fullMarketWorker = null;
+    } else if (message.error) {
+      fullMarketStatus = {...fullMarketStatus, state:'failed', error:message.error, message:'全市场历史任务失败'};
+      appendLogLine({type:'error', action:'full_market_research_failed', message:'全市场历史任务失败', stack:message.error});
+      if (sender && !sender.isDestroyed()) sender.send('full-market-research-progress', fullMarketStatus);
+      fullMarketWorker?.terminate();
+      fullMarketWorker = null;
+    }
+  });
+  fullMarketWorker.on('error', error => {
+    fullMarketStatus = {...fullMarketStatus, state:'failed', error:error.message, message:'全市场历史任务线程异常'};
+    appendLogLine({type:'error', action:'full_market_worker_failed', message:'全市场历史任务线程异常', stack:error.stack || String(error)});
+    fullMarketWorker = null;
+  });
+  fullMarketWorker.on('exit', code => {
+    if (!fullMarketWorker) return;
+    fullMarketWorker = null;
+    if (code !== 0 && !['completed','cancelled','failed'].includes(fullMarketStatus?.state)) {
+      fullMarketStatus = {...fullMarketStatus, state:'failed', message:`全市场历史任务线程退出：${code}`};
+      appendLogLine({type:'error', action:'full_market_worker_exit', message:'全市场历史任务线程异常退出', detail:{code}});
+    }
+  });
+  return fullMarketStatus;
+}
+
+app.on('before-quit', () => {
+  marketWorker?.terminate();
+  fullMarketWorker?.terminate();
+});
 
 ipcMain.handle('fetch-market-overview', async (_event, input) => {
   const request = input && typeof input === 'object' ? input : { force: Boolean(input) };
@@ -6949,6 +7349,119 @@ ipcMain.handle('fetch-market-overview', async (_event, input) => {
   } catch (err) {
     appendLogLine({ type: 'error', message: '大盘实时分析失败', action: 'market_overview_failed', stack: err.stack || String(err) });
     throw err;
+  }
+});
+
+ipcMain.handle('start-full-market-research', async (_event, request) => {
+  appendLogLine({type:'info', action:'full_market_research_start', message:'启动或恢复全市场历史任务', detail:request || {}});
+  return startFullMarketResearch(request || {}, _event?.sender);
+});
+
+ipcMain.handle('get-full-market-research-status', async () => fullMarketStatus || {state:'idle', completed:0, total:0});
+
+ipcMain.handle('cancel-full-market-research', async () => {
+  if (fullMarketJobId) {
+    const store = new ResearchJobStore(path.join(dataRootPath(), 'data', 'full-market-jobs'));
+    try { fullMarketStatus = await store.cancel(fullMarketJobId); } catch {}
+  }
+  if (fullMarketWorker) await fullMarketWorker.terminate();
+  fullMarketWorker = null;
+  fullMarketStatus = {...(fullMarketStatus || {}), state:'cancelled', message:'全市场历史任务已取消，可稍后恢复'};
+  appendLogLine({type:'warn', action:'full_market_research_cancel', message:'取消全市场历史任务', detail:{jobId:fullMarketJobId}});
+  return fullMarketStatus;
+});
+
+function researchAccountFile() {
+  return path.join(dataRootPath(), 'data', 'research-account.json');
+}
+
+async function loadResearchAccount() {
+  return readJsonWithBackup(researchAccountFile(), null);
+}
+
+ipcMain.handle('load-research-account', async () => loadResearchAccount());
+
+ipcMain.handle('create-research-account', async (_event, request = {}) => {
+  try {
+    const account = createResearchAccount({
+      accountId:`research-${Date.now()}`,
+      initialCash:Number(request.initialCash),
+      rules:RESEARCH_ACCOUNT_RULES
+    });
+    await atomicWriteJson(researchAccountFile(), account);
+    appendLogLine({type:'success', action:'research_account_created', message:'研究模拟账户已创建', detail:{accountId:account.accountId, initialCash:account.initialCash, rules:account.rules}});
+    return {ok:true, account};
+  } catch (error) {
+    appendLogLine({type:'error', action:'research_account_create_failed', message:'研究模拟账户创建失败', stack:error.stack || String(error)});
+    return {ok:false, error:error.message || String(error)};
+  }
+});
+
+ipcMain.handle('execute-research-order', async (_event, order = {}) => {
+  const loaded = await loadResearchAccount();
+  if (!loaded.value) return {ok:false, error:'请先创建研究模拟账户'};
+  try {
+    const result = executeResearchOrder(loaded.value, order);
+    await atomicWriteJson(researchAccountFile(), result.account);
+    appendLogLine({type:result.ok ? 'success' : 'warn', action:result.ok ? 'research_order_filled' : 'research_order_rejected', message:result.ok ? '研究模拟委托成交' : '研究模拟委托被拒绝', detail:{order, reason:result.reason || '', fill:result.fill || null}});
+    return {...result, recoveredFromBackup:loaded.recoveredFromBackup};
+  } catch (error) {
+    appendLogLine({type:'error', action:'research_order_failed', message:'研究模拟委托处理失败', detail:{order}, stack:error.stack || String(error)});
+    return {ok:false, error:error.message || String(error)};
+  }
+});
+
+ipcMain.handle('mark-research-account', async (_event, request = {}) => {
+  const loaded = await loadResearchAccount();
+  if (!loaded.value) return {ok:false, account:null};
+  try {
+    const account = markResearchAccount(loaded.value, Array.isArray(request.quotes) ? request.quotes : [], request.tradeDate || '');
+    await atomicWriteJson(researchAccountFile(), account);
+    return {ok:true, account, recoveredFromBackup:loaded.recoveredFromBackup};
+  } catch (error) {
+    appendLogLine({type:'error', action:'research_account_mark_failed', message:'研究模拟账户估值失败', stack:error.stack || String(error)});
+    return {ok:false, error:error.message || String(error)};
+  }
+});
+
+ipcMain.handle('load-user-state', async () => {
+  const file = path.join(dataRootPath(), 'data', 'user-state.json');
+  return readJsonWithBackup(file, null);
+});
+
+ipcMain.handle('save-user-state', async (_event, state) => {
+  const file = path.join(dataRootPath(), 'data', 'user-state.json');
+  try {
+    const value = {schemaVersion:2, updatedAt:new Date().toISOString(), labels:[], portfolio:[], simulatedTrades:[], ...(state || {})};
+    await atomicWriteJson(file, value);
+    return {ok:true, file};
+  } catch (error) {
+    appendLogLine({type:'error', action:'user_state_save_failed', message:'用户数据保存失败', stack:error.stack || String(error)});
+    return {ok:false, error:error.message || String(error)};
+  }
+});
+
+ipcMain.handle('explain-stock-with-ai', async (_event, request = {}) => {
+  const apiKey = process.env.STOCK_AI_API_KEY || '';
+  const endpoint = process.env.STOCK_AI_BASE_URL || '';
+  const model = process.env.STOCK_AI_MODEL || '';
+  if (!apiKey || !endpoint || !model) return {configured:false, message:'未配置 STOCK_AI_API_KEY、STOCK_AI_BASE_URL 和 STOCK_AI_MODEL'};
+  const evidence = (request.evidence || []).filter(item => item?.id && item?.text).slice(0, 30);
+  if (!request.analysisId || !evidence.length) return {configured:true, ok:false, message:'当前快照没有可引用证据'};
+  const prompt = buildAiEvidencePrompt({...request, evidence});
+  try {
+    const response = await postJson(endpoint, {model, temperature:0.1, messages:[
+      {role:'system', content:'你是A股研究解释器。只能重述输入证据并标注证据编号，不新增事实，不承诺收益，不给确定目标价。'},
+      {role:'user', content:prompt}
+    ]}, {Authorization:`Bearer ${apiKey}`});
+    const text = response?.choices?.[0]?.message?.content || '';
+    const validation = validateAiExplanation(text, evidence.map(item => item.id));
+    if (!validation.valid) return {configured:true, ok:false, message:`AI输出证据校验失败${validation.unsupported.length ? `：${validation.unsupported.join('、')}` : ''}`};
+    appendLogLine({type:'success', action:'ai_explanation', message:'AI证据解释完成', detail:{code:request.code,analysisId:request.analysisId,model}});
+    return {configured:true, ok:true, text, model, analysisId:request.analysisId};
+  } catch (error) {
+    appendLogLine({type:'error', action:'ai_explanation_failed', message:'AI证据解释失败', detail:{code:request.code,analysisId:request.analysisId,model}, stack:error.stack || String(error)});
+    return {configured:true, ok:false, message:error.message || String(error)};
   }
 });
 
@@ -7021,6 +7534,9 @@ module.exports = {
   tencentQuoteObservedAt,
   marketQuoteContentSignature,
   resolveObservationPhase,
+  crossSectionPercentile,
+  buildAiEvidencePrompt,
+  validateAiExplanation,
   marketSnapshotId,
   classifyMarketRegime,
   buildStrategyScoreCard,
@@ -7035,7 +7551,9 @@ module.exports = {
   splitDataCenterFinancialRows,
   buildCanslimFromFactors,
   buildIndividualInvestmentAnalysis,
+  attachStrategyPlatform,
   buildRecommendationFactorContext,
+  buildDetailFactorAnalysis,
   buildIndustryRotationFromQuotes,
   normalizeSectorCapitalRows,
   classifySectorRotationPhase,
@@ -7054,6 +7572,7 @@ module.exports = {
   mergeRecommendationOutcomeQuotes,
   mergeRecommendationOutcomeBenchmarks,
   summarizeRecommendationOutcomes,
+  recommendationOutcomeMetadata,
   assessRecommendationHorizons,
   recommendationDataConfidence,
   weightedRecommendationScore,
@@ -7092,6 +7611,7 @@ module.exports = {
   analyzeCapitalWindows,
   analyzePathMetrics,
   selectFullMarketScreening,
+  buildBackgroundWatchRecommendations,
   assessReboundQuality,
   assessBreakoutQuality,
   annotateSectorRotation,
