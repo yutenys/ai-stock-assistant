@@ -3798,6 +3798,9 @@ function buildBackgroundWatchRecommendations(scored, screening, tradeDate, now =
   return screening.candidates.map(candidate => {
     const quote = byCode.get(candidate.code);
     if (!quote || !['strict','watch'].includes(candidate.status)) return null;
+    const breakoutPrice = finiteNumber(candidate.previousHigh20 ?? candidate.high20);
+    const ma30 = finiteNumber(candidate.ma30);
+    if (!(breakoutPrice > 0) || !(ma30 > 0)) return null;
     const industry = resolveRecommendationIndustry(quote);
     if (industry === '行业待确认') return null;
     const signalScore = clampRecommendationScore(candidate.score);
@@ -3807,6 +3810,8 @@ function buildBackgroundWatchRecommendations(scored, screening, tradeDate, now =
       signal:candidate.stage || '观察候选',
       signalScore,
       score:signalScore,
+      breakoutPrice,
+      ma30,
       recommendationTier:'观察候选',
       newsLabel:'消息中性',
       newsContext:{signal:'中性',available:false,summary:'后台全市场因子阶段尚未补齐个股消息，严格推荐前需重新核验。'},
@@ -7298,7 +7303,8 @@ async function runFullMarketResearchJob(input = {}, onProgress = () => {}) {
     const evaluations = evaluateStrategyRegistry(factor, {observationPhase});
     const decision = arbitrateStrategyResults(evaluations);
     return {code:factor.code, score:decision.score, status:decision.status, stage:decision.stage, horizon:decision.horizon,
-      primaryStrategyId:decision.primaryStrategyId, rps20:factor.rps20, rps60:factor.rps60, rps120:factor.rps120, rps250:factor.rps250};
+      primaryStrategyId:decision.primaryStrategyId, rps20:factor.rps20, rps60:factor.rps60, rps120:factor.rps120, rps250:factor.rps250,
+      ma30:factor.ma30, high20:factor.high20, previousHigh20:factor.previousHigh20, close:factor.close, volumeRatio:factor.volumeRatio};
   }).filter(item => ['strict', 'watch'].includes(item.status));
   const screening = {
     complete:factors.complete,
