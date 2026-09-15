@@ -1,0 +1,67 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+
+const {atomicWriteJson, readJsonWithBackup, ResearchJobStore, StockHistoryStore} = require('../lib/persistence');
+
+test('原子JSON保存保留上一版备份且可在主文件损坏后恢复', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stock-state-'));
+  const file = path.join(dir, 'state.json');
+  await atomicWriteJson(file, {schemaVersion:1, labels:['first']});
+  await atomicWriteJson(file, {schemaVersion:2, labels:['second']});
+  fs.writeFileSync(file, '{broken', 'utf8');
+  const restored = await readJsonWithBackup(file);
+  assert.deepEqual(restored.value.labels, ['first']);
+  assert.equal(restored.recoveredFromBackup, true);
+});
+
+test('损坏的主文件不会覆盖上一版有效备份', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stock-backup-'));
+  const file = path.join(dir, 'state.json');
+  await atomicWriteJson(file, {version:1});
+  await atomicWriteJson(file, {version:2});
+  fs.writeFileSync(file, '{broken', 'utf8');
+  await atomicWriteJson(file, {version:3});
+  fs.writeFileSync(file, '{broken-again', 'utf8');
+  const restored = await readJsonWithBackup(file);
+  assert.equal(restored.value.version, 1);
+  assert.equal(restored.recoveredFromBackup, true);
+});
+
+test('全市场任务按游标恢复、取消且不重复写已完成证券', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stock-job-'));
+  const store = new ResearchJobStore(dir);
+  await store.start({jobId:'job-1',analysisId:'a-1',tradeDate:'2026-09-14',total:3});
+  await store.recordBatch('job-1', [{code:'600001',factor:{code:'600001'}},{code:'600002',error:'timeout'}]);
+  await store.recordBatch('job-1', [{code:'600002',factor:{code:'600002'}},{code:'600003',error:'history missing'}]);
+  let status = await store.status('job-1');
+  assert.equal(status.completed, 3);
+  assert.equal(status.cursor, 3);
+  assert.equal(status.valid, 2);
+  assert.equal(status.failed, 1);
+  await store.cancel('job-1');
+  status = await store.status('job-1');
+  assert.equal(status.state, 'cancelled');
+  const resumed = await store.resume('job-1');
+  assert.equal(resumed.state, 'running');
+  assert.equal(resumed.completed, 3);
+});
+
+test('股票历史仓库按交易日增量合并、覆盖同日快照并限制长度', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stock-history-'));
+  const store = new StockHistoryStore(dir, 3);
+  await store.merge('600001', [
+    {date:'2026-09-10',close:10}, {date:'2026-09-11',close:11}, {date:'2026-09-12',close:12}
+  ], {source:'full', fullRefresh:true});
+  const result = await store.merge('600001', [
+    {date:'2026-09-12',close:12.5}, {date:'2026-09-14',close:13}
+  ], {source:'incremental',tradeDate:'2026-09-14'});
+  assert.deepEqual(result.bars.map(row => [row.date,row.close]), [
+    ['2026-09-11',11],['2026-09-12',12.5],['2026-09-14',13]
+  ]);
+  assert.equal(result.lastDate,'2026-09-14');
+  assert.ok(result.fullFetchedAt);
+  await assert.rejects(() => store.read('../bad'), /股票代码无效/);
+});

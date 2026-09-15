@@ -2,6 +2,7 @@ node_modules/
 release/
 logs/
 cache/
+data/
 
 .env
 .env.*
