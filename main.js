@@ -11,9 +11,11 @@ const { TextDecoder } = require('util');
 const crypto = require('crypto');
 const {atomicWriteJson, readJsonWithBackup, ResearchJobStore, StockHistoryStore} = require('./lib/persistence');
 const {createResearchAccount, executeResearchOrder, markResearchAccount} = require('./lib/research-account');
+const {executionWindow} = require('./lib/trade-time');
 const {
   buildFactorSnapshot,
   detectBreakoutContext,
+  isFirstPullback,
   evaluateStrategyRegistry,
   arbitrateStrategyResults,
   buildAnalysisViewModel,
@@ -43,7 +45,7 @@ let marketDirectorySavedAt = 0;
 const CONTROLLED_VOLUME_MIN = 1.5;
 const CONTROLLED_VOLUME_MAX = 4;
 const SECTOR_CAPITAL_FALLBACK_MAX_AGE_MS = 72 * 60 * 60 * 1000;
-const RECOMMENDATION_MODEL_VERSION = '2026-09-14-strategy-platform-v20';
+const RECOMMENDATION_MODEL_VERSION = '2026-09-15-strategy-platform-v22';
 const RESEARCH_ACCOUNT_RULES = Object.freeze({
   commissionRate:.00025,
   minimumCommission:5,
@@ -1654,6 +1656,7 @@ function selectRotationPriorityCandidates(scored, sectors, options = {}) {
   const perSector = Number(options.perSector) || 4;
   const sectorLimit = Number(options.sectorLimit) || 5;
   const eligibleSectors = (sectors || []).filter(item => !item.capitalStale && !item.rotationIntraday?.retreating
+    && !item.participation?.divergent && !item.participation?.capitalConcentrated
     && !assessSectorCapitalTrend(item).weakening && (item.capitalEstimated
     ? Number(item.rotationScore) >= 72
     : Number(item.mainNetInflow) > 0 && Number(item.mainNetPct || 0) > 0))
@@ -1670,7 +1673,7 @@ function selectRotationPriorityCandidates(scored, sectors, options = {}) {
     const rows = resolved
       .filter(item => !codes.has(item.code) && item.rotationProfiles.some(profile => profile.name === sector.name)
         && Number(item.amount || 0) >= 3e7
-        && Number(item.changePct || 0) >= -1 && Number(item.changePct || 0) < 8.8
+        && Number(item.changePct || 0) >= -3 && Number(item.changePct || 0) < 8.8
         && Number(item.price || 0) > 0 && Number(item.high || 0) > 0 && Number(item.price) / Number(item.high) >= .9)
       .sort((a, b) => Number(b.preliminaryScore || 0) - Number(a.preliminaryScore || 0) || Number(b.amount || 0) - Number(a.amount || 0));
     if (rows.length) coveredSectors++;
@@ -1685,14 +1688,17 @@ function selectRotationPriorityCandidates(scored, sectors, options = {}) {
 
 function momentumRecommendationDecision(item) {
   const profile = (item?.rotationProfiles || []).find(row => !row.capitalEstimated && !row.capitalStale && !row.rotationIntraday?.retreating
+    && !row.participation?.divergent && !row.participation?.capitalConcentrated
     && !assessSectorCapitalTrend(row).weakening && Number(row.mainNetInflow) > 0 && Number(row.mainNetPct) > 0);
   const nearHigh = Number(item?.high) > 0 ? Number(item.price) / Number(item.high) : 0;
   const changePct = Number(item?.changePct || 0);
   const volumeRatio = Number(item?.snapshotVolumeRatio ?? item?.analysis?.volumeRatio);
-  const passed = Boolean(profile && changePct >= 4 && Number(item?.amount || 0) >= 5e7 && nearHigh >= .97);
+  const firstPullback = Boolean(item?.analysis?.firstPullback);
+  const passed = Boolean(profile && Number(item?.amount || 0) >= 5e7
+    && (firstPullback && changePct >= -3 && nearHigh >= .95 || changePct >= 4 && nearHigh >= .97));
   const atLimit = Number(item?.upperLimit) > 0 ? Math.abs(Number(item.price) - Number(item.upperLimit)) < .005 : changePct >= 9.5;
   const explosive = Number.isFinite(volumeRatio) && volumeRatio > 4;
-  const noChase = atLimit || explosive || changePct >= 8;
+  const noChase = atLimit || explosive || changePct >= 8 || item?.analysis?.rsi14 > 80;
   const reasons = [atLimit ? '当前已涨停或接近涨停' : '', explosive ? `当前量比${volumeRatio.toFixed(2)}，属于爆量` : '', changePct >= 8 && !atLimit ? `当日涨幅${changePct.toFixed(2)}%，短线涨幅过大` : ''].filter(Boolean);
   const score = passed ? clampRecommendationScore(Number(profile.rotationScore || 50) * .4
     + clampRecommendationScore(50 + changePct * 5) * .25
@@ -1702,14 +1708,16 @@ function momentumRecommendationDecision(item) {
     passed,
     score,
     observationOnly:true,
+    firstPullback,
+    noChase,
     atLimit,
     profile:profile || null,
     entryAssessment:{
       allowed:false,
-      status:noChase ? '强势追踪，不追高' : '强势追踪，等待首次回踩',
+      status:noChase ? '强势追踪，不追高' : firstPullback ? '首次缩量回踩，核验承接' : '强势追踪，等待首次回踩',
       tone:noChase ? 'negative' : 'warning',
       summary:passed
-        ? `${profile.name}主力资金净流入${formatCapitalAmount(profile.mainNetInflow)}，个股处于板块强势扩散阶段。${reasons.length ? reasons.join('，') + '，不在加速段追高；等待开板承接或首次缩量回踩。' : '等待首次缩量回踩并确认承接后再评估。'}`
+        ? `${profile.name}主力资金净流入${formatCapitalAmount(profile.mainNetInflow)}。${firstPullback && !noChase ? '近期放量突破后首次缩量回踩MA20附近，收盘仍守住突破支撑；继续核验个股阶段资金、消息风险和次日承接。' : `个股处于板块强势扩散阶段。${reasons.length ? reasons.join('，') + '，不在加速段追高；等待首次缩量回踩并确认承接。' : '等待首次缩量回踩并确认承接后再评估。'}`}`
         : '所属板块未获得真实资金流入确认，或个股强度与流动性不足，不进入强势追踪。'
     }
   };
@@ -2157,6 +2165,7 @@ function attachRecommendationMetadata(item) {
   const holdingProfile = assessRecommendationHorizons(item);
   const result = {
     ...item,
+    executionTiming:executionWindow(item.recommendationContext?.evaluatedAt || Date.now()),
     dataConfidence,
     holdingProfile,
     holdingPeriod:holdingProfile.primary
@@ -2528,7 +2537,9 @@ function classifyMarketRegime(overview = {}, previous = null) {
   const turnover = finiteNumber(overview.turnover), previousTurnover = finiteNumber(previous?.turnover);
   const turnoverChangePct = turnover !== null && previousTurnover !== null && previousTurnover > 0
     ? (turnover / previousTurnover - 1) * 100 : null;
-  const strongSectors = (overview.sectors || []).filter(row => !row.rotationIntraday?.retreating && Number(row.changePct) >= 1.5
+  const strongSectors = (overview.sectors || []).filter(row => !row.rotationIntraday?.retreating
+    && !row.participation?.divergent && !row.participation?.capitalConcentrated && !assessSectorCapitalTrend(row).weakening
+    && Number(row.changePct) >= 1.5
     && Number(row.upRatio) >= .65 && (!row.capitalStale && !row.capitalEstimated ? Number(row.mainNetInflow) > 0 : Number(row.rotationScore) >= 65));
   const limitUp = Number(overview?.limits?.upCount || 0), limitDown = Number(overview?.limits?.downCount || 0);
   const broadWeak = upRatio !== null && upRatio <= .35 || indexAverage !== null && indexAverage <= -1;
@@ -2543,7 +2554,7 @@ function classifyMarketRegime(overview = {}, previous = null) {
   else if (broadStrong) { key = 'broad-advance'; label = volumeExpanded ? '放量普涨扩散' : '普涨扩散'; }
   else if (indexAverage !== null && indexAverage >= .5 && upRatio !== null && upRatio < .5) { key = 'index-divergence'; label = '指数强、个股弱'; }
   return {key,label,up,down,flat,upRatio,indexAverage,turnover,previousTurnover,turnoverChangePct,
-    volumeExpanded,strongSectorCount:strongSectors.length,strongSectors:strongSectors.slice(0,6).map(row=>row.name),
+    volumeExpanded,strongSectorCount:strongSectors.length,strongSectors:strongSectors.map(row=>row.name),
     riskOff:['risk-release','broad-weak'].includes(key),riskOn:key === 'broad-advance',localized:key === 'localized-strength',
     evidence:[active ? `上涨${up}、下跌${down}、平盘${flat}` : '市场宽度不可用',
       indexAverage === null ? '指数方向不可用' : `主要指数平均${signedPercent(indexAverage)}`,
@@ -2572,10 +2583,13 @@ function applyEntryContextAssessment(analysis, { newsContext = null, riskProfile
   const industry = normalizeSectorCapitalName(resolveRecommendationIndustry(subject));
   const weakIndustry = profiles.find(row => row.boardType === 'industry' && row.name === industry
     && assessSectorCapitalTrend(row).weakening);
-  const relatedSector = weakIndustry || profiles[0];
   const localizedNames = marketOverview?.marketRegime?.strongSectors || [];
-  const outsideLocalizedMainline = Boolean(marketOverview?.marketRegime?.localized && relatedSector
-    && !localizedNames.some(name => normalizeSectorCapitalName(name) === normalizeSectorCapitalName(relatedSector.name)));
+  const localizedProfile = profiles.find(row => localizedNames.some(name => normalizeSectorCapitalName(name) === normalizeSectorCapitalName(row.name))
+    && !row.capitalEstimated && !row.capitalStale && Number(row.mainNetInflow) > 0
+    && !row.rotationIntraday?.retreating && !assessSectorCapitalTrend(row).weakening
+    && !row.participation?.divergent && !row.participation?.capitalConcentrated);
+  const relatedSector = weakIndustry || (marketOverview?.marketRegime?.localized ? localizedProfile : null) || profiles[0];
+  const outsideLocalizedMainline = Boolean(marketOverview?.marketRegime?.localized && !localizedProfile);
   const directSectorCapital = relatedSector && !relatedSector.capitalEstimated && !relatedSector.capitalStale && finiteNumber(relatedSector.mainNetInflow) !== null;
   const sectorRotationSummary = relatedSector
     ? `${relatedSector.name}${relatedSector.rotationState || '轮动中性'}，板块涨跌${signedPercent(relatedSector.changePct)}${Number.isFinite(Number(relatedSector.upRatio)) ? `，上涨占比${(Number(relatedSector.upRatio) * 100).toFixed(0)}%` : ''}${directSectorCapital ? `，主力净${Number(relatedSector.mainNetInflow) >= 0 ? '流入' : '流出'}${formatCapitalAmount(Math.abs(Number(relatedSector.mainNetInflow)))}，占比${signedPercent(relatedSector.mainNetPct)}${relatedSector.capitalRank ? `，资金排名${relatedSector.capitalRank}` : ''}` : '，资金为量价活跃度估算'}`
@@ -2594,7 +2608,8 @@ function applyEntryContextAssessment(analysis, { newsContext = null, riskProfile
   const contextRisks = [riskProfile?.status === 'risk' ? '公司风险' : '', newsSignal === '偏谨慎' ? '个股消息风险' : '',
     marketNewsSignal === '偏谨慎' ? '大盘消息风险' : '', marketWeak ? '大盘偏弱' : '', outsideLocalizedMainline ? '局部主线外' : '', sectorWeak ? '板块退潮' : '',
     sectorRetreating ? '板块盘中资金回撤' : '',
-    usGrowthRisk ? '美股科技风险' : '', relatedSector?.participation?.divergent ? '板块少数个股拉动' : ''].filter(Boolean);
+    usGrowthRisk ? '美股科技风险' : '', relatedSector?.participation?.divergent ? '板块少数个股拉动' : '',
+    relatedSector?.participation?.capitalConcentrated ? '板块资金集中' : ''].filter(Boolean);
   const technicalRisk = ['破位', '爆量观察', '结构偏弱', '公司风险'].includes(entry.status);
   let entryAssessment = {
     ...entry,
@@ -2618,7 +2633,7 @@ function applyEntryContextAssessment(analysis, { newsContext = null, riskProfile
     entryAssessment = { ...entryAssessment, allowed:false, status:'板块资金回撤，等待确认', tone:'warning', summary:`${entryAssessment.summary} ${relatedSector.rotationIntraday.summary}，不按盘中峰值确认主线。` };
   } else if (usGrowthRisk && !technicalRisk) {
     entryAssessment = { ...entryAssessment, allowed: false, status: '美股科技风险待确认', tone: 'warning', summary: `${entryAssessment.summary} 海外科技风险偏高，等待A股价格、量能和阶段资金重新确认。` };
-  } else if (relatedSector?.participation?.divergent && !technicalRisk) {
+  } else if ((relatedSector?.participation?.divergent || relatedSector?.participation?.capitalConcentrated) && !technicalRisk) {
     entryAssessment = { ...entryAssessment, allowed:false, status:'板块分化，等待确认', tone:'warning' };
   }
   if (contextRisks.length) entryAssessment.allowed = false;
@@ -2977,7 +2992,10 @@ function summarizeRecommendationOutcomes(rows, { now = Date.now(), minimumAgeDay
       invalidCount++;
       continue;
     }
-    if ((currentTime - addedAt) / 864e5 < minimumAgeDays) {
+    const executionTiming = executionWindow(addedAt);
+    const firstExitAt = executionTiming.sellDate ? Date.parse(`${executionTiming.sellDate}T09:30:00+08:00`) : NaN;
+    if (addedAt > currentTime || minimumAgeDays > 0 && (!Number.isFinite(firstExitAt) || currentTime < firstExitAt)
+      || minimumAgeDays > 1 && (currentTime - addedAt) / 864e5 < minimumAgeDays) {
       immatureCount++;
       continue;
     }
@@ -3069,6 +3087,7 @@ function summarizeRecommendationOutcomes(rows, { now = Date.now(), minimumAgeDay
     attributedCount: samples.filter(row => row.signal).length,
     unattributedCount: samples.filter(row => !row.signal).length,
     minimumAgeDays,
+    maturityPolicy:'recommendation-earliest-buy-plus-next-trading-day',
     recentDays,
     recentWindowDays: recentSelection.windowDays,
     recentCohortCount: recentSelection.cohortCount,
@@ -3114,6 +3133,7 @@ function recommendationOutcomeMetadata(profile) {
     unattributedCount: profile.unattributedCount,
     excludedCount: profile.excludedCount,
     immatureCount: profile.immatureCount,
+    maturityPolicy: profile.maturityPolicy,
     recentCohortCount: profile.recentCohortCount,
     recentWindowDays: profile.recentWindowDays,
     recentExtended: profile.recentExtended,
@@ -3226,7 +3246,7 @@ function calibrateRecommendationWithOutcomes(item, profile) {
 
 function recommendationContextBlocked(item) {
   return (item?.entryAssessment?.contextRisks || []).some(risk =>
-    ['公司风险','个股消息风险','大盘消息风险','板块退潮','美股科技风险'].includes(risk));
+    ['公司风险','个股消息风险','大盘消息风险','板块退潮','美股科技风险','板块盘中资金回撤','板块资金集中','板块少数个股拉动'].includes(risk));
 }
 
 function recommendationGateDecision(item) {
@@ -3817,6 +3837,7 @@ function buildBackgroundWatchRecommendations(scored, screening, tradeDate, now =
       newsContext:{signal:'中性',available:false,summary:'后台全市场因子阶段尚未补齐个股消息，严格推荐前需重新核验。'},
       holdingPeriod:candidate.horizon || '周期待确认',
       analysisId:screening.analysisId,
+      executionTiming:executionWindow(screening.generatedAt),
       fullMarketFactor:{rps20:candidate.rps20,rps60:candidate.rps60,rps120:candidate.rps120,rps250:candidate.rps250,scope:screening.complete ? 'full-market' : 'partial-market'},
       entryAssessment:{allowed:false,status:'等待实时资金、消息和公司风险确认',tone:'neutral',summary:'全市场历史因子已通过；严格推荐前仍需补齐实时资金、消息和未来半年公司风险。',evidence:['后台全市场历史任务']},
       reason:`后台${screening.complete ? '全市场' : '部分市场'}历史因子：${candidate.stage || '策略命中'}，RPS20 ${candidate.rps20 ?? '--'}；仅进入观察池。`,
@@ -3899,8 +3920,13 @@ function finalizeMomentumRecommendations(items, limit = Infinity, perSector = In
   const selectedCodes = new Set();
   const selected = [];
   const candidates = (items || []).filter(item => item.momentumDecision?.passed && !recommendationContextBlocked(item))
+    .filter(item => !analyzeCapitalWindows(item.fundFlowPeriod, item.analysis?.tradeDate).weakening
+      && !['破位','结构偏弱','资金未确认','资金时效待确认'].includes(item.entryAssessment?.status))
     .filter(item => Number.isFinite(Number(item.signalScore)) && Number(item.signalScore) >= 60)
-    .sort((a, b) => Number(b.signalScore || 0) - Number(a.signalScore || 0)
+    .sort((a, b) => Number(Boolean(a.entryAssessment?.contextRisks?.length)) - Number(Boolean(b.entryAssessment?.contextRisks?.length))
+      || Number(Boolean(a.momentumDecision?.noChase)) - Number(Boolean(b.momentumDecision?.noChase))
+      || Number(Boolean(b.momentumDecision?.firstPullback)) - Number(Boolean(a.momentumDecision?.firstPullback))
+      || Number(b.signalScore || 0) - Number(a.signalScore || 0)
       || Number(b.momentumDecision?.score || 0) - Number(a.momentumDecision?.score || 0));
   for (const item of candidates) {
     const code = String(item?.code || '');
@@ -4029,6 +4055,7 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
         latestPrice: history.at(-1)?.close || null
       };
       const item = { ...quote, analysis };
+      item.momentumDecision = momentumRecommendationDecision(item);
       return { ...item, estimatedFundFlow: estimateFundFlowFromHistory(history, 10), reboundQuality: assessReboundQuality(item), breakoutQuality: assessBreakoutQuality(item) };
   });
   historyResults.forEach(result => {
@@ -6229,7 +6256,7 @@ function analyzeAccumulationSetup(history) {
 function assessCurrentEntry({
   latestPrice, ma5, ma10, ma20, ma30, supportPrice, resistance, volumeRatio, rsi14,
   breakoutStatus, accumulationSetup = null, consolidationBreakout = null,
-  macdHistogram = null, return20 = null, observationPhase = null
+  macdHistogram = null, return20 = null, observationPhase = null, firstPullback = false
 }) {
   const price = Number(latestPrice);
   const support = Number(supportPrice);
@@ -6282,6 +6309,10 @@ function assessCurrentEntry({
   }
   if (breakoutStatus === '结构偏弱') {
     return withStructure({ allowed: false, status: '结构偏弱', tone: 'negative', summary: '横盘或量价结构已经转弱，当前不建议入场，等待重新站回关键均线和支撑位。', evidence });
+  }
+  if (firstPullback && observationPhase?.phase === 'closed') {
+    return withStructure({allowed:false, status:'首次缩量回踩，核验承接', tone:'warning', setupType:'first-pullback',
+      summary:`近期1.5-4.0倍放量突破后首次缩量回踩，现价${price.toFixed(2)}元回到MA20 ${Number(ma20).toFixed(2)}元附近，量比${ratio.toFixed(2)}，收盘未失守突破支撑。继续核验阶段主力资金和次日承接；若跌破突破支撑或MA20，回踩条件失效。`, evidence});
   }
   const priceConfirmed = price > breakout;
   const breakoutAdvancePct = breakout ? (price / breakout - 1) * 100 : 0;
@@ -6576,6 +6607,8 @@ function analyzeHistory(history, options = {}) {
   const direction = periodReturn >= 0 ? '上涨' : '下跌';
   const accumulationSetup = analyzeAccumulationSetup(rows);
   const breakoutContext = detectBreakoutContext(rows);
+  const firstPullback = isFirstPullback({close:latest.close, ma20, ma30, volumeRatio,
+    high20:Math.max(...closes.slice(-20)), breakoutContext}, {observationPhase});
   const consolidationBreakout = analyzeConsolidationBreakout(rows);
   const trendContinuation = analyzeTrendContinuation(rows);
   const pathMetrics = analyzePathMetrics(history);
@@ -6627,9 +6660,9 @@ function analyzeHistory(history, options = {}) {
   const entryAssessment = assessCurrentEntry({
     latestPrice: latest.close, ma5, ma10, ma20, ma30, supportPrice, resistance,
     volumeRatio, rsi14, breakoutStatus: consolidationBreakout.status,
-    accumulationSetup, consolidationBreakout, macdHistogram, return20, observationPhase
+    accumulationSetup, consolidationBreakout, macdHistogram, return20, observationPhase, firstPullback
   });
-  if (['破位', '爆量观察', '结构偏弱'].includes(entryAssessment.status)) tradePlan.enabled = false;
+  if (firstPullback || ['破位', '爆量观察', '结构偏弱'].includes(entryAssessment.status)) tradePlan.enabled = false;
   return {
     tradeDate:latest.date, observationPhase,
     summary: `${summary} 趋势持续性：${trendContinuation.summary}。 长周期：${pathMetrics.summary}。`, trendContinuation, pathMetrics,
@@ -6641,11 +6674,11 @@ function analyzeHistory(history, options = {}) {
     bollUpper: roundMetric(bollUpper), bollMiddle: roundMetric(ma20), bollLower: roundMetric(bollLower),
     atr14: roundMetric(atr14), volatility20: roundMetric(volatility20, 1), maxDrawdown: roundMetric(maxDrawdown, 1),
     breakoutPrice: roundMetric(resistance), supportPrice: roundMetric(supportPrice), distanceToBreakout: roundMetric(distanceToBreakout),
-    score, verdict, buyCondition, risk, entry, exit, tradePlan, entryAssessment,
+    score, verdict, buyCondition:firstPullback ? entryAssessment.summary : buyCondition, risk, entry, exit, tradePlan, entryAssessment,
     reboundSignal, reboundScore, reboundReason, bottomDate: bottomRow.date,
     bottomPrice: roundMetric(bottomRow.low), bottomDrawdown: roundMetric(bottomDrawdown, 1),
     reboundFromBottom: roundMetric(reboundFromBottom, 1), bottomRangePosition: roundMetric(bottomRangePosition, 1),
-    daysSinceBottom, macdImproving, shortAverageImproving, accumulationSetup, consolidationBreakout, breakoutContext,
+    daysSinceBottom, macdImproving, shortAverageImproving, accumulationSetup, consolidationBreakout, breakoutContext, firstPullback,
     entryWindow: falling ? '等待趋势条件触发，通常至少观察5-15个交易日。' : '未来3-10个交易日，条件未触发则继续等待。',
     exitWindow: '入场后1-4周持续观察，价格与成交量条件优先于固定日期。'
   };
@@ -6712,6 +6745,7 @@ async function fetchStockHistory({ code, name, industry = '', sector = '', force
   const liveQuoteForTiming = quoteResult.status === 'fulfilled' ? quoteResult.value[0] : null;
   const observationPhase = resolveObservationPhase(stockTradeDate, stockObservedAt, {sourceObservedAt:liveQuoteForTiming?.quoteObservedAt});
   let analysis = analyzeHistory(history, {observationPhase});
+  analysis.executionTiming = executionWindow(stockObservedAt);
   const historicalFlow = fundFlowResult.status === 'fulfilled'
     ? { ...fundFlowResult.value }
     : { ...estimateFundFlowFromHistory(history, 10), fallbackReason:fundFlowResult.reason?.message || String(fundFlowResult.reason || '') };
@@ -7508,6 +7542,8 @@ ipcMain.handle('execute-research-order', async (_event, order = {}) => {
   const loaded = await loadResearchAccount();
   if (!loaded.value) return {ok:false, error:'请先创建研究模拟账户'};
   try {
+    const submittedAt = new Date().toISOString();
+    order = {...order,submittedAt,tradeDate:executionWindow(submittedAt).date};
     const result = executeResearchOrder(loaded.value, order);
     await atomicWriteJson(researchAccountFile(), result.account);
     appendLogLine({type:result.ok ? 'success' : 'warn', action:result.ok ? 'research_order_filled' : 'research_order_rejected', message:result.ok ? '研究模拟委托成交' : '研究模拟委托被拒绝', detail:{order, reason:result.reason || '', fill:result.fill || null}});

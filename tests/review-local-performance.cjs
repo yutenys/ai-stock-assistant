@@ -4,7 +4,8 @@ const { monitorEventLoopDelay } = require('node:perf_hooks');
 const { api, live } = require('./market-diagnostics.cjs');
 const root = path.resolve(__dirname, '..');
 const read = name => JSON.parse(fs.readFileSync(path.join(root, 'cache', name), 'utf8'));
-const state = read('local-state-review.json');
+const stateFile = path.join(root, 'data', 'user-state.json');
+const state = fs.existsSync(stateFile) ? JSON.parse(fs.readFileSync(stateFile, 'utf8')) : read('local-state-review.json');
 async function main() {
   const snapshot = process.argv.includes('--snapshot') ? read('review-live-snapshot.json')
     : { ...await live.fetchTencentMarketSnapshot(), fetchedAt:new Date().toISOString() };
@@ -25,11 +26,6 @@ async function main() {
     recommendationContext:stock.favoriteEntrySnapshot?.context || null
   })));
   const pricedOutcomes = api.mergeRecommendationOutcomeQuotes(favoriteOutcomes, snapshot.quotes);
-  const profile = api.summarizeRecommendationOutcomes(pricedOutcomes, {now:quoteFetchedAt,requireFreshQuote:true});
-  const cohorts = (state.labels || []).filter(label => !excluded(label.name)).map(label => {
-    const stats = api.summarizeRecommendationOutcomes(pricedOutcomes.filter(row => row.label === label.name), {now:quoteFetchedAt,requireFreshQuote:true});
-    return { label:label.name, ...stats.overall, immatureCount:stats.immatureCount, invalidCount:stats.invalidCount };
-  });
   // Old positions cannot safely be attributed using their current label membership.
   const positions = (state.portfolio || []).map(position => {
     const price = quotes.get(position.code)?.price;
@@ -48,6 +44,17 @@ async function main() {
     console.log(JSON.stringify(row));
   });
   eventLoop.disable();
+  const benchmarkedOutcomes = api.mergeRecommendationOutcomeBenchmarks(pricedOutcomes, market.indices, market.sectors);
+  const profile = api.summarizeRecommendationOutcomes(benchmarkedOutcomes, {now:quoteFetchedAt,requireFreshQuote:true});
+  const cohorts = (state.labels || []).filter(label => !excluded(label.name)).map(label => {
+    const rows = benchmarkedOutcomes.filter(row => row.label === label.name);
+    const stats = api.summarizeRecommendationOutcomes(rows, {now:quoteFetchedAt,requireFreshQuote:true});
+    const earlyObservation = stats.immatureCount ? {
+      ...api.summarizeRecommendationOutcomes(rows, {now:quoteFetchedAt,minimumAgeDays:0,requireFreshQuote:true}).overall,
+      calibrationEligible:false
+    } : null;
+    return {label:label.name, ...stats.overall, immatureCount:stats.immatureCount, invalidCount:stats.invalidCount, earlyObservation};
+  });
   const report = { fetchedAt:new Date().toISOString(), quoteFetchedAt, quoteTradeDate:snapshot.quotes[0]?.tradeDate,
     marketFetchedAt:market.fetchedAt, breadth:market.breadth, marketNews:market.newsContext, overseas:market.overseas,
     profile, cohorts, positions, simulatedTradeCount:state.simulatedTrades?.length || 0,

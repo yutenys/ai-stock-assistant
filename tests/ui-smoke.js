@@ -621,6 +621,9 @@ app.whenReady().then(async () => {
     return document.getElementById('stockContainer').innerText;
   })()`);
   const simulationState = await win.webContents.executeJavaScript(`(async () => {
+    window.originalTradeClock = Date.now;
+    window.simulatedTradeClock = Date.parse('2026-08-12T10:00:00+08:00');
+    Date.now = () => window.simulatedTradeClock;
     const defaultPrice = document.querySelector('[data-sim-price="603567"]').value;
     document.querySelector('[data-sim-price="603567"]').value = '10';
     document.querySelector('[data-sim-amount="603567"]').value = '10000';
@@ -652,12 +655,15 @@ app.whenReady().then(async () => {
     const halfSellQuantity = document.querySelector('[data-sim-sell-quantity="603567"]').value;
     document.querySelector('[data-sim-price="603567"]').value = '12';
     document.querySelector('[data-sim-trade="sell"]').click();
+    const sameDayBlocked = portfolioPosition('603567').quantity === 1000;
+    window.simulatedTradeClock = Date.parse('2026-08-13T10:00:00+08:00');
+    document.querySelector('[data-sim-trade="sell"]').click();
     await new Promise(resolve => setTimeout(resolve, 20));
     document.getElementById('simulationView').click();
     await new Promise(resolve => setTimeout(resolve, 80));
     const saved = JSON.parse(localStorage.getItem('ai-stock-assistant-state-v1') || '{}');
     return {
-      afterBuy,
+      afterBuy, sameDayBlocked,
       afterSell:document.getElementById('stockContainer').innerText,
       active:document.getElementById('simulationView').classList.contains('active'),
       defaultPrice, defaultSellQuantity, halfSellQuantity, quickSellLabels, pnlColors,
@@ -680,6 +686,7 @@ app.whenReady().then(async () => {
     document.querySelector('[data-portfolio-sell-ratio]').value = '0.5';
     document.querySelector('[data-portfolio-batch="sell"]').click();
     const afterBatchSell = JSON.parse(localStorage.getItem('ai-stock-assistant-state-v1') || '{}').portfolio?.find(item => item.code === '603567')?.quantity;
+    Date.now = window.originalTradeClock;
     return { refreshExists, refreshReady, selectedAll, afterBatchBuy, afterBatchSell };
   })()`);
   const liveNewsState = await win.webContents.executeJavaScript(`(async () => {
@@ -1079,6 +1086,7 @@ app.whenReady().then(async () => {
     && state.chartState.refresh.disabled === false
     && state.chartState.refresh.metaBeforeRefresh !== state.chartState.refresh.metaAfterRefresh;
   const simulationUsable = state.simulationState.active
+    && state.simulationState.sameDayBlocked
     && /1000股[\s\S]*¥11.08 \/ ¥10.00[\s\S]*1080[\s\S]*\+10.80%/.test(state.simulationState.afterBuy)
     && /500股[\s\S]*¥11.08 \/ ¥10.00[\s\S]*540[\s\S]*\+10.80%[\s\S]*1000[\s\S]*1540/.test(state.simulationState.afterSell)
     && state.simulationState.position?.quantity === 500

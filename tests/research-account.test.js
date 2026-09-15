@@ -26,6 +26,19 @@ test('研究账户执行T+1并逐笔记录拒绝原因', () => {
   assert.ok(nextDay.account.realizedPnl > 900);
 });
 
+test('研究账户不能在午休盘后或休市日成交，也不能使用伪造交易日', () => {
+  const account=createResearchAccount({accountId:'time',initialCash:100000,rules});
+  const order={side:'buy',code:'600001',price:10,quantity:100,tradeDate:'2026-09-15'};
+  for (const time of ['09:29:00','11:30:00','12:30:00','15:00:00']) {
+    assert.equal(executeResearchOrder(account,{...order,submittedAt:`2026-09-15T${time}+08:00`}).ok,false);
+  }
+  assert.equal(executeResearchOrder(account,{...order,submittedAt:'2026-09-16T10:00:00+08:00'}).ok,false);
+  assert.equal(executeResearchOrder(account,{...order,tradeDate:'2026-09-25'}).ok,false);
+  const bought=executeResearchOrder(account,{...order,tradeDate:'2026-09-18',submittedAt:'2026-09-18T14:00:00+08:00'}).account;
+  assert.equal(executeResearchOrder(bought,{...order,side:'sell',tradeDate:'2026-09-19'}).ok,false);
+  assert.equal(executeResearchOrder(bought,{...order,side:'sell',tradeDate:'2026-09-21'}).ok,true);
+});
+
 test('研究账户按最新可用报价计算真实权益和集中度', () => {
   let account = createResearchAccount({accountId:'r-1', initialCash:100000, rules});
   account = executeResearchOrder(account, {side:'buy', code:'600001', price:10, quantity:5000, tradeDate:'2026-09-14', industry:'半导体'}).account;

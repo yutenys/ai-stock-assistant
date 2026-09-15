@@ -251,6 +251,86 @@ test('公开资金分项使用超大单加大单且缺失不冒充零', () => {
   assert.equal(normalizeEastmoneyFundFlow({f64:1}).mainInflow,null);
 });
 
+test('局部主线匹配所有所属板块，缺失或陈旧资金不能放行', () => {
+  const base={entryAssessment:{allowed:true,status:'可分批入场',summary:'技术成立',evidence:[]},tradePlan:{enabled:true}};
+  const marketOverview={marketRegime:{localized:true,label:'普跌中的局部强势',strongSectors:['风电设备']}};
+  const industry={name:'通信设备',capitalEstimated:false,mainNetInflow:2e8,mainNetPct:2};
+  const theme={name:'风电设备',capitalEstimated:false,mainNetInflow:1e8,mainNetPct:1};
+  const evaluate=rotationProfiles => applyEntryContextAssessment(base,{marketOverview,subject:{industry:'通信设备',rotationProfiles}});
+  assert.equal(evaluate([industry,theme]).entryAssessment.allowed,true);
+  assert.equal(evaluate([theme,industry]).entryAssessment.allowed,true);
+  assert.equal(evaluate([]).entryAssessment.allowed,false);
+  assert.equal(evaluate([industry,{...theme,capitalStale:true}]).entryAssessment.allowed,false);
+  assert.equal(evaluate([industry,{...theme,participation:{capitalConcentrated:true}}]).entryAssessment.allowed,false);
+  assert.equal(evaluate([industry,{...theme,rotationIntraday:{retreating:true}}]).entryAssessment.allowed,false);
+});
+
+test('主线名单不受展示六项限制且集中拉动不确认扩散', () => {
+  const sectors=Array.from({length:8},(_,i)=>({name:`行业${i}`,changePct:2,upRatio:.8,mainNetInflow:1e8,capitalEstimated:false}));
+  const result=classifyMarketRegime({breadth:{up:1000,down:4000},sectors:[...sectors,
+    {...sectors[0],name:'集中',participation:{capitalConcentrated:true}}]});
+  assert.equal(result.strongSectors.length,8);
+  assert.ok(result.strongSectors.includes('行业7'));
+  assert.ok(!result.strongSectors.includes('集中'));
+});
+
+test('回踩通道允许缩量低涨幅，但仍排除失去资金确认的板块', () => {
+  const profile={name:'风电设备',capitalEstimated:false,mainNetInflow:1e8,mainNetPct:2,rotationScore:80};
+  const item={code:'600001',price:10.4,high:10.5,changePct:-.5,amount:1e8,snapshotVolumeRatio:.9,
+    rotationProfiles:[profile],analysis:{firstPullback:true,volumeRatio:.9}};
+  const result=momentumRecommendationDecision(item);
+  assert.equal(result.passed,true);
+  assert.equal(result.firstPullback,true);
+  assert.match(result.entryAssessment.status,/首次缩量回踩/);
+  assert.equal(result.entryAssessment.allowed,false);
+  assert.equal(momentumRecommendationDecision({...item,analysis:{firstPullback:false}}).passed,false);
+  for (const changes of [{capitalStale:true},{participation:{capitalConcentrated:true}},{rotationIntraday:{retreating:true}}]) {
+    assert.equal(momentumRecommendationDecision({...item,rotationProfiles:[{...profile,...changes}]}).passed,false);
+  }
+});
+
+test('强势追踪先主线和回踩，再等待与过热，硬资金风险排除', () => {
+  const row=(code,score,decision={},risks=[])=>({code,signalScore:score,
+    momentumDecision:{passed:true,score,profile:{name:'板块'},entryAssessment:{allowed:false,status:'等待回踩'},...decision},
+    entryAssessment:{contextRisks:risks}});
+  const result=finalizeMomentumRecommendations([
+    row('outside',95,{},['局部主线外']),row('hot',90,{noChase:true}),row('wait',80),
+    row('pullback',65,{firstPullback:true}),row('retreat',98,{},['板块盘中资金回撤']),
+    {...row('broken',99),entryAssessment:{status:'破位'}}
+  ]);
+  assert.deepEqual(result.map(item=>item.code),['pullback','wait','hot','outside']);
+  assert.ok(result.every(item=>item.entryAssessment.allowed===false));
+});
+
+test('首次回踩同步到个股入场分析，破位优先且资金未确认不自动低吸', () => {
+  const input={latestPrice:10.4,ma5:10.7,ma10:10.5,ma20:10.15,ma30:10.1,supportPrice:10.15,resistance:11.2,
+    volumeRatio:.9,rsi14:55,firstPullback:true,observationPhase:{phase:'closed'}};
+  const entry=assessCurrentEntry(input);
+  assert.equal(entry.setupType,'first-pullback');
+  assert.equal(entry.allowed,false);
+  assert.match(entry.summary,/阶段主力资金/);
+  assert.equal(assessCurrentEntry({...input,latestPrice:9}).status,'破位');
+  assert.notEqual(assessCurrentEntry({...input,observationPhase:{phase:'intraday'}}).setupType,'first-pullback');
+});
+
+test('完整日线分析识别首次回踩并进入强势通道，不要求当日大涨', () => {
+  const candle=(index,close,volume)=>({date:new Date(Date.UTC(2026,5,index+1)).toISOString().slice(0,10),
+    open:close,close,high:close+.05,low:close-.05,volume});
+  const rows=[...Array.from({length:70},(_,index)=>candle(index,10,1000)),
+    candle(70,11,2000),candle(71,11.2,1100),candle(72,10.4,900)];
+  const analysis=analyzeHistory(rows,{observationPhase:{phase:'closed'}});
+  assert.equal(analysis.firstPullback,true);
+  assert.equal(analysis.entryAssessment.setupType,'first-pullback');
+  assert.equal(analysis.tradePlan.enabled,false);
+  assert.match(analysis.buyCondition,/首次缩量回踩/);
+  const item={code:'600001',price:10.4,high:10.45,changePct:-.5,amount:1e8,analysis,
+    rotationProfiles:[{name:'板块',capitalEstimated:false,mainNetInflow:1e8,mainNetPct:2,rotationScore:80}]};
+  assert.equal(momentumRecommendationDecision(item).passed,true);
+  const intraday=analyzeHistory(rows,{observationPhase:{phase:'intraday'}});
+  assert.equal(intraday.firstPullback,false);
+  assert.equal(momentumRecommendationDecision({...item,analysis:intraday}).passed,false);
+});
+
 test('逐日资金保留百分比单位并标记不足十日，汇总不丢弃真实明细', () => {
   const result = summarizeEastmoneyFundHistory(['2026-09-09,-100,20,80,-120,20,-0.5,1,2,3,4,10,-1'],10);
   assert.equal(result.rows[0].mainNetPct,-.5);
@@ -1245,10 +1325,11 @@ test('后台全市场结果可发布超过160只观察候选且不冒充严格�
   const tradeDate='2026-09-14';
   const scored=Array.from({length:220},(_,index)=>({code:String(600000+index),name:`测试${index}`,industry:`行业${index%12}`,price:10,changePct:1,amount:1e8}));
   const screening={tradeDate,generatedAt:'2026-09-14T07:00:00.000Z',modelVersion:RECOMMENDATION_MODEL_VERSION,analysisId:'full-1',
-    complete:true,historyCovered:220,universe:220,candidates:scored.map((item,index)=>({code:item.code,status:index%3?'watch':'strict',score:70,stage:'接近突破',horizon:'波段',rps20:80}))};
+    complete:true,historyCovered:220,universe:220,candidates:scored.map((item,index)=>({code:item.code,status:index%3?'watch':'strict',score:70,stage:'接近突破',horizon:'波段',rps20:80,previousHigh20:10.2,ma30:9.8}))};
   const rows=buildBackgroundWatchRecommendations(scored,screening,tradeDate,Date.parse('2026-09-14T08:00:00.000Z'));
   assert.equal(rows.length,220);
   assert.ok(rows.every(item=>item.recommendationTier==='观察候选' && item.entryAssessment.allowed===false));
+  assert.equal(buildBackgroundWatchRecommendations(scored,{...screening,candidates:[{...screening.candidates[0],ma30:null}]},tradeDate,Date.parse('2026-09-14T08:00:00.000Z')).length,0);
 });
 
 test('详情多因子评分独立于CANSLIM且缺失项不按中性满配', () => {
@@ -2035,7 +2116,7 @@ test('推荐信号统计区分突破形态与吸筹洗盘形态', () => {
   assert.equal(recommendationSignalFamily('已反弹'), 'rebounded');
 });
 
-test('本地推荐复盘排除指定标签和不足一天的样本', () => {
+test('本地推荐复盘排除指定标签和尚未到T+1可卖时点的样本', () => {
   const now = Date.parse('2026-08-17T12:00:00.000Z');
   const row = (label, signal, score, base, price, addedAt) => ({
     label, signal, signalScore:score, favoriteBasePrice:base, price, favoriteAddedAt:addedAt
@@ -2055,6 +2136,17 @@ test('本地推荐复盘排除指定标签和不足一天的样本', () => {
   assert.equal(profile.byScoreBand['55-64'].count, 1);
   assert.equal(profile.excludedCount, 2);
   assert.equal(profile.immatureCount, 1);
+});
+
+test('收藏成熟时点区分盘中与盘后，不使用自然24小时代替交易日', () => {
+  const row=(label,addedAt)=>({code:'600001',label,favoriteAddedAt:addedAt,favoriteBasePrice:10,price:9});
+  const rows=[row('盘中','2026-09-14T14:00:00+08:00'),row('盘后','2026-09-14T16:00:00+08:00')];
+  const nextMorning=summarizeRecommendationOutcomes(rows,{now:Date.parse('2026-09-15T10:00:00+08:00')});
+  assert.equal(nextMorning.sampleSize,1);
+  assert.equal(nextMorning.immatureCount,1);
+  assert.equal(summarizeRecommendationOutcomes(rows,{now:Date.parse('2026-09-15T09:00:00+08:00')}).sampleSize,0);
+  assert.equal(summarizeRecommendationOutcomes(rows,{now:Date.parse('2026-09-16T10:00:00+08:00')}).sampleSize,2);
+  assert.equal(summarizeRecommendationOutcomes([row('周五盘后','2026-09-18T16:00:00+08:00')],{now:Date.parse('2026-09-21T16:00:00+08:00')}).sampleSize,0);
 });
 
 test('推荐复盘使用最新行情覆盖收藏旧价', () => {
@@ -2188,8 +2280,9 @@ test('跨周末近期样本不足时按最新推荐版本扩窗', () => {
   addCohort('0820盘中', 9, '2026-08-20T01:00:00.000Z', -2.8);
   addCohort('0819盘中', 14, '2026-08-19T02:00:00.000Z', 1);
   const profile = summarizeRecommendationOutcomes(rows, { now });
-  assert.equal(profile.recentOverall.count, 28);
-  assert.equal(profile.recentCohortCount, 3);
+  assert.equal(profile.recentOverall.count, 20);
+  assert.equal(profile.recentCohortCount, 2);
+  assert.equal(profile.immatureCount, 8);
   assert.equal(profile.recentExtended, true);
   assert.equal(profile.marketRisk.status, 'drawdown');
 });

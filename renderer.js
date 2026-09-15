@@ -331,6 +331,7 @@ function recommendationCardHtml(item, selectable=false){
   const unifiedScore = item.scoreCard?.recommendation ?? item.signalScore ?? item.score;
   const content = `<span class="market-stock-content"><b class="market-stock-head"><span class="market-stock-name">${escapeHtml(item.name)}</span><span class="code">${escapeHtml(item.code)}</span><span class="market-signal ${badgeClass(item.signal)}">${escapeHtml(item.signal || '待突破')}</span><span class="market-signal ${badgeClass(item.newsLabel)}">${escapeHtml(item.newsLabel || '消息中性')}</span><span class="market-signal b-blue">${escapeHtml(item.holdingPeriod || '周期待确认')}</span><span class="market-current-price">${yuan(item.price)}</span><span class="market-current-change ${changeClass}">${formatPct(item.changePct)}</span></b>
     <span>${escapeHtml(sectorLabel)} · ${escapeHtml(verdictLabel || '等待确认')} · ${scoreLabel} ${escapeHtml(unifiedScore)} · ${escapeHtml(confidence)} · ${escapeHtml(recommendationCanslimText(item))} · ${escapeHtml(recommendationFactorText(item))} · MA30 ${yuan(item.ma30)} · 突破价 ${yuan(item.breakoutPrice)}</span>
+    ${item.executionTiming?.summary ? `<small>${escapeHtml(item.executionTiming.summary)}</small>` : ''}
     <small>${escapeHtml(item.reason || '')}</small></span>`;
   if(selectable) return `<label class="market-recommendation market-stock-choice" data-market-industry="${escapeHtml(industry)}"><input type="checkbox" data-market-stock-choice="${escapeHtml(item.code)}" checked />${content}</label>`;
   return `<button class="market-recommendation" data-market-recommendation="${escapeHtml(item.code)}" data-market-industry="${escapeHtml(industry)}">${content}</button>`;
@@ -427,7 +428,7 @@ function renderMarketOverview(result){
   }
   const accumulationCoverage = structureCounts.length ? `；${structureCounts.join('，')}` : '';
   const outcomeCoverage = coverage.outcomeFeedback?.sampleSize
-    ? `；本地推荐复盘 ${coverage.outcomeFeedback.sampleSize} 条（最近${coverage.outcomeFeedback.recentCohortCount || '--'}个版本，实时行情重算，已排除重点关注/personal及不足1天样本）${coverage.outcomeFeedback.marketRisk?.status === 'drawdown' ? '，近期策略处于回撤并已收紧筛选' : ''}`
+    ? `；本地推荐观察 ${coverage.outcomeFeedback.sampleSize} 条（最近${coverage.outcomeFeedback.recentCohortCount || '--'}个版本，实时行情重算，已排除重点关注/personal及未到T+1最早可卖日的样本；收藏涨跌非实际交易收益）${coverage.outcomeFeedback.marketRisk?.status === 'drawdown' ? '，近期策略处于回撤并已收紧筛选' : ''}`
     : '';
   const unresolvedIndustryCoverage = Number(coverage.industryUnresolved) > 0 ? `，${coverage.industryUnresolved} 只行业待补充` : '';
   const tierSummary = Number.isFinite(Number(coverage.strictQualified))
@@ -920,6 +921,11 @@ function executeSimulatedTrade(code, side, options={}){
     if(!options.quiet) notify('模拟交易失败：交易方向无效', 'error');
     return false;
   }
+  const timing = TradeTime.executionWindow(Date.now());
+  if(!timing.tradable){
+    if(!options.quiet) notify(`模拟交易失败：${timing.label}，仅支持交易日9:30-11:30、13:00-15:00成交`, 'error');
+    return false;
+  }
   const stock = findStockByCode(code);
   const price = Number(options.price ?? document.querySelector(`[data-sim-price="${code}"]`)?.value ?? stock?.price);
   const requestedAmount = Number(options.amount ?? document.querySelector(`[data-sim-amount="${code}"]`)?.value);
@@ -951,6 +957,14 @@ function executeSimulatedTrade(code, side, options={}){
     if(!options.quiet) notify('模拟交易失败：数量不足100股或金额超出有效范围', 'error');
     return false;
   }
+  // Legacy positions without acquisition lots stay locked through their last known update day.
+  const buyLocks = position?.buyLocks || (heldQuantity ? [{tradeDate:TradeTime.clock(position?.updatedAt).date || timing.date,quantity:heldQuantity}] : []);
+  const lockedQuantity = buyLocks.filter(lot => !lot.tradeDate || lot.tradeDate >= timing.date)
+    .reduce((sum,lot) => sum + Number(lot.quantity || 0),0);
+  if(side === 'sell' && quantity > Math.max(0,heldQuantity-lockedQuantity)){
+    if(!options.quiet) notify(`T+1：当前可卖${Math.max(0,heldQuantity-lockedQuantity)}股，当日新买仓位不能卖出`, 'error');
+    return false;
+  }
 
   if(!position){
     position = {code, name:stock.name, sector:stock.sector, quantity:0, costPrice:0, realizedPnl:0, lastPrice:Number(stock.price) || price, changePct:stock.changePct, source:stock.source, stock:{...stock}};
@@ -958,11 +972,13 @@ function executeSimulatedTrade(code, side, options={}){
   }
   position.quantity = heldQuantity;
   position.costPrice = heldCost;
+  position.buyLocks = buyLocks.filter(lot=>!lot.tradeDate || lot.tradeDate >= timing.date);
   let realizedPnl = 0;
   if(side === 'buy'){
     const oldCost = position.quantity * position.costPrice;
     position.quantity += quantity;
     position.costPrice = (oldCost + amount) / position.quantity;
+    position.buyLocks.push({tradeDate:timing.date,quantity});
   }else{
     realizedPnl = (price - position.costPrice) * quantity;
     position.quantity -= quantity;
@@ -976,7 +992,7 @@ function executeSimulatedTrade(code, side, options={}){
   position.source = stock.source;
   position.stock = {...position.stock, ...stock};
   position.updatedAt = new Date().toISOString();
-  simulatedTrades.unshift({id:`${Date.now()}-${code}`, time:nowText(), side:side === 'buy' ? '买入' : '卖出', code, name:stock.name, price, quantity, amount, realizedPnl,
+  simulatedTrades.unshift({id:`${Date.now()}-${code}`, time:nowText(), tradeDate:timing.date, earliestSellDate:side === 'buy' ? timing.sellDate : null, side:side === 'buy' ? '买入' : '卖出', code, name:stock.name, price, quantity, amount, realizedPnl,
     entrySnapshot:side === 'buy' ? { capturedAt:new Date().toISOString(), signal:stock.marketSignal || stock.signal || stock.type,
       modelVersion:stock.recommendationModelVersion || '', technicalScore:stock.technicalScore ?? null,
       signalScore:stock.signalScore ?? null, scoreCard:stock.scoreCard ? JSON.parse(JSON.stringify(stock.scoreCard)) : null,
@@ -1960,6 +1976,7 @@ function renderHistoryAnalysis(s, result){
       <p><b>突破 / 支撑：</b>突破确认价 ${yuan(a.breakoutPrice)}；距突破位 ${formatPct(a.distanceToBreakout)}；支撑参考 ${yuan(a.supportPrice)}。</p>
       <p><b>波动风险：</b>${escapeHtml(a.risk || '--')}</p>
       <p><b>是否适合购买：</b>${escapeHtml(a.buyCondition || a.entry)}</p>
+      ${a.executionTiming ? `<p><b>交易时间与T+1：</b>${escapeHtml(a.executionTiming.summary)} ${escapeHtml(a.executionTiming.risk)}</p>` : ''}
       <p><b>入场观察：</b>${escapeHtml(a.entry)}</p>
       <p><b>离场 / 风控：</b>${escapeHtml(a.exit)}</p>
       <p><b>消息面：</b>${escapeHtml(a.newsImpact || result.newsContext?.summary || '未获取到有效消息')}</p>

@@ -3,6 +3,7 @@ const assert=require('node:assert/strict');
 const fs=require('node:fs');
 const path=require('node:path');
 const vm=require('node:vm');
+const tradeTime=require('../lib/trade-time');
 const source=fs.readFileSync(path.join(__dirname,'../renderer.js'),'utf8');
 
 function harness(names, values={}) {
@@ -12,7 +13,8 @@ function harness(names, values={}) {
     assert.ok(index>=0,`Missing renderer function ${name}`);
     return source.slice(declarations[index].index,declarations[index+1]?.index ?? source.length);
   }).join('\n');
-  const context=vm.createContext({notify(){},saveState(){},renderStocks(){},addLog(){},...values});
+  const context=vm.createContext({notify(){},saveState(){},renderStocks(){},addLog(){},
+    TradeTime:{...tradeTime,executionWindow:()=>tradeTime.executionWindow('2026-09-15T10:00:00+08:00')},...values});
   vm.runInContext(code,context);
   return context;
 }
@@ -41,12 +43,14 @@ test('环境观察卡片使用观察评分并展示当前环境限制',()=>{
   const context=harness(['recommendationCardHtml'],{recommendationIndustry:()=>'',pctClass:()=>'',badgeClass:()=>'',
     yuan:String,formatPct:String,escapeHtml:String,recommendationCanslimText:()=>'',recommendationFactorText:()=>''});
   const html=context.recommendationCardHtml({code:'600001',name:'测试',signalScore:80,recommendationTier:'环境观察',
+    executionTiming:{summary:'最早买入 2026-09-16；最早卖出 2026-09-17（T+1）'},
     holdingPeriod:'波段',dataConfidence:{label:'中等',available:4,total:6},
     entryAssessment:{allowed:false,status:'大盘偏弱，等待确认'}});
   assert.match(html,/观察评分 80/);
   assert.match(html,/大盘偏弱，等待确认/);
   assert.match(html,/波段/);
   assert.match(html,/数据可信度 中等 4\/6/);
+  assert.match(html,/最早买入 2026-09-16.*最早卖出 2026-09-17/);
 });
 
 test('推荐首屏按行业选代表股，不让行业分组截断遮蔽其他方向',()=>{
@@ -168,6 +172,41 @@ test('旧持仓数值字符串不能使加仓数量发生字符串拼接',()=>{
   assert.equal(snapshot.labels[0],'测试版本');
   stock.recommendationContext.news.signal='negative';
   assert.equal(snapshot.context.news.signal,'neutral');
+});
+
+test('普通模拟交易逐日锁定新买仓位，次交易日解锁，非交易时间拒绝',()=>{
+  let at='2026-09-15T10:00:00+08:00';
+  const context=harness(['executeSimulatedTrade'],{portfolio:[],simulatedTrades:[],
+    TradeTime:{...tradeTime,executionWindow:()=>tradeTime.executionWindow(at)},
+    findStockByCode:()=>({code:'600001',name:'测试',price:10}),
+    portfolioPosition:()=>context.portfolio[0],document:{querySelector:()=>null},nowText:()=>at,money:String});
+  const buy=()=>context.executeSimulatedTrade('600001','buy',{price:10,amount:1000,quiet:true,render:false});
+  const sell=quantity=>context.executeSimulatedTrade('600001','sell',{price:10,quantity,quiet:true,render:false});
+  assert.equal(buy(),true);
+  assert.equal(sell(100),false);
+  assert.equal(context.portfolio[0].quantity,100);
+  at='2026-09-16T10:00:00+08:00';
+  assert.equal(buy(),true);
+  assert.equal(sell(200),false);
+  assert.equal(sell(100),true);
+  assert.equal(sell(100),false);
+  at='2026-09-16T12:00:00+08:00';
+  assert.equal(buy(),false);
+  at='2026-09-17T15:10:00+08:00';
+  assert.equal(sell(100),false);
+  at='2026-09-18T10:00:00+08:00';
+  assert.equal(sell(100),true);
+});
+
+test('旧持仓部分卖出不把剩余老仓重新锁定为当日买入',()=>{
+  const position={code:'600001',quantity:300,costPrice:10,updatedAt:'2026-09-14T02:00:00Z'};
+  const context=harness(['executeSimulatedTrade'],{portfolio:[position],simulatedTrades:[],
+    findStockByCode:()=>({code:'600001',name:'测试',price:10}),portfolioPosition:()=>position,
+    document:{querySelector:()=>null},nowText:()=>'',money:String});
+  const sell=()=>context.executeSimulatedTrade('600001','sell',{quantity:100,price:10,quiet:true,render:false});
+  assert.equal(sell(),true);
+  assert.equal(sell(),true);
+  assert.equal(position.quantity,100);
 });
 
 test('取消个股标签勾选后保存移除成员，其他股票不受影响',()=>{

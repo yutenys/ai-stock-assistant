@@ -87,6 +87,10 @@ test('首次回踩必须有近期放量突破且此前没有触及回踩区', ()
     .find(item => item.id === 'first-pullback').matched, false);
   assert.equal(evaluateStrategyRegistry(factor,{observationPhase:{phase:'intraday'}})
     .find(item => item.id === 'first-pullback').matched, false);
+  assert.equal(evaluateStrategyRegistry({...factor,breakoutContext:{...context,breakoutLevel:11}},closed)
+    .find(item => item.id === 'first-pullback').matched, false);
+  assert.equal(evaluateStrategyRegistry({...factor,ma30:null},closed)
+    .find(item => item.id === 'first-pullback').matched, false);
 });
 
 test('硬风险覆盖策略高分，推荐和详情共享同一冻结展示模型', () => {
