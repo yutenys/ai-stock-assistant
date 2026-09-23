@@ -23,6 +23,15 @@ contextBridge.exposeInMainWorld('stockApi', {
   createResearchAccount: (request) => ipcRenderer.invoke('create-research-account', request),
   executeResearchOrder: (order) => ipcRenderer.invoke('execute-research-order', order),
   markResearchAccount: (request) => ipcRenderer.invoke('mark-research-account', request),
+  listDailyReports: () => ipcRenderer.invoke('list-daily-reports'),
+  getDailyReport: (request) => ipcRenderer.invoke('get-daily-report', request),
+  generateDailyReport: (request) => ipcRenderer.invoke('generate-daily-report', request),
+  openDailyReport: (request) => ipcRenderer.invoke('open-daily-report', request),
+  onDailyReportProgress: (callback) => {
+    const listener = (_event, progress) => callback(progress);
+    ipcRenderer.on('daily-report-progress', listener);
+    return () => ipcRenderer.removeListener('daily-report-progress', listener);
+  },
   explainStockWithAi: (request) => ipcRenderer.invoke('explain-stock-with-ai', request),
   onMarketProgress: (callback) => {
     const listener = (_event, progress) => callback(progress);

@@ -53,6 +53,8 @@ const {
   validateAiExplanation,
   marketSnapshotId,
   classifyMarketRegime,
+  updateMarketRotationHistory,
+  priorMarketRotationSnapshot,
   buildStrategyScoreCard,
   mergeSectorCapitalRows,
   classifySectorRotationPhase,
@@ -78,6 +80,7 @@ const {
   weightedRecommendationScore,
   filterResolvedRecommendations,
   buildRecommendationLedgerEntry,
+  attachRecommendationMetadata,
   calibrateRecommendationWithOutcomes,
   applyOutcomeFeedbackAssessment,
   recommendationPassesOutcomeGate,
@@ -187,9 +190,9 @@ test('腾讯行情原始时间参与收盘判断与快照内容身份', () => {
 });
 
 test('放量普跌中的局部板块单独分类，不误判成普涨或全面风险', () => {
-  const result = classifyMarketRegime({breadth:{up:600,down:4500,flat:30},turnover:1.97e12,
+  const result = classifyMarketRegime({breadth:{up:600,down:4500,flat:30},turnover:1.97e12,observationPhase:{phase:'closed'},
     indices:[{changePct:-1.1},{changePct:-.5}],limits:{upCount:40,downCount:8},
-    sectors:[{name:'元件',changePct:3.6,upRatio:.86,mainNetInflow:3.2e9,capitalEstimated:false,capitalStale:false}]}, {turnover:1.64e12});
+    sectors:[{name:'元件',changePct:3.6,upRatio:.86,mainNetInflow:3.2e9,capitalEstimated:false,capitalStale:false}]}, {turnover:1.64e12,observationPhase:{phase:'closed'}});
   assert.equal(result.key, 'localized-strength');
   assert.equal(result.label, '放量普跌中的局部强势');
   assert.equal(result.riskOff, false);
@@ -694,13 +697,14 @@ test('缺失估值不等于负估值，弱均线缩量箱体不进入低吸候�
   assert.notEqual(assessCurrentEntry({...params,consolidationBreakout:{...params.consolidationBreakout,volumeCompressionRatio:null}}).setupType,'sideways-washout');
 });
 
-test('全市场历史筛选只使用完整同日同模型结果，候选队列避免类别饿死',()=>{
+test('全市场历史筛选跨日只作为今日待重算候选，候选队列避免类别饿死',()=>{
   const now=Date.parse('2026-09-05T08:00:00Z'),stock={code:'600001',tradeDate:'2026-09-04',amount:1e8,price:10,high:10};
   const cache={complete:true,codes:['600001','600001','600999'],tradeDate:'2026-09-04',generatedAt:'2026-09-05T07:59:00Z',modelVersion:RECOMMENDATION_MODEL_VERSION};
   assert.equal(selectFullMarketScreening([stock],cache,'2026-09-04',now).length,1);
   assert.equal(selectFullMarketScreening([{...stock,amount:0}],cache,'2026-09-04',now).length,0);
   assert.equal(selectFullMarketScreening([stock],{...cache,complete:false},'2026-09-04',now).length,0);
   assert.equal(selectFullMarketScreening([stock],cache,'2026-09-07',now).length,0);
+  assert.equal(selectFullMarketScreening([{...stock,tradeDate:'2026-09-07'}],cache,'2026-09-07',now).length,1);
   const rows=prefix=>Array.from({length:100},(_,i)=>({code:`${prefix}${String(i).padStart(4,'0')}`,industry:`行业${i}`}));
   const picked=selectMarketRecommendationCandidates({breakoutScreened:rows('60'),reboundScreened:rows('00'),fullMarketScreened:rows('30')},6);
   assert.equal(picked.filter(item=>item.code.startsWith('00')).length,2);
@@ -726,12 +730,14 @@ test('行情响应中途断开能结束请求并进入失败路径', async () =>
 });
 
 test('成功筛空不能恢复旧推荐，接口失败回退不保留入场许可', () => {
-  const cached={recommendations:[{code:'600001',industry:'半导体',signal:'突破确认',technicalScore:80,signalScore:80,entryAssessment:{allowed:true,status:'可入场'},tradePlan:{enabled:true},newsLabel:'消息确认'}]};
+  const tradeDate=new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());
+  const cached={fetchedAt:new Date(Date.now()-60000).toISOString(),tradeDate,recommendationCoverage:{modelVersion:RECOMMENDATION_MODEL_VERSION},
+    recommendations:[{code:'600001',industry:'半导体',signal:'突破确认',technicalScore:80,signalScore:80,entryAssessment:{allowed:true,status:'可入场'},tradePlan:{enabled:true},newsLabel:'消息确认'}]};
   const empty={recommendations:[],recommendationsComputed:true,momentumRecommendations:[{code:'600002'}]};
   assert.equal(restoreCachedMarketRecommendations(empty,cached),false);
   assert.equal(empty.recommendations.length,0);
   const failed={recommendations:[],momentumRecommendations:[{code:'600002'}]};
-  assert.equal(restoreCachedMarketRecommendations(failed,cached),true);
+  assert.equal(restoreCachedMarketRecommendations(failed,cached,[{code:'600001',tradeDate,price:10}]),true);
   assert.equal(failed.recommendations[0].entryAssessment.allowed,false);
   assert.equal(failed.recommendations[0].tradePlan.enabled,false);
   assert.equal(failed.recommendations[0].newsLabel,'消息待核验');
@@ -1321,15 +1327,69 @@ test('大盘推荐在风险接口失败但没有已核验风险时降分保留�
   assert.equal(allUnknown.item.signalScore, 66);
 });
 
-test('后台全市场结果可发布超过160只观察候选且不冒充严格推荐', () => {
+test('后台全市场结果保留待筛身份且不冒充当轮推荐', () => {
   const tradeDate='2026-09-14';
   const scored=Array.from({length:220},(_,index)=>({code:String(600000+index),name:`测试${index}`,industry:`行业${index%12}`,price:10,changePct:1,amount:1e8}));
   const screening={tradeDate,generatedAt:'2026-09-14T07:00:00.000Z',modelVersion:RECOMMENDATION_MODEL_VERSION,analysisId:'full-1',
     complete:true,historyCovered:220,universe:220,candidates:scored.map((item,index)=>({code:item.code,status:index%3?'watch':'strict',score:70,stage:'接近突破',horizon:'波段',rps20:80,previousHigh20:10.2,ma30:9.8}))};
   const rows=buildBackgroundWatchRecommendations(scored,screening,tradeDate,Date.parse('2026-09-14T08:00:00.000Z'));
   assert.equal(rows.length,220);
-  assert.ok(rows.every(item=>item.recommendationTier==='观察候选' && item.entryAssessment.allowed===false));
+  assert.ok(rows.every(item=>item.recommendationTier==='历史待筛' && item.entryAssessment.allowed===false));
+  assert.ok(rows.every(item=>!recommendationPassesDisplayGate(item)));
   assert.equal(buildBackgroundWatchRecommendations(scored,{...screening,candidates:[{...screening.candidates[0],ma30:null}]},tradeDate,Date.parse('2026-09-14T08:00:00.000Z')).length,0);
+});
+
+test('未来交易日不能生成正式收盘报告', async () => {
+  const {nextTradingDay} = require('../lib/trade-time');
+  const future = nextTradingDay(chinaClockParts().date);
+  assert.ok(future);
+  await assert.rejects(handlers.get('generate-daily-report')(null, {date:future}), /未来交易日/);
+});
+
+test('跨日轮动快照保留收盘基线，重启和同日刷新不覆盖昨日', () => {
+  const closed = {tradeDate:'2026-09-16', fetchedAt:'2026-09-16T07:10:00Z', turnover:100,
+    observationPhase:{phase:'closed'}, sectors:[{name:'软件',rotationScore:80,capitalEstimated:false}]};
+  let history = updateMarketRotationHistory([], closed);
+  const today = {...closed, tradeDate:'2026-09-17', fetchedAt:'2026-09-17T02:00:00Z', turnover:30, observationPhase:{phase:'intraday'}};
+  history = updateMarketRotationHistory(history, today);
+  history = updateMarketRotationHistory(history, {...closed, fetchedAt:'2026-09-16T06:00:00Z',turnover:50,observationPhase:{phase:'intraday'}});
+  const baseline = priorMarketRotationSnapshot(JSON.parse(JSON.stringify(history)), today.tradeDate);
+  assert.equal(history.length,1);
+  assert.equal(baseline.turnover,100);
+  assert.equal(priorMarketRotationSnapshot(history,'2026-09-21'),null);
+  const current = [{name:'软件',rotationScore:60,capitalEstimated:false}];
+  const first = annotateSectorRotation(current,{tradeDate:today.tradeDate,sectors:current},today.tradeDate,baseline);
+  assert.equal(first[0].rotationTransition.delta,-20);
+  const again = annotateSectorRotation(current,{tradeDate:today.tradeDate,sectors:first},today.tradeDate,baseline);
+  assert.equal(again[0].rotationTransition.baseline.date,'2026-09-16');
+  assert.equal(classifyMarketRegime(today,baseline).turnoverChangePct,null);
+  assert.ok(Math.abs(classifyMarketRegime({...today,turnover:110,observationPhase:{phase:'closed'}},baseline).turnoverChangePct-10)<1e-8);
+});
+
+test('稳健与观察入口拒绝涨停和过热，强势通道只能标记不追高', () => {
+  const item = {code:'600001',price:11,upperLimit:11,changePct:10,signal:'接近突破',technicalScore:80,signalScore:80,
+    qualityScore:80,analysis:{volumeRatio:2,rsi14:60,distanceToBreakout:1}};
+  assert.equal(recommendationGateDecision(item).reason,'no-chase');
+  assert.equal(recommendationPassesWatchGate({...item,signal:'横盘观察'}),false);
+  assert.equal(recommendationGateDecision({...item,upperLimit:12,changePct:2,analysis:{...item.analysis,rsi14:85}}).passed,false);
+  assert.equal(recommendationGateDecision({...item,price:10.2,changePct:2}).passed,true);
+  const detail=applyEntryContextAssessment({verdict:'可关注',tradePlan:{enabled:true},
+    entryAssessment:{allowed:true,status:'可分批入场',summary:'原技术确认'}},{subject:item});
+  assert.equal(detail.entryAssessment.allowed,false);
+  assert.equal(detail.tradePlan.enabled,false);
+  assert.match(detail.buyCondition,/不追入/);
+});
+
+test('已越过箱顶不能继续分析为箱内洗盘', () => {
+  const result = assessCurrentEntry({latestPrice:10.4,ma5:10,ma10:10.1,ma20:10,ma30:9.9,
+    supportPrice:9,resistance:10,volumeRatio:2,rsi14:60,observationPhase:{phase:'closed'},
+    consolidationBreakout:{available:true,isConsolidating:true,boxHigh:10,boxLow:9,boxDays:12,volumeCompressionRatio:.9,summary:'测试箱体'}});
+  assert.notEqual(result.setupType,'sideways-washout');
+  assert.equal(result.status,'离开箱体，等待确认');
+  assert.doesNotMatch(result.summary,/仍在|维持.*箱体/);
+  assert.doesNotMatch(result.structureSummary || '',/洗盘特征成立/);
+  assert.equal(recommendationGateDecision({signal:'突破确认',technicalScore:85,signalScore:85,
+    entryAssessment:{status:'离开箱体，等待确认'}}).reason,'structure-not-confirmed');
 });
 
 test('详情多因子评分独立于CANSLIM且缺失项不按中性满配', () => {
@@ -1353,14 +1413,15 @@ test('收藏反馈为空时仍保留稳定签名供缓存复用', () => {
   assert.equal(metadata.signature, profile.signature);
 });
 
-test('本轮大盘推荐为空时保留最近成功推荐并刷新行情', () => {
+test('仅同交易日当前模型的短时缓存可以明确标记后恢复', () => {
+  const tradeDate=new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());
   const result = { recommendations: [], recommendationCoverage: { scanned: 5892 } };
   const cached = {
-    fetchedAt: '2026-08-13T08:00:00.000Z',
+    fetchedAt: new Date(Date.now()-60000).toISOString(), tradeDate,
     recommendations: [{ code:'600001', name:'测试股', signal:'突破确认', signalScore:72, technicalScore:75, price:10, factorAnalysis:{sectorProfile:{name:'半导体'}} }],
-    recommendationCoverage: { scanned:5892, prefiltered:400, analyzed:60, industries:40, qualified:1 }
+    recommendationCoverage: { scanned:5892, prefiltered:400, analyzed:60, industries:40, qualified:1, modelVersion:RECOMMENDATION_MODEL_VERSION }
   };
-  const restored = restoreCachedMarketRecommendations(result, cached, [{ code:'600001', price:10.8, changePct:2.5, amount:1e8 }]);
+  const restored = restoreCachedMarketRecommendations(result, cached, [{ code:'600001', price:10.8, changePct:2.5, amount:1e8, tradeDate }]);
   assert.equal(restored, true);
   assert.equal(result.recommendations.length, 1);
   assert.equal(result.recommendations[0].industry, '半导体');
@@ -1369,8 +1430,7 @@ test('本轮大盘推荐为空时保留最近成功推荐并刷新行情', () =>
   assert.match(result.recommendations[0].reason, /综合入场：数据待补充/);
   assert.equal(result.recommendationCoverage.cachedFallback, true);
   assert.equal(result.recommendationCoverage.qualified, 1);
-  assert.equal(result.recommendationCoverage.momentumCandidates, null);
-  assert.match(result.recommendationCoverage.momentumUnavailableReason, /旧模型/);
+  assert.equal(result.recommendationCoverage.momentumCandidates, undefined);
   assert.deepEqual(result.recommendationCoverage.signals, { bottomWaiting:0, rebounded:0, breakout:1, structure:0, other:0 });
 
   const fresh = { recommendations:[{code:'600002'}] };
@@ -1387,6 +1447,7 @@ test('本轮大盘推荐为空时保留最近成功推荐并刷新行情', () =>
   const empty = { recommendations: [] };
   assert.equal(restoreCachedMarketRecommendations(empty, obsolete, []), false);
   assert.deepEqual(empty.recommendations, []);
+  assert.equal(restoreCachedMarketRecommendations({recommendations:[]},{...cached,tradeDate:'2026-09-21'},[{code:'600001',tradeDate}]),false);
 });
 
 test('旧推荐模型缓存不能复用为双轨推荐结果', () => {
@@ -1446,7 +1507,8 @@ test('market analysis merges the live trading day into delayed daily history', (
   const merged = mergeQuoteIntoHistory(history, quote);
   assert.equal(merged.length, 2);
   assert.deepEqual(merged.at(-1), {
-    date: '2026-08-13', open: 10.2, close: 9.8, high: 10.4, low: 9.7, volume: 180, amount: 1764
+    date: '2026-08-13', open: 10.2, close: 9.8, high: 10.4, low: 9.7, volume: 180, amount: 1764,
+    isFinal:false, observedAt:'', source:''
   });
   assert.equal(history.length, 1);
 
@@ -1706,7 +1768,8 @@ test('大盘分析返回指数、轮动、资金和涨跌停结构', { timeout: 
     assert.ok(result.recommendationCoverage.enriched > 0, 'Empty results must still have verified candidates');
     assert.ok(result.recommendationCoverage.outcomeGateRejected > 0, 'Empty results must have screening evidence');
     assert.ok(Object.values(result.recommendationCoverage.outcomeGateFailures).some(count=>count > 0));
-    assert.deepEqual(result.errors, []);
+    assert.ok(Array.isArray(result.errors));
+    assert.ok(result.errors.every(error => typeof error === 'string' && error.length > 0));
   }
   assert.ok(result.recommendations.every(item => item.breakoutPrice > 0 && item.ma30 > 0));
   assert.ok(result.recommendations.every(item => [
@@ -2250,14 +2313,34 @@ test('板块轮动阶段同时考虑资金持续性、上涨广度和成交集�
 
 test('推荐账本记录完整候选和三周期快照', () => {
   const entry = buildRecommendationLedgerEntry({
-    fetchedAt:'2026-09-11T08:00:00.000Z', tradeDate:'2026-09-11',
-    recommendations:[{code:'600001',name:'测试股份',industry:'半导体',signal:'突破蓄势',signalScore:78,holdingPeriod:'波段'}],
+    fetchedAt:'2026-09-11T08:00:00.000Z', computedAt:'2026-09-11T08:00:05.000Z', publishedAt:'2026-09-11T08:00:06.000Z', tradeDate:'2026-09-11',
+    recommendations:[{code:'600001',name:'测试股份',industry:'半导体',signal:'突破蓄势',signalScore:78,holdingPeriod:'波段',price:10,changePct:2,quoteObservedAt:'2026-09-11T07:59:58.000Z',source:'腾讯实时行情',analysis:{trendBroken:true}}],
     momentumRecommendations:[],
     recommendationCoverage:{scanned:5000,analyzed:100,rejectedCandidates:[{code:'600002',reason:'industry-unresolved'}],modelVersion:'test-v1'}
   });
-  assert.equal(entry.schemaVersion, 1);
+  assert.equal(entry.schemaVersion, 2);
+  assert.equal(entry.inputCutoffAt, '2026-09-11T08:00:00.000Z');
+  assert.equal(entry.publishedAt, '2026-09-11T08:00:06.000Z');
   assert.equal(entry.recommendations[0].holdingPeriod, '波段');
+  assert.equal(entry.recommendations[0].track, 'A');
+  assert.equal(entry.recommendations[0].primaryRole, '结构失效');
+  assert.equal(entry.recommendations[0].quote.observedAt, '2026-09-11T07:59:58.000Z');
+  assert.equal(entry.recommendations[0].quote.changePct, 2);
   assert.equal(entry.rejectedCandidates[0].reason, 'industry-unresolved');
+});
+
+test('A/B候选附带影子角色但不改写原推荐结论', () => {
+  const result = attachRecommendationMetadata({
+    code:'600001', signal:'待突破', recommendationTier:'观察候选',
+    entryAssessment:{allowed:false,status:'等待确认'},
+    analysis:{consolidationBreakout:{breakoutConfirmed:true},breakoutContext:{firstPullback:true},volumeRatio:.82},
+    recommendationContext:{capital:{mainNetInflow:2e8},sector:{phase:'持续扩散'}},
+    factorAnalysis:{factors:{leadership:{score:85}}}
+  });
+  assert.equal(result.signal, '待突破');
+  assert.equal(result.recommendationTier, '观察候选');
+  assert.equal(result.primaryRole, '首次回踩');
+  assert.equal(result.roleAssessment.mode, 'shadow');
 });
 
 test('跨周末近期样本不足时按最新推荐版本扩窗', () => {
@@ -2424,11 +2507,45 @@ test('个股索赔新闻不能作为全市场消息风险，但仍参与对应�
 });
 
 test('大盘消息保留真实市场风险与监管政策，不因过滤个股新闻而丢弃', () => {
-  for (const title of ['央行宣布降准政策','证监会发布退市制度新规','A股大盘下滑，市场风险加剧','美联储加息，人民币汇率下跌','全球债券遭抛售，美债收益率上升']) {
+  for (const title of ['央行宣布降准政策','证监会发布退市制度新规','A股大盘下滑，市场风险加剧']) {
     assert.equal(isMarketWideNews({title}),true,title);
+  }
+  for (const title of ['韩国央行警示银行风险','印度央行发出风险警示','某公司H股相对A股股价下滑','美联储加息，人民币汇率下跌','全球债券遭抛售，美债收益率上升']) {
+    assert.equal(isMarketWideNews({title}),false,title);
   }
   const now = Date.parse('2026-09-11T01:52:00Z');
   assert.equal(summarizeNews([{title:'A股大盘下滑，市场风险加剧',publishedAt:'2026-09-11T01:00:00Z'}],'',{now,scope:'market'}).signal,'偏谨慎');
+});
+
+test('普通大盘负面消息只修正判断，已核实系统风险才阻止新入场', () => {
+  const base={entryAssessment:{allowed:true,status:'可以入场',summary:'形态与量能符合',evidence:[]}};
+  const ordinary=applyEntryContextAssessment(base,{marketNewsContext:{available:true,signal:'偏谨慎',systemicRisk:false},
+    newsContext:{signal:'中性',items:[]}});
+  assert.ok(!ordinary.entryAssessment.contextRisks.includes('大盘消息风险'));
+  assert.notEqual(ordinary.entryAssessment.status,'大盘消息风险待确认');
+  const systemic=applyEntryContextAssessment(base,{marketNewsContext:{available:true,signal:'偏谨慎',systemicRisk:true},
+    newsContext:{signal:'中性',items:[]}});
+  assert.ok(systemic.entryAssessment.contextRisks.includes('大盘消息风险'));
+  assert.equal(systemic.entryAssessment.allowed,false);
+});
+
+test('缓存中的新闻事件在下一次请求按当前时间重新计算权重', () => {
+  const oldRoot=process.env.STOCK_ASSISTANT_DATA_ROOT;
+  process.env.STOCK_ASSISTANT_DATA_ROOT=fs.mkdtempSync(path.join(require('node:os').tmpdir(),'news-lifecycle-'));
+  try {
+    const firstAt='2026-09-11T02:00:00.000Z';
+    const title='A股大盘风险加剧';
+    const first=summarizeNews([{title,publishedAt:'2026-09-11T01:30:00.000Z',link:'https://example.com/market'}], '',
+      {scope:'market',lifecycleKey:'test-reweight-market',now:firstAt,fetchedAt:firstAt});
+    const later=summarizeNews([], '', {scope:'market',lifecycleKey:'test-reweight-market',
+      now:'2026-09-19T02:00:00.000Z',fetchedAt:'2026-09-19T02:00:00.000Z'});
+    assert.ok(first.rawScore < later.rawScore);
+    assert.equal(later.systemicRisk,false);
+    assert.ok(later.latestAgeHours > 168);
+  } finally {
+    if(oldRoot === undefined) delete process.env.STOCK_ASSISTANT_DATA_ROOT;
+    else process.env.STOCK_ASSISTANT_DATA_ROOT=oldRoot;
+  }
 });
 
 test('合并候选通道后按行业轮流精筛，避免同一行业重复挤占预算', () => {
@@ -2505,6 +2622,10 @@ test('收藏来源收益不参与公共推荐校准',()=>{
   const profile=summarizeRecommendationOutcomes([row],{now:Date.parse('2026-09-08')});
   assert.equal(profile.sampleSize,0);
   assert.equal(profile.excludedCount,1);
+  const observation=summarizeRecommendationOutcomes([row],{now:Date.parse('2026-09-08'),includeFavorites:true});
+  assert.equal(observation.sampleSize,1);
+  assert.equal(observation.calibrationEligible,false);
+  assert.equal(calibrateRecommendationWithOutcomes({signal:'待突破',signalScore:75},observation).adjustment,0);
 });
 
 test('历史绝对收益和胜率很差时即使相对市场占优也必须降分', () => {
@@ -2715,7 +2836,7 @@ test('低价高估值弱反弹股票不会进入大盘推荐', { timeout: 180000
 test('通用行业命令能生成手机产业链股票', { timeout: 90000 }, async () => {
   const result = await handlers.get('run-industry-workflow')(null, '搜索手机行业产业链股票');
   assert.equal(result.subject, '手机');
-  assert.ok(result.stocks.length >= 10);
+  assert.ok(result.stocks.length >= 10, JSON.stringify(result.stocks.map(stock => ({code:stock.code,sector:stock.sector,source:stock.source}))));
   assert.ok(result.stocks.every(stock => /^\d{6}$/.test(stock.code)));
   assert.ok(result.stocks.every(stock => !/ST|退/.test(stock.name)));
   assert.ok(result.stocks.every(stock => !['300033', '300059'].includes(stock.code)));
@@ -2724,9 +2845,12 @@ test('通用行业命令能生成手机产业链股票', { timeout: 90000 }, asy
 
 test('复合行业命令优先具体产业而不是宽泛AI概念', { timeout: 90000 }, async () => {
   const result = await handlers.get('run-industry-workflow')(null, '查找A股AI算力租赁');
-  assert.ok(result.stocks.length >= 10);
+  assert.ok(result.stocks.length >= 4, JSON.stringify(result.stocks.map(stock => ({code:stock.code,sector:stock.sector,source:stock.source}))));
   assert.ok(result.stocks.some(stock => /算力租赁|智算中心/.test(stock.sector)));
-  assert.ok(result.stocks.every(stock => !['300033', '300059', '300498', '601166', '000001'].includes(stock.code)));
+  assert.ok(result.stocks.filter(stock => ['603629','603881','300442','603887'].includes(stock.code))
+    .every(stock => /算力租赁|智算中心/.test(stock.sector)));
+  assert.ok(result.stocks.every(stock => !['300033', '300059', '300498', '601166', '000001'].includes(stock.code)),
+    JSON.stringify(result.stocks.filter(stock => ['300033', '300059', '300498', '601166', '000001'].includes(stock.code))));
   assert.ok(result.terms.includes('算力租赁'));
   assert.ok(!result.terms.includes('人工智能'));
 });

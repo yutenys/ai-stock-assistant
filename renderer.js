@@ -39,6 +39,10 @@ let liveNewsItems = [];
 let liveNewsMeta = null;
 let liveNewsPage = 0;
 let liveNewsRefreshing = false;
+let dailyReports = [];
+let activeDailyReport = null;
+let reportLoading = false;
+let reportRecommendationTrack = 'all';
 const detailProfileCache = new Map();
 const detailNewsCache = new Map();
 const detailHistoryCache = new Map();
@@ -416,14 +420,14 @@ function renderMarketOverview(result){
     return counts;
   }, {bottomWaiting:0, rebounded:0, breakout:0, structure:0, other:0});
   const riskCoverage = Number.isFinite(Number(coverage.riskChecked))
-    ? `；未来半年风险核验 ${coverage.riskChecked} 只，排除 ${coverage.riskRejected || 0} 只，未确认 ${coverage.riskUnknown || 0} 只${coverage.riskUnverifiedIncluded ? `（降分保留 ${coverage.riskUnverifiedIncluded} 只）` : ''}`
+    ? `；未来半年风险核验 ${coverage.riskChecked} 只，排除 ${coverage.riskRejected || 0} 只，未确认 ${coverage.riskUnknown || 0} 只，未执行 ${coverage.riskNotAttempted ?? '--'} 只${coverage.riskUnverifiedIncluded ? `（降分保留 ${coverage.riskUnverifiedIncluded} 只）` : ''}`
     : '';
   const structureCounts = [];
   if(Number.isFinite(Number(coverage.accumulationCandidates))) structureCounts.push(`蓄势结构 ${coverage.accumulationCandidates} 只`);
   if(Number.isFinite(Number(coverage.consolidationCandidates))) structureCounts.push(`横盘候选 ${coverage.consolidationCandidates} 只`);
   if(Number.isFinite(Number(coverage.fundFlowAvailable))) {
     const capitalDetail = Number.isFinite(Number(coverage.fundFlowDirect))
-      ? `（逐日明细 ${Math.max(0,(coverage.fundFlowDirect || 0)-(coverage.fundFlowAggregate || 0))}，真实多日汇总 ${coverage.fundFlowAggregate || 0}，量价代理 ${coverage.fundFlowEstimated || 0}）` : '';
+      ? `（逐日明细 ${coverage.fundFlowDaily ?? Math.max(0,(coverage.fundFlowDirect || 0)-(coverage.fundFlowAggregate || 0))}，真实多日汇总 ${coverage.fundFlowAggregate || 0}，量价代理 ${coverage.fundFlowEstimated || 0}）` : '';
     structureCounts.push(`阶段资金可用 ${coverage.fundFlowAvailable} 只${capitalDetail}`);
   }
   const accumulationCoverage = structureCounts.length ? `；${structureCounts.join('，')}` : '';
@@ -437,13 +441,33 @@ function renderMarketOverview(result){
   const signalSummary = [`待反弹 ${signals.bottomWaiting}`, `已反弹 ${signals.rebounded}`, `突破类 ${signals.breakout}`, `吸筹/洗盘 ${signals.structure}`];
   if(signals.other) signalSummary.push(`其他 ${signals.other}`);
   const fullMarketCoverage = coverage.fullMarketHistoryCovered
-    ? `；已采用全量历史 ${coverage.fullMarketHistoryCovered} 只、历史候选 ${coverage.fullMarketCandidates || 0} 只` : '';
+    ? `；${coverage.fullMarketHistoryDate || '历史'}全量历史 ${coverage.fullMarketHistoryCovered} 只、历史候选 ${coverage.fullMarketCandidates || 0} 只（本轮可重新核验 ${coverage.fullMarketPending || 0} 只）` : '';
   $('marketRecommendationCoverage').textContent = coverage.scanned
     ? `全市场扫描 ${coverage.scanned} 只，初筛 ${coverage.prefiltered || 0} 只，本轮在线精筛 ${coverage.analyzed || 0} 只${fullMarketCoverage}，覆盖 ${coverage.industries || 0} 个已确认行业${unresolvedIndustryCoverage}${accumulationCoverage}${riskCoverage}${outcomeCoverage}；${tierSummary}实际展示 ${recommendations.length} 只（${signalSummary.join('，')}）${fallbackNote}`
     : '等待全市场扫描';
+  const gateLabels = {'no-chase':'不宜追高','context-risk':'环境或公司风险','recent-capital-outflow':'阶段资金转弱',
+    'technical-score':'技术评分不足','signal-not-confirmed':'形态尚未确认','signal-score':'综合评分不足',
+    'structure-not-confirmed':'结构待确认'};
+  const rejectionSummary = Object.entries(coverage.outcomeGateFailures || {}).sort((a,b) => b[1]-a[1]).slice(0,4)
+    .map(([reason,count]) => `${gateLabels[reason] || reason} ${count}`).join('、');
+  if(rejectionSummary) $('marketRecommendationCoverage').textContent += `；当轮筛选首要未通过原因：${rejectionSummary}`;
+  if(coverage.noChaseBreakdown && coverage.outcomeGateFailures?.['no-chase']) {
+    const hot = coverage.noChaseBreakdown;
+    $('marketRecommendationCoverage').textContent += `（不宜追高条件可重叠：涨停${hot.limitUp}、涨幅过大${hot.change8}、RSI过热${hot.rsi80}、盘中量比过高${hot.quoteVolume}、日量爆量${hot.dailyVolume}）`;
+  }
   if(recommendations.length) $('marketRecommendationCoverage').textContent += `；${recommendationConcentrationText(recommendations)}`;
+  const background = result.backgroundCandidates || [];
+  $('marketBackgroundCandidates').textContent = background.length
+    ? `历史待筛 ${background.length} 只（${coverage.fullMarketHistoryDate || '日期待核验'}）；需完成今日行情、资金、消息及公司风险核验后才可能进入推荐。`
+    : '当前没有可复用的历史待筛候选。';
   const visibleRecommendations = recommendationPreview(recommendationPools.strict, 10);
-  $('marketRecommendations').innerHTML = visibleRecommendations.length ? groupedRecommendationHtml(visibleRecommendations) : '<div class="market-row"><span>当前未筛出满足条件的候选</span></div>';
+  const emptyReason = coverage.analyzed === 0 ? '本轮尚未完成在线精筛'
+    : coverage.enriched === 0 && (coverage.historyFailures || coverage.enrichmentFailures) ? '候选资料请求失败，请查看下方数据异常'
+      : coverage.riskChecked === 0 && coverage.enriched > 0
+        ? `已分析 ${coverage.enriched} 只，入场与质量条件尚未通过；公司风险未核验，不生成严格推荐`
+        : '当前没有通过当轮行情、资金、消息和风险条件的严格推荐';
+  $('marketRecommendations').innerHTML = visibleRecommendations.length ? groupedRecommendationHtml(visibleRecommendations)
+    : `<div class="market-row"><span>${escapeHtml(emptyReason)}</span></div>`;
   $('addMarketRecommendations').textContent = `查看更多（${recommendationPools.strict.length}）`;
   $('addMarketRecommendations').disabled = !recommendationPools.strict.length;
   $('marketStableCount').textContent = recommendationPools.strict.length;
@@ -476,7 +500,8 @@ function renderMarketOverview(result){
   $('marketMomentumCount').textContent = momentumRecommendations.length;
   setMarketRecommendationTrack(activeMarketRecommendationTrack);
   const marketNews = result.newsContext?.items || [];
-  $('marketNews').innerHTML = `<div class="market-stocks">${escapeHtml(result.newsContext?.summary || '消息面暂不可用')}</div>${marketNews.slice(0, 5).map(item => `<a class="market-news-row" href="#" data-market-news-link="${escapeHtml(safeHttpUrl(item.link))}">${escapeHtml(item.title)}<span>${escapeHtml(item.source || '')} · ${escapeHtml(item.publishedAt || '')}</span></a>`).join('')}`;
+  const decisionNews = result.newsContext?.decisionItems || [];
+  $('marketNews').innerHTML = `<div class="market-stocks">${escapeHtml(result.newsContext?.summary || '消息面暂不可用')}</div>${decisionNews.length ? `<div class="market-coverage">影响本轮判断：${escapeHtml(decisionNews.map(item => `${item.title}（${item.weightedScore > 0 ? '+' : ''}${item.weightedScore}）`).join('；'))}</div>` : ''}${marketNews.slice(0, 5).map(item => `<a class="market-news-row" href="#" data-market-news-link="${escapeHtml(safeHttpUrl(item.link))}">${escapeHtml(item.title)}<span>${escapeHtml(item.source || '')} · ${escapeHtml(item.publishedAt || '')}</span></a>`).join('')}`;
   document.querySelectorAll('[data-market-recommendation]').forEach(button => button.onclick = () => {
     const item = [...recommendations, ...momentumRecommendations].find(candidate => candidate.code === button.dataset.marketRecommendation);
     if(!item) return;
@@ -743,10 +768,13 @@ function saveMarketRecommendations(){
   renderLabels();
   closeMarketLabelPanel();
 }
-function pctClass(v){ return Number(v) >= 0 ? 'up' : 'down'; }
+function pctClass(v){
+  const number = v === null || v === undefined || v === '' ? NaN : Number(v);
+  return !Number.isFinite(number) || Math.abs(number) < .005 ? 'neutral' : number > 0 ? 'up' : 'down';
+}
 function checked(code){ return selected.has(code) ? 'checked' : ''; }
 function formatNumber(v, digits=2){ return typeof v === 'number' && Number.isFinite(v) ? v.toFixed(digits) : '--'; }
-function formatPct(v){ return typeof v === 'number' ? `${v > 0 ? '+' : ''}${v.toFixed(2)}%` : '--'; }
+function formatPct(v){ return typeof v === 'number' && Number.isFinite(v) ? `${v > 0 ? '+' : ''}${v.toFixed(2)}%` : '--'; }
 function yuan(v){ return typeof v === 'number' ? `¥${v.toFixed(2)}` : '--'; }
 function money(v){
   if(typeof v !== 'number' || !Number.isFinite(v)) return '--';
@@ -1248,6 +1276,7 @@ async function refreshLiveNews(force=true){
 }
 
 async function openLiveNewsView(){
+  cancelPendingSearch();
   currentViewSource = 'liveNews';
   activeDetailCode = null;
   stocks = [];
@@ -1366,6 +1395,7 @@ async function refreshPortfolioHoldings(){
 }
 
 async function openSimulationPortfolio(){
+  cancelPendingSearch();
   currentViewSource = 'portfolio';
   activeDetailCode = null;
   stocks = [];
@@ -1381,11 +1411,164 @@ async function openSimulationPortfolio(){
   await refreshPortfolioHoldings();
 }
 
+function reportDateToday(){
+  return new Intl.DateTimeFormat('en-CA', {timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());
+}
+
+function reportMoney(value){
+  const number = value === null || value === undefined || value === '' ? NaN : Number(value);
+  if(!Number.isFinite(number)) return '--';
+  if(Math.abs(number) >= 1e12) return `${(number / 1e12).toFixed(2)}万亿`;
+  if(Math.abs(number) >= 1e8) return `${(number / 1e8).toFixed(2)}亿`;
+  if(Math.abs(number) >= 1e4) return `${(number / 1e4).toFixed(2)}万`;
+  return number.toFixed(0);
+}
+
+function reportPct(value){
+  return value === null || value === undefined || value === '' ? '--' : formatPct(Number(value));
+}
+
+function reportPrice(value){
+  const price = value === null || value === undefined || value === '' ? NaN : Number(value);
+  return Number.isFinite(price) && price > 0 ? price.toFixed(2) : '--';
+}
+
+function reportRecommendationRows(report, overrideRows=null){
+  const recommendations = report?.recommendations || {};
+  const rows = overrideRows || (reportRecommendationTrack === 'stable' ? recommendations.stable || []
+    : reportRecommendationTrack === 'momentum' ? recommendations.momentum || []
+      : reportRecommendationTrack === 'best' ? recommendations.best || []
+        : reportRecommendationTrack === 'worst' ? recommendations.worst || []
+      : recommendations.all || []);
+  if(!rows.length) return '<tr><td colspan="15" class="report-empty-cell">当前分组没有可复盘推荐</td></tr>';
+  return rows.map(row => `<tr>
+    <td>${escapeHtml(row.code || '')}</td><td><b>${escapeHtml(row.name || '')}</b></td>
+    <td>${escapeHtml(row.industry || '待确认')}</td><td>${escapeHtml((row.tracks || [row.track]).filter(Boolean).join('/'))}</td>
+    <td><span class="report-role">${escapeHtml(row.primaryRole || '趋势观察')}</span></td>
+    <td>${escapeHtml(row.holdingPeriod || '待确认')}</td><td>${escapeHtml(row.checkpoint || row.publishedAt || '时点待核验')}</td>
+    <td>${escapeHtml(row.earliestBuyDate || '待核验')}</td><td>${escapeHtml(row.earliestSellDate || '待核验')}</td>
+    <td>${reportPrice(row.price)}</td>
+    <td class="${pctClass(row.changePct)}">${reportPct(row.changePct)}</td>
+    <td>${reportPrice(row.closePrice)}</td>
+    <td class="${pctClass(row.closeChangePct)}">${reportPct(row.closeChangePct)}</td>
+    <td class="${pctClass(row.priceReturnPct)}"><b>${reportPct(row.priceReturnPct)}</b></td>
+    <td>${escapeHtml(row.dataStatus || '待核验')}</td>
+  </tr>`).join('');
+}
+
+function renderDailyReportView(){
+  const report = activeDailyReport?.report || activeDailyReport || null;
+  const options = dailyReports.map(item => `<option value="${escapeHtml(item.tradeDate)}" ${item.tradeDate === report?.tradeDate ? 'selected' : ''}>${escapeHtml(item.tradeDate)} · r${String(item.latestRevision || 1).padStart(3,'0')} · ${item.status === 'complete' ? '完整' : '部分'}</option>`).join('');
+  if(reportLoading && !report) return '<div class="report-view"><div class="portfolio-empty">正在读取收盘报告...</div></div>';
+  if(!report) return `<div class="report-view"><div class="report-head"><div><h2>全局收盘报告</h2><p>交易日15:30生成；软件关闭时，下次启动自动补报。</p></div><div class="report-actions"><input id="reportDate" type="date" value="${reportDateToday()}" /><button id="generateReport" class="primary">生成报告</button></div></div><div class="portfolio-empty">尚无报告。生成后可在软件内查看，也可用默认浏览器打开。</div></div>`;
+  const breadth = report.market?.breadth || {};
+  const warnings = report.dataQuality?.warnings || [];
+  const sectors = (report.sectors || []).slice(0, 12);
+  const news = report.news || [];
+  return `<div class="report-view">
+    <div class="report-head"><div><h2>${escapeHtml(report.tradeDate)} 全局收盘报告</h2><p>修订 r${String(report.revision || 0).padStart(3,'0')} · ${report.status === 'complete' ? '数据完整' : report.status === 'preview' ? '盘中预览' : '部分数据缺失'} · ${escapeHtml(report.generatedAt || '')}</p></div>
+      <div class="report-actions"><select id="reportDateSelect">${options}</select><input id="reportDate" type="date" value="${escapeHtml(report.tradeDate)}" /><button id="generateReport" class="primary" ${reportLoading ? 'disabled' : ''}>${reportLoading ? '生成中' : '重新生成'}</button><button id="openReportBrowser">浏览器打开</button></div>
+    </div>
+    <div class="report-summary">${escapeHtml(report.summary || '')}</div>
+    <div class="report-stat-grid"><div><span>上涨</span><b class="up">${breadth.up ?? '--'}</b></div><div><span>下跌</span><b class="down">${breadth.down ?? '--'}</b></div><div><span>平盘</span><b>${breadth.flat ?? '--'}</b></div><div><span>成交额</span><b>${reportMoney(report.market?.turnover)}</b></div><div><span>方案A</span><b>${report.recommendations?.stable?.length || 0}</b></div><div><span>方案B</span><b>${report.recommendations?.momentum?.length || 0}</b></div><div><span>A/B重叠</span><b>${report.recommendations?.overlapCount || 0}</b></div><div><span>收藏样本</span><b>${report.favorites?.count || 0}</b></div></div>
+    <section class="report-section"><div class="report-section-head"><h3>推荐复盘</h3><div class="report-tabs"><button data-report-track="all" class="${reportRecommendationTrack === 'all' ? 'active' : ''}">全部</button><button data-report-track="stable" class="${reportRecommendationTrack === 'stable' ? 'active' : ''}">方案A</button><button data-report-track="momentum" class="${reportRecommendationTrack === 'momentum' ? 'active' : ''}">方案B</button><button data-report-track="best" class="${reportRecommendationTrack === 'best' ? 'active' : ''}">最佳10</button><button data-report-track="worst" class="${reportRecommendationTrack === 'worst' ? 'active' : ''}">最差10</button></div></div><div class="table-wrap report-table-wrap"><table class="report-table"><thead><tr><th>代码</th><th>名称</th><th>板块</th><th>方案</th><th>角色</th><th>周期</th><th>信号时点</th><th>最早可买</th><th>最早可卖</th><th>推荐时价格</th><th>当时涨幅</th><th>当日收盘</th><th>收盘涨幅</th><th>推荐后表现</th><th>数据</th></tr></thead><tbody>${reportRecommendationRows(report)}</tbody></table></div></section>
+    <section class="report-section"><h3>历史推荐跟踪</h3><p>原推荐日期见信号时点；表现为从原参考价至本日收盘的观察涨幅，不等于成交收益。</p><div class="table-wrap report-table-wrap"><table class="report-table"><thead><tr><th>代码</th><th>名称</th><th>板块</th><th>方案</th><th>角色</th><th>周期</th><th>原信号日期</th><th>最早可买</th><th>最早可卖</th><th>原参考价</th><th>原当时涨幅</th><th>本日收盘</th><th>本日涨幅</th><th>累计观察</th><th>数据</th></tr></thead><tbody>${reportRecommendationRows(report,report.recommendations?.followUp || [])}</tbody></table></div></section>
+    <section class="report-section"><h3>板块轮动</h3>${sectors.length ? `<div class="report-sector-list">${sectors.map(item => `<div><b>${escapeHtml(item.name || '')}</b><span class="${pctClass(item.changePct)}">${reportPct(item.changePct)}</span><small>${escapeHtml(item.rotationPhase?.phase || item.rotationState || item.capitalTrend?.phase || '阶段待确认')} · 主力净额 ${reportMoney(item.mainNetInflow)}</small></div>`).join('')}</div>` : '<div class="report-note">板块历史快照缺失，未使用当前板块数据回填。</div>'}</section>
+    <section class="report-section"><h3>收藏与账户</h3><p>排除重点关注和personal后 ${report.favorites?.count || 0} 条，有效 ${report.favorites?.validCount || 0} 条，等权平均 <b class="${pctClass(report.favorites?.averageReturnPct)}">${reportPct(report.favorites?.averageReturnPct)}</b>。收藏表现不是实际成交收益。</p><p>报告内持仓 ${report.portfolio?.positions?.length || 0} 只。${escapeHtml(report.portfolio?.unavailableReason || '模拟账户按实际记录展示。')}</p></section>
+    <section class="report-section"><h3>消息与异常</h3>${news.length ? `<div class="report-news">${news.map(item => `<button data-report-news-link="${escapeHtml(item.url || '')}"><b>${escapeHtml(item.title || '')}</b><span>${escapeHtml(item.publishedAt || '时间待核验')} · ${escapeHtml(item.source || '来源待核验')}</span></button>`).join('')}</div>` : '<div class="report-note">没有可核验的冻结消息。</div>'}<ul class="report-warnings">${warnings.length ? warnings.map(item => `<li>${escapeHtml(item)}</li>`).join('') : '<li>无异常</li>'}</ul></section>
+  </div>`;
+}
+
+async function loadDailyReport(date, revision = null){
+  if(!window.stockApi?.getDailyReport) return;
+  reportLoading = true;
+  renderStocks();
+  try{
+    activeDailyReport = await window.stockApi.getDailyReport({date,revision});
+    if(!activeDailyReport) notify(`${date} 暂无收盘报告`, 'warn');
+  }catch(error){
+    notify(`读取收盘报告失败：${error.message || error}`, 'error');
+  }finally{
+    reportLoading = false;
+    renderStocks();
+  }
+}
+
+async function openDailyReports(){
+  cancelPendingSearch();
+  currentViewSource = 'report';
+  activeDetailCode = null;
+  stocks = [];
+  selected.clear();
+  onlineSearchResults = [];
+  searchStatus = '';
+  $('searchInput').value = '';
+  $('addPanel')?.classList.add('hidden');
+  closeStockLabelPanel();
+  reportLoading = true;
+  renderStocks();
+  try{
+    dailyReports = await window.stockApi?.listDailyReports?.() || [];
+    if(dailyReports.length) activeDailyReport = await window.stockApi.getDailyReport({date:dailyReports[0].tradeDate});
+    else activeDailyReport = null;
+  }catch(error){
+    notify(`读取收盘报告列表失败：${error.message || error}`, 'error');
+  }finally{
+    reportLoading = false;
+    renderStocks();
+  }
+}
+
+async function generateReportFromView(){
+  const date = $('reportDate')?.value || reportDateToday();
+  if(!date || !window.stockApi?.generateDailyReport) return;
+  reportLoading = true;
+  renderStocks();
+  try{
+    const result = await window.stockApi.generateDailyReport({date,force:true});
+    activeDailyReport = result?.report ? {manifest:result.manifest || null,report:result.report} : null;
+    dailyReports = await window.stockApi.listDailyReports() || [];
+    notify(result?.preview ? '盘中预览已生成，15:30后才保存正式收盘报告' : `${date} 收盘报告已生成`, result?.preview ? 'info' : 'success');
+  }catch(error){
+    notify(`生成收盘报告失败：${error.message || error}`, 'error');
+  }finally{
+    reportLoading = false;
+    renderStocks();
+  }
+}
+
+function bindDailyReportInteractions(){
+  $('reportDateSelect')?.addEventListener('change', event => void loadDailyReport(event.target.value));
+  $('generateReport')?.addEventListener('click', () => void generateReportFromView());
+  $('openReportBrowser')?.addEventListener('click', async () => {
+    const report = activeDailyReport?.report || activeDailyReport;
+    if(!report?.tradeDate) return;
+    const result = await window.stockApi?.openDailyReport?.({date:report.tradeDate,revision:report.revision});
+    notify(result?.ok ? '已用默认浏览器打开收盘报告' : `打开报告失败：${result?.error || '未知错误'}`, result?.ok ? 'success' : 'error');
+  });
+  document.querySelectorAll('[data-report-track]').forEach(button => button.onclick = () => {
+    reportRecommendationTrack = button.dataset.reportTrack;
+    renderStocks();
+  });
+  document.querySelectorAll('[data-report-news-link]').forEach(button => button.onclick = () => {
+    const url = button.dataset.reportNewsLink;
+    if(/^https?:\/\//i.test(url)) window.stockApi?.openExternal?.(url);
+  });
+}
+
 function renderStocks(){
   $('selectedCount').textContent = selected.size;
   renderDetailPanel();
   $('simulationView')?.classList.toggle('active', currentViewSource === 'portfolio');
   $('liveNewsView')?.classList.toggle('active', currentViewSource === 'liveNews');
+  $('reportView')?.classList.toggle('active', currentViewSource === 'report');
+  if(currentViewSource === 'report'){
+    $('stockContainer').innerHTML = renderDailyReportView();
+    bindDailyReportInteractions();
+    renderAddStockList();
+    renderLabels();
+    return;
+  }
   if(currentViewSource === 'liveNews'){
     $('stockContainer').innerHTML = renderLiveNewsView();
     bindLiveNewsInteractions($('stockContainer'));
@@ -3037,8 +3220,7 @@ async function generateStockPool(){
     return;
   }
   $('searchInput').value = '';
-  clearTimeout(searchTimer);
-  searchSeq++;
+  cancelPendingSearch();
   stocks = [];
   currentViewSource = 'empty';
   selected.clear();
@@ -3078,6 +3260,11 @@ async function generateStockPool(){
   }catch(err){
     notify(`生成/更新股票池失败：${err.message || err}`, 'error');
   }
+}
+
+function cancelPendingSearch(){
+  clearTimeout(searchTimer);
+  searchSeq++;
 }
 
 async function runOnlineSearch(seq, keyword){
@@ -3229,6 +3416,7 @@ $('confirmAdd').onclick = () => {
 $('cardView').onclick = () => { view='card'; renderStocks(); };
 $('tableView').onclick = () => { view='table'; renderStocks(); };
 $('simulationView').onclick = openSimulationPortfolio;
+$('reportView').onclick = openDailyReports;
 $('editLabelStocks').onclick = () => labelEditMode ? finishLabelEditing() : startLabelEditing();
 $('labelScoreSort').onchange = event => updateLabelSort('score', event.target.value);
 $('labelChangeSort').onchange = event => updateLabelSort('changePct', event.target.value);
@@ -3279,6 +3467,12 @@ renderStocks();
 hydrateUserState();
 loadResearchAccount().then(() => { if(activeDetailCode || currentViewSource === 'portfolio') renderStocks(); });
 window.stockApi?.onFullMarketResearchProgress?.(renderFullMarketResearchStatus);
+window.stockApi?.onDailyReportProgress?.(progress => {
+  if(progress?.state === 'completed'){
+    if(currentViewSource === 'report') void openDailyReports();
+    else notify(progress.message || '收盘报告已生成', 'success');
+  }else if(progress?.state === 'failed') notify(`${progress.message || '收盘报告生成失败'}：${progress.error || ''}`, 'error');
+});
 window.stockApi?.getFullMarketResearchStatus?.().then(renderFullMarketResearchStatus).catch(() => {});
 loadMarketOverview();
 setInterval(() => loadMarketOverview(), 60 * 1000);

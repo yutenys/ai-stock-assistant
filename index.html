@@ -68,6 +68,7 @@
           <div class="market-section-title"><h3>全市场历史任务</h3><div><button id="startFullMarketResearch" class="small">启动 / 恢复</button><button id="cancelFullMarketResearch" class="small" disabled>取消</button></div></div>
           <div id="fullMarketResearchStatus" class="market-coverage">尚未启动；任务在后台运行，不阻塞大盘刷新。</div>
           <progress id="fullMarketResearchProgress" max="1" value="0"></progress>
+          <div id="marketBackgroundCandidates" class="market-coverage"></div>
         </section>
         <section class="market-section strategy-experiment"><h3>策略影子实验</h3><div id="strategyExperimentSummary" class="market-coverage">等待本轮策略评估。</div></section>
         <section class="market-section"><h3>市场消息</h3><div id="marketNews"></div></section>
@@ -85,6 +86,7 @@
           <div class="toolbar-right">
             <button id="openAddPanel" class="primary hidden">一键添加到关注</button>
             <button id="simulationView">模拟持仓</button>
+            <button id="reportView">收盘报告</button>
           </div>
         </div>
 

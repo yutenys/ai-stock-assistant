@@ -14,6 +14,7 @@ async function main() {
   const quotes = new Map(snapshot.quotes.map(row => [row.code, row]));
   const excluded = label => ['重点关注', 'personal'].includes(String(label).trim().toLowerCase());
   const favoriteOutcomes = (state.labels || []).flatMap(label => (label.stocks || []).map(stock => ({
+    outcomeOrigin:'favorite',
     code:stock.code, label:label.name, favoriteBasePrice:stock.favoriteBasePrice,
     favoriteAddedAt:stock.favoriteAddedAt, price:stock.price,
     signal:stock.favoriteEntrySnapshot?.signal || '',
@@ -45,19 +46,25 @@ async function main() {
   });
   eventLoop.disable();
   const benchmarkedOutcomes = api.mergeRecommendationOutcomeBenchmarks(pricedOutcomes, market.indices, market.sectors);
-  const profile = api.summarizeRecommendationOutcomes(benchmarkedOutcomes, {now:quoteFetchedAt,requireFreshQuote:true});
+  const observationOptions = {now:quoteFetchedAt,requireFreshQuote:true,includeFavorites:true};
+  const profile = api.summarizeRecommendationOutcomes(benchmarkedOutcomes, observationOptions);
   const cohorts = (state.labels || []).filter(label => !excluded(label.name)).map(label => {
     const rows = benchmarkedOutcomes.filter(row => row.label === label.name);
-    const stats = api.summarizeRecommendationOutcomes(rows, {now:quoteFetchedAt,requireFreshQuote:true});
+    const stats = api.summarizeRecommendationOutcomes(rows, observationOptions);
     const earlyObservation = stats.immatureCount ? {
-      ...api.summarizeRecommendationOutcomes(rows, {now:quoteFetchedAt,minimumAgeDays:0,requireFreshQuote:true}).overall,
+      ...api.summarizeRecommendationOutcomes(rows, {...observationOptions,minimumAgeDays:0}).overall,
       calibrationEligible:false
     } : null;
     return {label:label.name, ...stats.overall, immatureCount:stats.immatureCount, invalidCount:stats.invalidCount, earlyObservation};
   });
+  const observationGroups = key => Object.fromEntries([...new Set(benchmarkedOutcomes.map(key))].map(value => [value,
+    api.summarizeRecommendationOutcomes(benchmarkedOutcomes.filter(row => key(row) === value), observationOptions).overall]));
   const report = { fetchedAt:new Date().toISOString(), quoteFetchedAt, quoteTradeDate:snapshot.quotes[0]?.tradeDate,
     marketFetchedAt:market.fetchedAt, breadth:market.breadth, marketNews:market.newsContext, overseas:market.overseas,
-    profile, cohorts, positions, simulatedTradeCount:state.simulatedTrades?.length || 0,
+    profile, cohorts, positions, calibrationEligible:false,
+    byEntryModel:observationGroups(row => row.recommendationModelVersion || '未记录'),
+    byEntrySectorPhase:observationGroups(row => row.recommendationContext?.sector?.phase || '未记录'),
+    simulatedTradeCount:state.simulatedTrades?.length || 0,
     totalFloatingPnl:positions.reduce((sum, row) => sum + (row.floatingPnl || 0), 0),
     progress, eventLoopMaxMs:eventLoop.max / 1e6, elapsedMs:Date.now() - startedAt,
     coverage:market.recommendationCoverage, errors:market.errors, warnings:market.warnings,
