@@ -1499,8 +1499,11 @@ function sectorQuoteStats(memberCodes, marketQuotes) {
   const codeSet = new Set((memberCodes || []).map(code => String(code || '').slice(-6)).filter(Boolean));
   const stocks = codeSet.size ? (marketQuotes || []).filter(item => codeSet.has(String(item.code || '').slice(-6))) : [];
   if (!stocks.length) return null;
-  const abnormalListing = item => item?.noPriceLimit === true || Number(item?.daysSinceListing) <= 5
-    || /^[NC](?![A-Z])/i.test(String(item?.name || '').trim());
+  const abnormalListing = item => {
+    const daysSinceListing = finiteNumber(item?.daysSinceListing);
+    return item?.noPriceLimit === true || daysSinceListing !== null && daysSinceListing <= 5
+      || /^[NC](?![A-Z])/i.test(String(item?.name || '').trim());
+  };
   const regularStocks = stocks.filter(item => !abnormalListing(item));
   const changes = regularStocks.map(item => finiteNumber(item.changePct)).filter(value => value !== null);
   const rawChanges = stocks.map(item => finiteNumber(item.changePct)).filter(value => value !== null);
@@ -1517,7 +1520,7 @@ function sectorQuoteStats(memberCodes, marketQuotes) {
     averageChangePct:changes.length ? average(changes) : 0,
     upRatio:changes.length ? changes.filter(value => value > 0).length / changes.length : .5,
     amount,
-    amountPerStock:stocks.length ? amount / stocks.length : 0,
+    amountPerStock:regularStocks.length ? amount / regularStocks.length : 0,
     leader:leaders[0]?.name || '',
     representatives:leaders.slice(0, 3).map(item => item.name)
   };
@@ -2222,13 +2225,20 @@ function filterResolvedRecommendations(items) {
   return result;
 }
 
+function resolveEntryPermission(item = {}) {
+  const entryStatus = String(item.entryAssessment?.status || '');
+  if (/破位|失效|退潮|风险/.test(entryStatus) || item.analysis?.trendBroken) return 'blocked';
+  if (/过期/.test(entryStatus)) return 'expired';
+  const explicit = item.strategyDecision?.entryPermission || item.entryPermission;
+  if (['watch','armed','allowed','blocked','expired'].includes(explicit)) return explicit;
+  if (item.entryAssessment?.allowed === true) return 'allowed';
+  return item.momentumDecision?.firstPullback ? 'armed' : 'watch';
+}
+
 function buildRecommendationLedgerEntry(result) {
   const compact = (item, track) => {
     const tradePlan = item.analysis?.tradePlan || item.tradePlan || null;
-    const entryStatus = String(item.entryAssessment?.status || '');
-    const entryPermission = /破位|失效|退潮|风险/.test(entryStatus) ? 'blocked'
-      : item.entryAssessment?.allowed === true ? 'allowed'
-        : item.momentumDecision?.firstPullback ? 'armed' : 'watch';
+    const entryPermission = resolveEntryPermission(item);
     const role = item.roleAssessment?.primaryRole || item.primaryRole ? {
       primaryRole:item.roleAssessment?.primaryRole || item.primaryRole,
       entryPermission,
@@ -2242,8 +2252,9 @@ function buildRecommendationLedgerEntry(result) {
     });
     const observedAt = item.quoteObservedAt || item.fetchedAt || item.recommendationContext?.evaluatedAt || result?.fetchedAt || '';
     const signalId = `${result?.tradeDate || ''}-${item.code || ''}-${track}-${item.analysisId || item.scoreCard?.snapshotId || ''}`;
-    const eventType = entryPermission === 'allowed' ? 'entry-allowed' : entryPermission === 'armed' ? 'entry-armed'
-      : entryPermission === 'blocked' ? 'entry-blocked' : entryPermission === 'expired' ? 'entry-expired' : 'observation';
+    const resolvedPermission = role.entryPermission;
+    const eventType = resolvedPermission === 'allowed' ? 'entry-allowed' : resolvedPermission === 'armed' ? 'entry-armed'
+      : resolvedPermission === 'blocked' ? 'entry-blocked' : resolvedPermission === 'expired' ? 'entry-expired' : 'observation';
     return {
     code:item.code, name:item.name, industry:item.industry, signal:item.signal,
     strategy:item.recommendationTier, score:item.signalScore, technicalScore:item.technicalScore,
@@ -2252,7 +2263,11 @@ function buildRecommendationLedgerEntry(result) {
     price:item.price, changePct:item.changePct, tradeDate:item.analysis?.tradeDate || result?.tradeDate || '',
     analysisId:item.analysisId || item.scoreCard?.snapshotId || '',
     scoreCard:item.scoreCard || null, context:item.recommendationContext || null,
-    strategyDecision:item.strategyDecision || null,
+    strategyDecision:item.strategyDecision ? {
+      ...item.strategyDecision,
+      entryPermission:resolvedPermission,
+      actionStatus:resolvedPermission
+    } : null,
     strategyId:item.strategyDecision?.primaryStrategyId || '',
     strategyEvaluations:item.strategyEvaluations || [],
     signalId,
@@ -2273,9 +2288,9 @@ function buildRecommendationLedgerEntry(result) {
     invalidationPrice:tradePlan?.invalidationPrice ?? null,
     stressExitPrice:tradePlan?.stressExitPrice ?? null,
     rewardRisk:tradePlan?.rewardRisk ?? null,
-    researchEntryEligible:Boolean(tradePlan?.researchEntryEligible && entryPermission === 'allowed'),
-    triggeredAt:entryPermission === 'allowed' ? observedAt || result?.publishedAt || '' : '',
-    decisionEvent:{id:`${signalId}:${eventType}`,type:eventType,occurredAt:observedAt || result?.publishedAt || '',entryPermission},
+    researchEntryEligible:Boolean(tradePlan?.researchEntryEligible && resolvedPermission === 'allowed'),
+    triggeredAt:resolvedPermission === 'allowed' ? observedAt || result?.publishedAt || '' : '',
+    decisionEvent:{id:`${signalId}:${eventType}`,type:eventType,occurredAt:observedAt || result?.publishedAt || '',entryPermission:resolvedPermission},
     rejectionReasons:item.strategyDecision?.reasons || [],
     quote:{
       price:item.price,
@@ -2398,9 +2413,7 @@ function attachStrategyPlatform(item, context = {}) {
       || item.recommendationTier === '环境观察'
   });
   const analysisId = item.scoreCard?.snapshotId || item.recommendationContext?.snapshotId || context.snapshotId || '';
-  const actionStatus = /破位|失效|退潮|风险/.test(String(item.entryAssessment?.status || '')) ? 'blocked'
-    : item.entryAssessment?.allowed === true ? 'allowed'
-      : item.momentumDecision?.firstPullback ? 'armed' : 'watch';
+  const actionStatus = resolveEntryPermission(item);
   const result = {...item, analysisId, strategyEvaluations:evaluations,
     strategyDecision:{...decision,entryPermission:actionStatus,actionStatus}};
   return {...result, analysisViewModel:buildAnalysisViewModel(result, {decision, evaluations})};
@@ -7981,11 +7994,12 @@ function reportBatches(entries, tradeDate) {
     ...selectPublishedBatchStatus(entries, `${tradeDate}T${time}:00+08:00`)}));
 }
 
-function reportPublishedStocks(entries = []) {
+function reportPublishedStocks(entries = [], include = () => true) {
   const stable = new Map(), momentum = new Map(), triggered = new Map();
   const batches = [...entries].filter(batch => Number.isFinite(Date.parse(batch?.publishedAt)))
     .sort((a, b) => Date.parse(a.publishedAt) - Date.parse(b.publishedAt));
   const add = (target, item, batch) => {
+    if (!include(item, batch)) return;
     const code = String(item?.code || '').slice(-6);
     if (code && !target.has(code)) target.set(code,{item,batch});
   };
@@ -8082,11 +8096,11 @@ async function buildDailyReportInput(tradeDate, {force = false, manual = false} 
   }
   const ledger = await reportLedgerEntries(tradeDate, {allowLegacyScan:manual});
   const checkpoints = reportBatches(ledger.entries, tradeDate);
-  const published = reportPublishedStocks(ledger.entries);
-  const latest = latestLedgerEntry(ledger.entries);
   const publishedCandidate = item => !item.fullMarketFactor?.scope && item.recommendationTier !== '历史待筛';
+  const published = reportPublishedStocks(ledger.entries, publishedCandidate);
+  const latest = latestLedgerEntry(ledger.entries);
   const fallback = !published.stable.length && !published.momentum.length && latest?.publishedAt && latest.tradeDate === tradeDate
-    ? reportPublishedStocks([latest]) : published;
+    ? reportPublishedStocks([latest], publishedCandidate) : published;
   const stable = fallback.stable.filter(({item}) => publishedCandidate(item))
     .map(({item,batch}) => normalizeLedgerStock(item,batch,''));
   const momentum = fallback.momentum.filter(({item}) => publishedCandidate(item))

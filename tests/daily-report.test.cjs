@@ -153,6 +153,15 @@ test('报告区分发布观察、触发观察并显示检查点缺失原因', ()
   assert.match(html,/11:30.*行情距检查点124秒/s);
 });
 
+test('结构失效不能被显式入场许可覆盖', () => {
+  const role = classifyRecommendationRole({
+    entryPermission:'allowed',
+    analysis:{trendBroken:true}
+  });
+  assert.equal(role.primaryRole, '结构失效');
+  assert.equal(role.entryPermission, 'blocked');
+});
+
 test('报告HTML转义动态文本且拒绝危险资讯链接', () => {
   const html = renderDailyReportHtml({
     tradeDate:'2026-09-18', revision:1, status:'partial', summary:'<script>alert(1)</script>',

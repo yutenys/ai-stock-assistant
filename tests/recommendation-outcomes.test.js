@@ -1,6 +1,10 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const {evaluatePublishedEpisodes,mergeSavedReportCloses,assessForwardValidation} = require('../lib/recommendation-outcomes');
+const {readLedgerEntriesForDate} = require('../lib/report-service');
 const {nextTradingDay} = require('../lib/trade-time');
 
 function batch(id, date, signalId = id) {
@@ -44,6 +48,31 @@ test('连续日期同股跨模型版本必须拆成独立episode', () => {
   const review=evaluatePublishedEpisodes([first,second],new Map(),{asOfDate:'2026-09-15',horizons:[1]});
   assert.equal(review.counts.episodes,2);
   assert.deepEqual(review.episodes.map(row=>row.modelVersion),['test-v1','test-v2']);
+});
+
+test('压缩账本后B观察与触发以及A不同setup仍分组评价', async () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(),'outcome-groups-')), 'ledger.jsonl');
+  const batches = [
+    {batchId:'b-watch',tradeDate:'2026-09-10',publishedAt:'2026-09-10T02:00:00+08:00',inputCutoffAt:'2026-09-10T01:59:00+08:00',modelVersion:'v1',momentumRecommendations:[
+      {code:'600001',signalId:'b-watch',strategyId:'first-pullback',price:10,entryPermission:'watch',setupType:'首次回踩'}
+    ]},
+    {batchId:'b-trigger',tradeDate:'2026-09-10',publishedAt:'2026-09-10T02:30:00+08:00',inputCutoffAt:'2026-09-10T02:29:00+08:00',modelVersion:'v1',momentumRecommendations:[
+      {code:'600001',signalId:'b-trigger',strategyId:'first-pullback',price:10.2,entryPermission:'allowed',triggeredAt:'2026-09-10T02:29:00+08:00',setupType:'首次回踩'}
+    ]},
+    {batchId:'a-breakout',tradeDate:'2026-09-10',publishedAt:'2026-09-10T03:00:00+08:00',inputCutoffAt:'2026-09-10T02:59:00+08:00',modelVersion:'v1',recommendations:[
+      {code:'600002',signalId:'a-breakout',strategyId:'trend-breakout',price:20,entryPermission:'watch',setupType:'突破确认'}
+    ]},
+    {batchId:'a-pullback',tradeDate:'2026-09-10',publishedAt:'2026-09-10T03:30:00+08:00',inputCutoffAt:'2026-09-10T03:29:00+08:00',modelVersion:'v1',recommendations:[
+      {code:'600002',signalId:'a-pullback',strategyId:'trend-breakout',price:19.5,entryPermission:'watch',setupType:'回踩低吸'}
+    ]}
+  ];
+  fs.writeFileSync(file, batches.map(row => JSON.stringify(row)).join('\n') + '\n', 'utf8');
+  const compact = await readLedgerEntriesForDate(file,'2026-09-10',{compact:true});
+  assert.equal(compact.entries[1].momentumRecommendations[0].entryPermission, 'allowed');
+  assert.equal(compact.entries[1].momentumRecommendations[0].triggeredAt, '2026-09-10T02:29:00+08:00');
+  assert.equal(compact.entries[3].recommendations[0].setupType, '回踩低吸');
+  const review = evaluatePublishedEpisodes(compact.entries,new Map(),{asOfDate:'2026-09-10',horizons:[1]});
+  assert.deepEqual(review.episodes.map(row => row.evaluationGroup).sort(), ['A:回踩低吸','A:突破确认','B:观察','B:触发']);
 });
 
 test('停牌、开盘涨停和缺限价证据保留为不同状态', () => {

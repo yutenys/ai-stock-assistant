@@ -840,7 +840,7 @@ test('轮动对照使用跨交易日同口径基线而非重复刷新', () => {
 test('新上市异常涨幅不冒充成熟板块普涨或强势扩散',()=>{
   const quotes=[
     {code:'001399',name:'N测试',price:30,changePct:206.59,amount:9e9,noPriceLimit:true},
-    {code:'600001',name:'普通股份',price:10,changePct:2,amount:1e9}
+    {code:'600001',name:'普通股份',price:10,changePct:2,amount:1e9,daysSinceListing:null}
   ];
   const sector=mergeSectorCapitalRows({sectors:[]},[{
     name:'测试板块',changePct:2.85,mainNetInflow:3e8,mainNetPct:3,capitalTradeDate:'2026-09-30',
@@ -848,6 +848,7 @@ test('新上市异常涨幅不冒充成熟板块普涨或强势扩散',()=>{
   }],quotes,'2026-09-30').sectors[0];
   assert.equal(sector.rawAverageChangePct,104.295);
   assert.equal(sector.averageChangePct,2);
+  assert.equal(sector.amountPerStock,1e9);
   assert.equal(sector.participation.regularCount,1);
   assert.equal(sector.participation.sampleLimited,true);
   assert.equal(sector.participation.confidence,'低');
@@ -2457,6 +2458,35 @@ test('推荐账本冻结嵌套交易计划并保留唯一入场许可', () => {
   assert.equal(blocked.entryPermission, 'blocked');
 });
 
+test('推荐账本保留计划过期状态且不记录触发时间', () => {
+  const item = buildRecommendationLedgerEntry({
+    fetchedAt:'2026-09-30T07:00:00.000Z', publishedAt:'2026-09-30T07:00:02.000Z', tradeDate:'2026-09-30',
+    recommendations:[{
+      code:'600001', name:'测试股份', price:10,
+      entryAssessment:{allowed:false,status:'计划已过期'},
+      strategyDecision:{primaryStrategyId:'trend-breakout',entryPermission:'expired'}
+    }]
+  }).recommendations[0];
+  assert.equal(item.entryPermission, 'expired');
+  assert.equal(item.decisionEvent.type, 'entry-expired');
+  assert.equal(item.triggeredAt, '');
+});
+
+test('推荐账本硬风险同步覆盖嵌套策略许可', () => {
+  const item = buildRecommendationLedgerEntry({
+    fetchedAt:'2026-09-30T07:00:00.000Z', publishedAt:'2026-09-30T07:00:02.000Z', tradeDate:'2026-09-30',
+    recommendations:[{
+      code:'600001', name:'测试股份', price:10,
+      entryAssessment:{allowed:false,status:'结构失效'},
+      strategyDecision:{primaryStrategyId:'trend-breakout',entryPermission:'allowed',actionStatus:'allowed'}
+    }]
+  }).recommendations[0];
+  assert.equal(item.entryPermission, 'blocked');
+  assert.equal(item.strategyDecision.entryPermission, 'blocked');
+  assert.equal(item.strategyDecision.actionStatus, 'blocked');
+  assert.equal(item.decisionEvent.type, 'entry-blocked');
+});
+
 test('收盘报告主评价覆盖全天首次发布且检查点逐项披露', () => {
   const batch = (batchId,publishedAt,quoteObservedAt,recommendations=[],momentumRecommendations=[]) => ({
     batchId,publishedAt,quoteObservedAt,tradeDate:'2026-09-30',recommendations,momentumRecommendations
@@ -2473,6 +2503,20 @@ test('收盘报告主评价覆盖全天首次发布且检查点逐项披露', ()
   assert.deepEqual(published.stable.map(row => row.item.code),['600001']);
   assert.deepEqual(published.momentum.map(row => row.item.code),['600002','600003']);
   assert.deepEqual(published.triggered.map(row => row.item.code),['600002']);
+});
+
+test('收盘报告先过滤内部候选再冻结正式首发', () => {
+  const entries = [
+    {batchId:'internal',publishedAt:'2026-09-30T01:30:00.000Z',recommendations:[{
+      code:'600001',recommendationTier:'历史待筛',fullMarketFactor:{scope:'全市场'}
+    }]},
+    {batchId:'official',publishedAt:'2026-09-30T02:00:00.000Z',recommendations:[{
+      code:'600001',recommendationTier:'稳健轮动',price:10
+    }]}
+  ];
+  const published = reportPublishedStocks(entries, item => !item.fullMarketFactor?.scope && item.recommendationTier !== '历史待筛');
+  assert.equal(published.stable.length, 1);
+  assert.equal(published.stable[0].batch.batchId, 'official');
 });
 
 test('A/B候选附带影子角色但不改写原推荐结论', () => {
