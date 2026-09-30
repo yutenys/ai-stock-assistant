@@ -36,3 +36,11 @@ test('T+1跳过周末、节假日和调休周末，未知日历不编造日期',
   assert.equal(isTradingDay('2026-02-30'),null);
   assert.equal(executionWindow('2027-01-04T10:00:00+08:00').tradable,false);
 });
+
+test('一年研究跨2025至2026年使用已公告交易日', () => {
+  assert.equal(nextTradingDay('2025-09-30'),'2025-10-09');
+  assert.equal(nextTradingDay('2025-12-31'),'2026-01-05');
+  assert.equal(isTradingDay('2025-02-03'),false);
+  assert.equal(isTradingDay('2025-09-29'),true);
+  assert.equal(isTradingDay('2024-12-31'),null);
+});

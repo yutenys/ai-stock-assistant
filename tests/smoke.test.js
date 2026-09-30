@@ -53,11 +53,13 @@ const {
   validateAiExplanation,
   marketSnapshotId,
   classifyMarketRegime,
+  confirmMarketRecovery,
   updateMarketRotationHistory,
   priorMarketRotationSnapshot,
   buildStrategyScoreCard,
   mergeSectorCapitalRows,
   classifySectorRotationPhase,
+  assessSectorCapitalTrend,
   resolveStockRotationProfiles,
   selectRotationPriorityCandidates,
   momentumRecommendationDecision,
@@ -80,6 +82,8 @@ const {
   weightedRecommendationScore,
   filterResolvedRecommendations,
   buildRecommendationLedgerEntry,
+  reportBatches,
+  reportPublishedStocks,
   attachRecommendationMetadata,
   calibrateRecommendationWithOutcomes,
   applyOutcomeFeedbackAssessment,
@@ -189,14 +193,35 @@ test('腾讯行情原始时间参与收盘判断与快照内容身份', () => {
   assert.notEqual(first,second);
 });
 
-test('放量普跌中的局部板块单独分类，不误判成普涨或全面风险', () => {
-  const result = classifyMarketRegime({breadth:{up:600,down:4500,flat:30},turnover:1.97e12,observationPhase:{phase:'closed'},
+test('放量普跌中的局部板块仅供观察，风险释放优先', () => {
+  const result = classifyMarketRegime({breadth:{up:1400,down:3600,flat:30},turnover:1.97e12,observationPhase:{phase:'closed'},
     indices:[{changePct:-1.1},{changePct:-.5}],limits:{upCount:40,downCount:8},
     sectors:[{name:'元件',changePct:3.6,upRatio:.86,mainNetInflow:3.2e9,capitalEstimated:false,capitalStale:false}]}, {turnover:1.64e12,observationPhase:{phase:'closed'}});
   assert.equal(result.key, 'localized-strength');
   assert.equal(result.label, '放量普跌中的局部强势');
   assert.equal(result.riskOff, false);
+  assert.equal(result.allowNewEntry, false);
   assert.equal(result.localized, true);
+  const risk = classifyMarketRegime({breadth:{up:897,down:4554,flat:468},indices:[{changePct:-1.67},{changePct:-3.44},{changePct:-4.53}],
+    sectors:[{name:'测试板块',changePct:2,upRatio:.8,mainNetInflow:1e8,mainNetPct:2,
+      mainNet3:3e8,mainNet5:5e8,mainNet10:8e8,capitalEstimated:false,capitalStale:false}]});
+  assert.equal(risk.key, 'risk-release');
+  assert.equal(risk.riskOff, true);
+  assert.equal(risk.localized, true);
+});
+
+test('风险释放后两个不同的间隔行情快照才允许恢复', () => {
+  const blocked = {marketRegime:{allowNewEntry:false}};
+  const healthy = {allowNewEntry:true,riskLevel:'normal'};
+  const first = confirmMarketRecovery(healthy,blocked,'a','2026-09-29T01:30:00Z');
+  assert.equal(first.allowNewEntry,false);
+  const repeated = confirmMarketRecovery(healthy,{marketRegime:first},'a','2026-09-29T01:50:00Z');
+  assert.equal(repeated.allowNewEntry,false);
+  const early = confirmMarketRecovery(healthy,{marketRegime:first},'b','2026-09-29T01:40:00Z');
+  assert.equal(early.allowNewEntry,false);
+  const second = confirmMarketRecovery(healthy,{marketRegime:early},'b','2026-09-29T01:46:00Z');
+  assert.equal(second.allowNewEntry,true);
+  assert.equal(second.recovery.count,2);
 });
 
 test('盘中越过突破位只进入观察，收盘数据才允许确认', () => {
@@ -284,6 +309,8 @@ test('回踩通道允许缩量低涨幅，但仍排除失去资金确认的板�
   const result=momentumRecommendationDecision(item);
   assert.equal(result.passed,true);
   assert.equal(result.firstPullback,true);
+  assert.equal(result.group,'回踩待触发');
+  assert.equal(result.triggerState,'armed');
   assert.match(result.entryAssessment.status,/首次缩量回踩/);
   assert.equal(result.entryAssessment.allowed,false);
   assert.equal(momentumRecommendationDecision({...item,analysis:{firstPullback:false}}).passed,false);
@@ -539,6 +566,17 @@ test('强势追踪最终文案保留资金消息美股风险分析',()=>{
   assert.match(result.entryAssessment.summary,/首次缩量回踩/);
   assert.match(result.entryAssessment.summary,/资金转弱.*消息谨慎.*美股偏弱/);
   assert.ok(result.entryAssessment.evidence.includes('美股风险'));
+  assert.equal(result.momentumGroup,'强势观察');
+});
+
+test('第一目标净盈亏比不足时不能保留可入场结论',()=>{
+  const result=applyEntryContextAssessment({
+    tradePlan:{enabled:true,researchEntryEligible:false,rewardRisk:.68},
+    entryAssessment:{allowed:true,status:'可分批入场',summary:'技术与资金成立',evidence:[]}
+  },{marketOverview:{breadth:{up:3000,down:2000},indices:[{changePct:.2}],sectors:[]}});
+  assert.equal(result.entryAssessment.allowed,false);
+  assert.equal(result.entryAssessment.status,'风险收益不足');
+  assert.equal(result.tradePlan.enabled,false);
 });
 
 test('新浪股数转换为手后与实时报价合并，量比和资金估算不差100倍', () => {
@@ -787,14 +825,54 @@ test('过期板块资金不进入强势追踪和轮动优先队列', () => {
 });
 
 test('轮动对照使用跨交易日同口径基线而非重复刷新', () => {
-  const old={tradeDate:'2026-09-03',sectors:[{name:'软件',rotationScore:60,capitalEstimated:true}]};
-  const current=[{name:'软件',rotationScore:75,capitalEstimated:true}];
+  const old={tradeDate:'2026-09-03',sectors:[{name:'软件',rotationScore:60,capitalEstimated:true,
+    boardType:'industry',capitalSource:'fixture'}]};
+  const current=[{name:'软件',rotationScore:75,capitalEstimated:true,boardType:'industry',capitalSource:'fixture'}];
   const first=annotateSectorRotation(current,old,'2026-09-04');
   assert.equal(first[0].rotationTransition.delta,15);
   const again=annotateSectorRotation([{...current[0],rotationScore:80}],{tradeDate:'2026-09-04',sectors:first},'2026-09-04');
   assert.equal(again[0].rotationTransition.delta,20);
   assert.equal(annotateSectorRotation(current,null,'2026-09-04')[0].rotationTransition.available,false);
   assert.equal(annotateSectorRotation([{...current[0],capitalEstimated:false}],old,'2026-09-04')[0].rotationTransition.available,false);
+  assert.equal(annotateSectorRotation([{...current[0],capitalSource:'other'}],old,'2026-09-04')[0].rotationTransition.available,false);
+});
+
+test('新上市异常涨幅不冒充成熟板块普涨或强势扩散',()=>{
+  const quotes=[
+    {code:'001399',name:'N测试',price:30,changePct:206.59,amount:9e9,noPriceLimit:true},
+    {code:'600001',name:'普通股份',price:10,changePct:2,amount:1e9}
+  ];
+  const sector=mergeSectorCapitalRows({sectors:[]},[{
+    name:'测试板块',changePct:2.85,mainNetInflow:3e8,mainNetPct:3,capitalTradeDate:'2026-09-30',
+    memberCodes:quotes.map(row=>row.code)
+  }],quotes,'2026-09-30').sectors[0];
+  assert.equal(sector.rawAverageChangePct,104.295);
+  assert.equal(sector.averageChangePct,2);
+  assert.equal(sector.participation.regularCount,1);
+  assert.equal(sector.participation.sampleLimited,true);
+  assert.equal(sector.participation.confidence,'低');
+  const regime=classifyMarketRegime({breadth:{up:3000,down:2000},indices:[{changePct:.2}],sectors:[sector]});
+  assert.equal(regime.strongSectorCount,0);
+});
+
+test('大盘状态记录上涨广度相对前一快照明显走弱',()=>{
+  const previous={breadth:{up:3500,down:1800},indices:[{changePct:.5}]};
+  const current=classifyMarketRegime({breadth:{up:2500,down:2800},indices:[{changePct:0}]},previous);
+  assert.ok(current.upRatioDelta < -.1);
+  assert.equal(current.breadthTrend,'明显走弱');
+  assert.match(current.evidence.join('；'),/上涨广度较前次/);
+});
+
+test('单日资金仍为正但快速减速，先记录影子降级而不直接改正式权重', () => {
+  const row={name:'农业',changePct:5.2,mainNetInflow:1e8,mainNet3:9e8,mainNet5:11e8,
+    mainNet10:20e8,mainNetPct:4,capitalEstimated:false,capitalStale:false,count:12,
+    participation:{breadthScore:70,topAmountShare:.5}};
+  const trend=assessSectorCapitalTrend(row);
+  assert.equal(trend.decelerating,true);
+  assert.equal(trend.confirmed,true);
+  assert.equal(trend.researchPhase,'资金流入放缓');
+  assert.equal(classifySectorRotationPhase(row).phase,'拥挤加速');
+  assert.equal(classifySectorRotationPhase(row).researchPhase,'拥挤分歧');
 });
 
 test('同交易日资金从峰值明显回撤时不再作为轮动主线确认',()=>{
@@ -1081,6 +1159,8 @@ test('强势追踪要求板块资金确认且涨停爆量不允许追高', () =>
   };
   const hot = momentumRecommendationDecision(base);
   assert.equal(hot.passed, true);
+  assert.equal(hot.group, '强势观察');
+  assert.equal(hot.triggerState, 'watch');
   assert.equal(hot.entryAssessment.allowed, false);
   assert.equal(hot.entryAssessment.status, '强势追踪，不追高');
   assert.match(hot.entryAssessment.summary, /涨停|爆量/);
@@ -1348,7 +1428,8 @@ test('未来交易日不能生成正式收盘报告', async () => {
 
 test('跨日轮动快照保留收盘基线，重启和同日刷新不覆盖昨日', () => {
   const closed = {tradeDate:'2026-09-16', fetchedAt:'2026-09-16T07:10:00Z', turnover:100,
-    observationPhase:{phase:'closed'}, sectors:[{name:'软件',rotationScore:80,capitalEstimated:false}]};
+    observationPhase:{phase:'closed'}, sectors:[{name:'软件',rotationScore:80,capitalEstimated:false,
+      boardType:'industry',capitalSource:'fixture'}]};
   let history = updateMarketRotationHistory([], closed);
   const today = {...closed, tradeDate:'2026-09-17', fetchedAt:'2026-09-17T02:00:00Z', turnover:30, observationPhase:{phase:'intraday'}};
   history = updateMarketRotationHistory(history, today);
@@ -1357,7 +1438,7 @@ test('跨日轮动快照保留收盘基线，重启和同日刷新不覆盖昨�
   assert.equal(history.length,1);
   assert.equal(baseline.turnover,100);
   assert.equal(priorMarketRotationSnapshot(history,'2026-09-21'),null);
-  const current = [{name:'软件',rotationScore:60,capitalEstimated:false}];
+  const current = [{name:'软件',rotationScore:60,capitalEstimated:false,boardType:'industry',capitalSource:'fixture'}];
   const first = annotateSectorRotation(current,{tradeDate:today.tradeDate,sectors:current},today.tradeDate,baseline);
   assert.equal(first[0].rotationTransition.delta,-20);
   const again = annotateSectorRotation(current,{tradeDate:today.tradeDate,sectors:first},today.tradeDate,baseline);
@@ -1666,6 +1747,9 @@ test('近三个月行情返回技术分析和观察窗口', { timeout: 60000 }, 
   const plan = result.analysis.tradePlan;
   assert.ok(plan.entryLow > 0 && plan.entryHigh >= plan.entryLow);
   assert.ok(plan.invalidationPrice < plan.entryLow);
+  assert.match(plan.earliestBuyDate || '',/^\d{4}-\d{2}-\d{2}$/);
+  assert.ok(plan.earliestSellDate > plan.earliestBuyDate);
+  assert.ok(plan.entryExpiryDate > plan.earliestSellDate);
   assert.equal(plan.entrySteps.reduce((sum, step) => sum + step.buyPct, 0), 100);
   assert.equal(plan.targets.reduce((sum, target) => sum + target.sellPct, 0), 100);
   assert.ok(plan.targets[0].price < plan.targets[1].price && plan.targets[1].price < plan.targets[2].price);
@@ -1720,6 +1804,18 @@ test('交易计划失效价始终低于低吸区下沿', () => {
   });
   assert.ok(plan.invalidationPrice < plan.entryLow);
   assert.ok(plan.stopPct > 0);
+});
+
+test('交易计划按实际入场路径计算第一目标净盈亏比', () => {
+  const plan = buildTradePlan({
+    latestPrice:95, supportPrice:92.5, resistance:95.72, rangeHigh:120, recent10Low:91,
+    ma5:94, ma10:93.5, ma20:93, ma30:92, atr14:1.2, volumeRatio:1.8, verdict:'可关注'
+  });
+  assert.equal(plan.setupType, '突破确认');
+  assert.equal(plan.expectedEntryPrice, plan.confirmationPrice);
+  assert.ok(plan.rewardRisk < 2);
+  assert.equal(plan.researchEntryEligible, false);
+  assert.ok(plan.legacyRangeRewardRisk > plan.rewardRisk);
 });
 
 test('个股走势返回分时五日日周月五种周期', { timeout: 60000 }, async () => {
@@ -2019,12 +2115,13 @@ test('个股入场结论区分破位、爆量、等待确认和可分批入场',
   const base = {
     latestPrice: 10.8, ma5: 10.5, ma10: 10.3, ma20: 10.1, ma30: 9.9,
     supportPrice: 9.8, resistance: 10.5, volumeRatio: 1.8, rsi14: 62,
-    breakoutStatus: '突破确认'
+    breakoutStatus: '突破确认',observationPhase:{phase:'closed'}
   };
   const ready = assessCurrentEntry(base);
   assert.equal(ready.allowed, true);
   assert.equal(ready.status, '可分批入场');
   assert.match(ready.summary, /现价10\.80元.*量比1\.80/);
+  assert.equal(assessCurrentEntry({...base,observationPhase:null}).status,'收盘状态待核验');
 
   const broken = assessCurrentEntry({
     ...base, latestPrice: 8.8, ma5: 9.1, ma10: 9.3, ma20: 9.4, ma30: 9.5,
@@ -2327,6 +2424,55 @@ test('推荐账本记录完整候选和三周期快照', () => {
   assert.equal(entry.recommendations[0].quote.observedAt, '2026-09-11T07:59:58.000Z');
   assert.equal(entry.recommendations[0].quote.changePct, 2);
   assert.equal(entry.rejectedCandidates[0].reason, 'industry-unresolved');
+});
+
+test('推荐账本冻结嵌套交易计划并保留唯一入场许可', () => {
+  const build = entryAssessment => buildRecommendationLedgerEntry({
+    fetchedAt:'2026-09-30T07:00:00.000Z', publishedAt:'2026-09-30T07:00:02.000Z', tradeDate:'2026-09-30',
+    recommendations:[{
+      code:'600001', name:'测试股份', signal:'突破确认', signalScore:88, price:10,
+      entryAssessment,
+      primaryRole:'首次回踩', secondaryRoles:['缩量承接'],
+      roleAssessment:{primaryRole:'首次回踩',entryPermission:'watch',reasons:['缩量承接']},
+      analysis:{tradePlan:{enabled:true,researchEntryEligible:true,setupType:'突破确认',confirmationPrice:10.2,
+        invalidationPrice:9.5,rewardRisk:2.1,entryExpiryDate:'2026-10-12'}}
+    }], momentumRecommendations:[]
+  }).recommendations[0];
+  const allowed = build({allowed:true,status:'可分批入场'});
+  assert.equal(allowed.primaryRole, '首次回踩');
+  assert.equal(allowed.entryPermission, 'allowed');
+  assert.equal(allowed.triggerPrice, 10.2);
+  assert.equal(allowed.invalidationPrice, 9.5);
+  assert.equal(allowed.rewardRisk, 2.1);
+  assert.equal(allowed.setupType, '突破确认');
+  assert.equal(allowed.entryExpiryDate, '2026-10-12');
+  assert.equal(allowed.researchEntryEligible, true);
+  assert.equal(allowed.decisionEvent.type, 'entry-allowed');
+  assert.equal(allowed.triggeredAt, '2026-09-30T07:00:00.000Z');
+  const waiting = build({allowed:false,status:'箱体震荡，洗盘待确认'});
+  assert.equal(waiting.entryPermission, 'watch');
+  assert.equal(waiting.researchEntryEligible, false);
+  assert.equal(waiting.triggeredAt, '');
+  const blocked = build({allowed:false,status:'结构失效'});
+  assert.equal(blocked.entryPermission, 'blocked');
+});
+
+test('收盘报告主评价覆盖全天首次发布且检查点逐项披露', () => {
+  const batch = (batchId,publishedAt,quoteObservedAt,recommendations=[],momentumRecommendations=[]) => ({
+    batchId,publishedAt,quoteObservedAt,tradeDate:'2026-09-30',recommendations,momentumRecommendations
+  });
+  const entries = [
+    batch('morning','2026-09-30T01:59:27.000Z','2026-09-30T01:59:16.000Z',[{code:'600001'}]),
+    batch('noon','2026-09-30T03:28:33.000Z','2026-09-30T03:27:56.000Z',[],[{code:'600002',entryPermission:'allowed',triggeredAt:'2026-09-30T03:27:56.000Z'}]),
+    batch('afternoon','2026-09-30T06:28:08.000Z','2026-09-30T06:27:29.000Z',[],[{code:'600003'}])
+  ];
+  const checkpoints = reportBatches(entries,'2026-09-30');
+  assert.deepEqual(checkpoints.map(row => row.status),['covered','stale','stale']);
+  assert.match(checkpoints[1].reason,/124秒/);
+  const published = reportPublishedStocks(entries);
+  assert.deepEqual(published.stable.map(row => row.item.code),['600001']);
+  assert.deepEqual(published.momentum.map(row => row.item.code),['600002','600003']);
+  assert.deepEqual(published.triggered.map(row => row.item.code),['600002']);
 });
 
 test('A/B候选附带影子角色但不改写原推荐结论', () => {

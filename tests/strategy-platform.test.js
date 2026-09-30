@@ -6,10 +6,85 @@ const {
   detectBreakoutContext,
   buildFactorSnapshot,
   evaluateStrategyRegistry,
+  evaluateResearchSetups,
   arbitrateStrategyResults,
   buildAnalysisViewModel,
   mergeEventLifecycle
 } = require('../lib/strategy-platform');
+const {nextTradingDay} = require('../lib/trade-time');
+
+test('C类影子规则保留量能边界且不授予入场许可', () => {
+  const rows = Array.from({length:20}, (_, index) => ({date:`2026-08-${String(index + 1).padStart(2, '0')}`,volume:100}));
+  const evidence = {
+    tradeDate:'2026-09-14',inputCutoffAt:'2026-09-14T15:05:00+08:00',history:[...rows,{date:'2026-09-11',volume:150},
+      {date:'2026-09-14',close:11,high:11,low:10,upperLimit:11,volume:220}],
+    observationPhase:{phase:'closed'},leaderPool:{complete:true,tradeDate:'2026-09-14',ruleGroup:'10%',
+      availableAt:'2026-09-14T15:01:00+08:00',priorHeightWindowVerified:true,
+      stocks:[{code:'600001',height:3,ruleGroup:'10%'},{code:'600002',height:2,ruleGroup:'10%'}],priorTenDayHeights:Array(10).fill(2)},
+    intradayEvents:[
+      {type:'opened-limit',tradeDate:'2026-09-14',at:'2026-09-14T10:00:00+08:00',price:10.9},
+      {type:'resealed',tradeDate:'2026-09-14',at:'2026-09-14T10:02:00+08:00',eventId:'a',price:11},
+      {type:'resealed',tradeDate:'2026-09-14',at:'2026-09-14T10:08:00+08:00',eventId:'b',price:11}]
+  };
+  const base = () => evaluateResearchSetups('600001',evidence).filter(row => row.id === 'leader-reversal-shadow');
+  assert.equal(base()[0].status,'matched');
+  assert.equal(base()[1].status,'matched');
+  assert.equal(evaluateResearchSetups('600001',evidence).find(row => row.id === 'leader-catchup-combination-shadow').status,'matched');
+  assert.equal(base()[0].entryPermission,'none');
+  evidence.history.at(-2).volume = 149;
+  assert.equal(base()[0].status,'failed');
+  evidence.history.at(-2).volume = 401;
+  assert.equal(base()[0].status,'matched');
+  evidence.leaderPool.stocks[1].height = 3;
+  assert.equal(base()[0].status,'failed');
+  evidence.leaderPool.stocks[1].height = 2;
+  evidence.leaderPool.complete = false;
+  assert.equal(base()[0].status,'unknown');
+  evidence.leaderPool.complete = true;
+  evidence.leaderPool.availableAt = '2026-09-14T15:06:00+08:00';
+  assert.equal(base()[0].status,'unknown');
+  evidence.leaderPool.availableAt = '2026-09-14T15:01:00+08:00';
+  evidence.intradayEvents = null;
+  assert.equal(base()[0].status,'unknown');
+  evidence.intradayEvents = [];
+  evidence.observationPhase.phase = 'intraday';
+  assert.notEqual(base()[0].status,'matched');
+});
+
+test('G首补二补必须有完整此前20交易日和信号时已知题材证据', () => {
+  let day = '2026-08-14';
+  const previousTwentyLimitUps = [];
+  for (let index=0;index<20;index++) {
+    previousTwentyLimitUps.push({date:day,confirmed:true,limitUp:index===3});
+    day = nextTradingDay(day);
+  }
+  const evidence = {tradeDate:day,inputCutoffAt:`${day}T15:10:00+08:00`,previousTwentyLimitUps,observationPhase:{phase:'closed'},
+    signalBar:{close:11,upperLimit:11,high:11,low:10},
+    theme:{memberCoverage:1,membershipAsOf:`${day}T10:00:00+08:00`,heightScope:'theme',memberCodes:['600001'],leadingHeight:5}};
+  const get = id => evaluateResearchSetups('600001',evidence).find(row => row.id === id).status;
+  assert.equal(get('first-catchup-shadow'),'failed');
+  assert.equal(get('second-catchup-shadow'),'matched');
+  assert.notEqual(get('leader-catchup-combination-shadow'),'matched');
+  evidence.sentiment={phase:'高潮',observedAt:`${day}T15:00:00+08:00`};
+  assert.equal(get('leader-catchup-combination-shadow'),'matched');
+  evidence.sentiment.observedAt=`${day}T15:11:00+08:00`;
+  assert.notEqual(get('leader-catchup-combination-shadow'),'matched');
+  evidence.previousTwentyLimitUps.pop();
+  assert.equal(get('second-catchup-shadow'),'unknown');
+  evidence.previousTwentyLimitUps.push({date:'2026-01-01',confirmed:true,limitUp:false});
+  assert.equal(get('second-catchup-shadow'),'unknown');
+  evidence.previousTwentyLimitUps.at(-1).date = previousTwentyLimitUps[18].date;
+  evidence.theme.membershipAsOf = '2026-12-01T10:00:00+08:00';
+  assert.notEqual(get('second-catchup-shadow'),'matched');
+  assert.equal(evaluateResearchSetups('600001',evidence).find(row => row.id === 'position-guarded-shadow').status,'unknown');
+  evidence.inputCutoffAt = `${day}T15:10:00+08:00`;
+  evidence.exactGuard = {ruleVersion:'C7/C8-v1',source:'point-in-time',status:'pass',availableAt:`${day}T15:11:00+08:00`};
+  assert.equal(get('position-guarded-shadow'),'unknown');
+  evidence.exactGuard.availableAt = `${day}T15:00:00+08:00`;
+  assert.equal(get('position-guarded-shadow'),'matched');
+  evidence.exactGuard.status = 'unknown';
+  assert.equal(get('position-guarded-shadow'),'unknown');
+});
 
 function history(start, dailyPct, count = 260) {
   const rows = [];

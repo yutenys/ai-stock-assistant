@@ -20,6 +20,7 @@ app.whenReady().then(async () => {
   let liveNewsRequestCount = 0;
   let reportGenerateCount = 0;
   let reportBrowserOpenCount = 0;
+  const reportBrowserRequests = [];
   let savedUserState = null;
   let researchAccount = null;
   ipcMain.handle('append-operation-log', async () => true);
@@ -56,8 +57,8 @@ app.whenReady().then(async () => {
   }
   ipcMain.handle('list-daily-reports', async () => [{tradeDate:'2026-09-18',latestRevision:1,status:'partial'}]);
   ipcMain.handle('get-daily-report', async () => ({manifest:{latestRevision:1},report:dailyReport}));
-  ipcMain.handle('generate-daily-report', async () => { reportGenerateCount += 1; return {preview:false,manifest:{latestRevision:1},report:dailyReport}; });
-  ipcMain.handle('open-daily-report', async () => { reportBrowserOpenCount += 1; return {ok:true,file:'report.html'}; });
+  ipcMain.handle('generate-daily-report', async () => { reportGenerateCount += 1; return {preview:true,report:{...dailyReport,revision:0,status:'preview'}}; });
+  ipcMain.handle('open-daily-report', async (_event, request) => { reportBrowserOpenCount += 1; reportBrowserRequests.push(request); return {ok:true,file:'report.html'}; });
   ipcMain.handle('search-a-share-stocks', async (_event, keyword) => {
     if (keyword === 'race') await new Promise(resolve => setTimeout(resolve, 350));
     return [];
@@ -878,6 +879,8 @@ app.whenReady().then(async () => {
       await new Promise(resolve => setTimeout(resolve, 10));
       if(!document.getElementById('generateReport')?.disabled) break;
     }
+    document.getElementById('openReportBrowser').click();
+    for(let index = 0; index < 30; index += 1) await new Promise(resolve => setTimeout(resolve, 5));
     const searchInput = document.getElementById('searchInput');
     searchInput.value = 'abc';
     searchInput.dispatchEvent(new Event('input', {bubbles:true}));
@@ -895,6 +898,7 @@ app.whenReady().then(async () => {
     return {initial,momentum,best,survivesPendingSearch,survivesInFlightSearch,active:document.getElementById('reportView').classList.contains('active'),hasBrowserButton:Boolean(document.getElementById('openReportBrowser')),warning:document.querySelector('.report-warnings')?.innerText || ''};
   })()`);
   reportState.browserOpenCount = reportBrowserOpenCount;
+  reportState.browserRequests = reportBrowserRequests;
   reportState.generateCount = reportGenerateCount;
   const state = await win.webContents.executeJavaScript(`({
     title: document.title,
@@ -1011,7 +1015,7 @@ app.whenReady().then(async () => {
     && state.detailState.text.includes('20日均量1.5-4.0倍')
     && state.detailState.text.includes('收盘跌破8.00元')
     && state.detailState.text.includes('MA30 ¥6.42')
-    && state.detailState.text.includes('低吸区间：¥6.11-¥6.25')
+    && state.detailState.text.includes('回踩低吸备选区间：¥6.11-¥6.25')
     && state.detailState.text.includes('第1档 ¥7.40 卖出30%')
     && state.detailState.text.includes('计划总仓位不超过30.0%')
     && state.detailState.text.includes('未来半年公司风险')
@@ -1248,7 +1252,8 @@ app.whenReady().then(async () => {
     && state.reportState.best.includes('方案B测试')
     && !state.reportState.best.includes('方案A测试')
     && state.reportState.warning.includes('逐日资金明细缺失')
-    && state.reportState.browserOpenCount === 1
+    && state.reportState.browserOpenCount === 2
+    && state.reportState.browserRequests[1]?.revision === 0
     && state.reportState.generateCount === 1;
   if (state.title !== '股票观察助手' || state.heading !== state.title || !state.hasApi || !state.stockContainer || state.statusFixed !== 'fixed' || state.focusAfterAdd !== 'searchInput' || state.focusAfterDelete !== 'searchInput' || !inputsUsable || !desktopLayoutUsable || !backToTopUsable || !multiLabelUsable || !detailUsable || !detailClickQuoteUsable || !marketUsable || !liveNewsUsable || !chartUsable || !simulationUsable || !labelModalUsable || !labelSortUsable || !labelRenameUsable || !favoriteChangeUsable || !labelListUsable || !reportUsable || errors.length) {
     console.error(JSON.stringify({ state, checks: { inputsUsable, desktopLayoutUsable, backToTopUsable, multiLabelUsable, detailUsable, detailClickQuoteUsable, marketUsable, liveNewsUsable, chartUsable, simulationUsable, labelModalUsable, labelSortUsable, labelRenameUsable, favoriteChangeUsable, labelListUsable, reportUsable }, errors }, null, 2));
