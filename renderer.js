@@ -6,6 +6,7 @@ let stocks = [];
 let selected = new Set();
 let view = 'card';
 let labels = [];
+let removedFavoriteEvents = [];
 let activeLabel = '';
 let labelSorts = {};
 let portfolio = [];
@@ -43,6 +44,10 @@ let dailyReports = [];
 let activeDailyReport = null;
 let reportLoading = false;
 let reportRecommendationTrack = 'all';
+let reportPage = 'review';
+let reportEpisodePage = null;
+let reportEpisodeLoading = false;
+let reportEpisodeRequestId = 0;
 const detailProfileCache = new Map();
 const detailNewsCache = new Map();
 const detailHistoryCache = new Map();
@@ -97,7 +102,8 @@ function safeHttpUrl(value){
 }
 
 async function saveState({successMessage = ''} = {}){
-  const state = {schemaVersion:2, updatedAt:new Date().toISOString(), labels, activeLabel, labelSorts, portfolio, simulatedTrades};
+  const state = {schemaVersion:2, updatedAt:new Date().toISOString(), labels, removedFavoriteEvents,
+    activeLabel, labelSorts, portfolio, simulatedTrades};
   let browserSaved = false;
   try{
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
@@ -166,6 +172,7 @@ function labelStockSnapshot(stock, existingStock=null){
     favoriteEntrySnapshot: existingStock
       ? existingStock.favoriteEntrySnapshot || null
       : {
+        favoriteEventId:globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`,
         signal:stock.marketSignal || stock.signal || stock.type || stock.status,
         signalScore:stock.signalScore ?? null,
         technicalScore:stock.technicalScore ?? null,
@@ -176,6 +183,11 @@ function labelStockSnapshot(stock, existingStock=null){
         industryBenchmark:industryBenchmark
           ? {code:industryBenchmark.code,name:industryBenchmark.name,price:Number(industryBenchmark.price)} : null,
         modelVersion:stock.recommendationModelVersion || '',
+        sourceType:stock.recommendationContext?.sourceType || (stock.recommendationModelVersion ? 'recommendation' : 'manual'),
+        signalId:stock.signalId || '',
+        planId:stock.planId || stock.planState?.planId || '',
+        planRevision:stock.planRevision || stock.planState?.revision || null,
+        plan:stock.planState?.tradePlan || stock.tradePlan || null,
         context:stock.recommendationContext ? JSON.parse(JSON.stringify(stock.recommendationContext)) : null,
         capturedAt:new Date().toISOString()
       },
@@ -187,9 +199,23 @@ function labelStockSnapshot(stock, existingStock=null){
   };
 }
 
+function recordRemovedFavorite(label, stocks){
+  const removedAt = new Date().toISOString();
+  for(const stock of stocks){
+    const source = stock.favoriteEntrySnapshot || {};
+    const favoriteEventId = source.favoriteEventId || globalThis.crypto?.randomUUID?.()
+      || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    if(removedFavoriteEvents.some(row => row.favoriteEventId === favoriteEventId)) continue;
+    removedFavoriteEvents.push({favoriteEventId,code:stock.code,labelId:label.id || label.name,
+      sourceType:source.sourceType || 'unknown',modelVersion:source.modelVersion || 'unknown',
+      signalId:source.signalId || '',planId:source.planId || '',addedAt:stock.favoriteAddedAt || '',removedAt});
+  }
+}
+
 function applyPersistedState(state){
   if(!state || typeof state !== 'object') return false;
     if(Array.isArray(state.labels)) labels = state.labels;
+    if(Array.isArray(state.removedFavoriteEvents)) removedFavoriteEvents = state.removedFavoriteEvents;
     if(state.labelSorts && typeof state.labelSorts === 'object') labelSorts = state.labelSorts;
     if(Array.isArray(state.portfolio)) portfolio = state.portfolio.filter(item => /^\d{6}$/.test(String(item.code || '')));
     if(Array.isArray(state.simulatedTrades)) simulatedTrades = state.simulatedTrades;
@@ -334,8 +360,12 @@ function recommendationCardHtml(item, selectable=false){
   const confidence = item.dataConfidence ? `数据可信度 ${item.dataConfidence.label} ${item.dataConfidence.available}/${item.dataConfidence.total}` : '数据可信度待评估';
   const unifiedScore = item.scoreCard?.recommendation ?? item.signalScore ?? item.score;
   const momentumBadge = item.momentumGroup ? `<span class="market-signal ${item.momentumGroup === '回踩待触发' ? 'b-blue' : 'b-yellow'}">${escapeHtml(item.momentumGroup)}</span>` : '';
-  const content = `<span class="market-stock-content"><b class="market-stock-head"><span class="market-stock-name">${escapeHtml(item.name)}</span><span class="code">${escapeHtml(item.code)}</span><span class="market-signal ${badgeClass(item.signal)}">${escapeHtml(item.signal || '待突破')}</span>${momentumBadge}<span class="market-signal ${badgeClass(item.newsLabel)}">${escapeHtml(item.newsLabel || '消息中性')}</span><span class="market-signal b-blue">${escapeHtml(item.holdingPeriod || '周期待确认')}</span><span class="market-current-price">${yuan(item.price)}</span><span class="market-current-change ${changeClass}">${formatPct(item.changePct)}</span></b>
+  const intradayBadge = item.intradayStructure?.state === 'retest-confirmed'
+    ? `<span class="market-signal ${item.intradayPlanState?.currentPermission === 'allowed' ? 'b-blue' : 'b-yellow'}">${item.intradayPlanState?.currentPermission === 'allowed' ? '60分影子触发' : '60分回踩待确认'}</span>` : '';
+  const themeEvidence = (item.themeRegimes || []).slice(0,2).map(row => `${row.name}：${row.state}`).join('；');
+  const content = `<span class="market-stock-content"><b class="market-stock-head"><span class="market-stock-name">${escapeHtml(item.name)}</span><span class="code">${escapeHtml(item.code)}</span><span class="market-signal ${badgeClass(item.signal)}">${escapeHtml(item.signal || '待突破')}</span>${momentumBadge}${intradayBadge}<span class="market-signal ${badgeClass(item.newsLabel)}">${escapeHtml(item.newsLabel || '消息中性')}</span><span class="market-signal b-blue">${escapeHtml(item.holdingPeriod || '周期待确认')}</span><span class="market-current-price">${yuan(item.price)}</span><span class="market-current-change ${changeClass}">${formatPct(item.changePct)}</span></b>
     <span>${escapeHtml(sectorLabel)} · ${escapeHtml(verdictLabel || '等待确认')} · ${scoreLabel} ${escapeHtml(unifiedScore)} · ${escapeHtml(confidence)} · ${escapeHtml(recommendationCanslimText(item))} · ${escapeHtml(recommendationFactorText(item))} · MA30 ${yuan(item.ma30)} · 突破价 ${yuan(item.breakoutPrice)}</span>
+    ${themeEvidence ? `<small>题材双轨影子观察：${escapeHtml(themeEvidence)}；不改变当前入场许可</small>` : ''}
     ${item.executionTiming?.summary ? `<small>${escapeHtml(item.executionTiming.summary)}</small>` : ''}
     <small>${escapeHtml(item.reason || '')}</small></span>`;
   if(selectable) return `<label class="market-recommendation market-stock-choice" data-market-industry="${escapeHtml(industry)}"><input type="checkbox" data-market-stock-choice="${escapeHtml(item.code)}" checked />${content}</label>`;
@@ -373,7 +403,7 @@ function renderMarketOverview(result){
   $('marketDown').textContent = result.breadth?.down ?? '--';
   $('marketFlat').textContent = result.breadth?.flat ?? '--';
   $('marketTurnover').textContent = money(result.turnover);
-  const rotationDetail = item => [item.rotationPhase ? `${item.rotationPhase.phase}（可信度${item.rotationPhase.confidence}）` : item.rotationState, item.rotationIntraday?.retreating ? item.rotationIntraday.state : '', item.rotationTransition?.available || !item.capitalTrend?.available ? item.rotationTransition?.state : '', item.capitalStale ? '资金缓存待核验' : '', item.participation?.summary || (item.upRatio != null && Number.isFinite(Number(item.upRatio)) ? `上涨${(Number(item.upRatio) * 100).toFixed(0)}%` : ''), item.capitalEstimated === false && !item.capitalStale && item.mainNetPct != null && Number.isFinite(Number(item.mainNetPct)) ? `净占比${Number(item.mainNetPct) >= 0 ? '+' : ''}${Number(item.mainNetPct).toFixed(2)}%` : '', item.capitalTrend?.available ? `5日净额${money(item.mainNet5)} / 10日净额${money(item.mainNet10)}` : '', item.capitalTradeDate ? `资金截至${item.capitalTradeDate}` : '', item.capitalRank && !item.capitalStale ? `资金第${item.capitalRank}` : '', item.leader ? `领涨 ${item.leader}` : ''].filter(Boolean).join(' · ');
+  const rotationDetail = item => [item.rotationPhase ? `${item.rotationPhase.phase}（可信度${item.rotationPhase.confidence}）` : item.rotationState, item.themeRegime?.state ? `双轨影子：${item.themeRegime.state}（${item.themeRegime.capital?.direction || '资金待核验'}）` : '',item.shadowRotation?.phase ? `影子阶段 ${item.shadowRotation.phase}` : '',item.ma20AboveRatio != null ? `MA20上方${(item.ma20AboveRatio*100).toFixed(0)}% / MA30上方${(item.ma30AboveRatio*100).toFixed(0)}%，结构覆盖${(item.structureCoverage*100).toFixed(0)}%` : '成员均线待核验',item.exTop3UpRatio != null ? `去前三上涨${(item.exTop3UpRatio*100).toFixed(0)}%` : '', item.rotationIntraday?.retreating ? item.rotationIntraday.state : '', item.rotationTransition?.available || !item.capitalTrend?.available ? item.rotationTransition?.state : '', item.capitalStale ? '资金缓存待核验' : '', item.participation?.summary || (item.upRatio != null && Number.isFinite(Number(item.upRatio)) ? `上涨${(Number(item.upRatio) * 100).toFixed(0)}%` : ''), item.capitalEstimated === false && !item.capitalStale && item.mainNetPct != null && Number.isFinite(Number(item.mainNetPct)) ? `净占比${Number(item.mainNetPct) >= 0 ? '+' : ''}${Number(item.mainNetPct).toFixed(2)}%` : '', item.capitalTrend?.available ? `5日净额${money(item.mainNet5)} / 10日净额${money(item.mainNet10)}` : '', item.capitalTradeDate ? `资金截至${item.capitalTradeDate}` : '', item.capitalRank && !item.capitalStale ? `资金第${item.capitalRank}` : '', item.leader ? `领涨 ${item.leader}` : ''].filter(Boolean).join(' · ');
   const strong = (result.sectors || []).slice(0, 4).map(item => marketRow(item, formatPct(item.changePct), rotationDetail(item))).join('');
   const weak = (result.weakSectors || []).slice(0, 2).map(item => marketRow(item, formatPct(item.changePct), rotationDetail(item) || '回落')).join('');
   $('marketSectors').innerHTML = strong + weak || '<div class="market-row"><span>板块轮动暂不可用</span></div>';
@@ -632,7 +662,8 @@ function renderFullMarketResearchStatus(status = {}){
   const progress = $('fullMarketResearchProgress');
   if(progress){ progress.max = Math.max(1, total); progress.value = Math.min(completed, Math.max(1, total)); }
   const labels = {idle:'未启动',starting:'正在启动',running:'运行中',cancelled:'已取消',completed:'已完成',failed:'失败'};
-  const detail = status.message || labels[status.state] || '状态待确认';
+  const error = status.state === 'failed' ? String(status.error || '').split('\n')[0].slice(0,160) : '';
+  const detail = `${status.message || labels[status.state] || '状态待确认'}${error ? `：${error}` : ''}`;
   $('fullMarketResearchStatus').textContent = `${detail}${total ? ` · ${completed}/${total}` : ''}${status.historyCovered != null ? ` · 历史有效 ${status.historyCovered}` : ''}${status.failures ? ` · 缺失 ${status.failures}` : ''}`;
   $('cancelFullMarketResearch').disabled = !['starting','running'].includes(status.state);
   $('startFullMarketResearch').textContent = ['cancelled','failed'].includes(status.state) ? '恢复任务'
@@ -690,7 +721,8 @@ async function hydrateUserState(){
     const result = await window.stockApi?.loadUserState?.();
     if(!result?.value){
       if(labels.length || portfolio.length || simulatedTrades.length){
-        await window.stockApi?.saveUserState?.({schemaVersion:2, labels, activeLabel, labelSorts, portfolio, simulatedTrades});
+        await window.stockApi?.saveUserState?.({schemaVersion:2, labels, removedFavoriteEvents,
+          activeLabel, labelSorts, portfolio, simulatedTrades});
       }
       return false;
     }
@@ -1469,34 +1501,69 @@ function renderDailyReportView(){
   const sectors = (report.sectors || []).slice(0, 12);
   const news = report.news || [];
   const review = report.publishedOutcomes || {};
+  const hasEpisodeDetails = Boolean(review.episodeChunks?.length);
+  const episodeRows = (reportEpisodePage?.rows || []).map(row => `<tr><td>${escapeHtml(row.episodeId || '')}</td><td>${escapeHtml(row.code || '')}</td><td>${escapeHtml(row.tradeDate || '')}</td><td>${escapeHtml((row.tracks || []).join('/'))}</td><td>${escapeHtml(row.execution?.status || '待核验')}</td></tr>`).join('');
+  const episodePageHtml = hasEpisodeDetails ? `<div class="report-episode-page"><div class="report-section-head"><h4>冻结评价明细 ${review.counts?.episodes || 0} 条</h4><div class="report-tabs"><button data-report-episode-page="${Math.max(0,(reportEpisodePage?.page || 0)-1)}" ${!reportEpisodePage?.page || reportEpisodeLoading ? 'disabled' : ''}>上一页</button><span>${reportEpisodePage ? `第${reportEpisodePage.page + 1}页` : '按需读取'}</span><button data-report-episode-page="${reportEpisodePage ? reportEpisodePage.page + 1 : 0}" ${reportEpisodePage && !reportEpisodePage.hasMore || reportEpisodeLoading ? 'disabled' : ''}>${reportEpisodeLoading ? '读取中' : '查看更多'}</button></div></div>${reportEpisodePage ? `<div class="table-wrap report-table-wrap"><table class="report-table"><thead><tr><th>事件</th><th>代码</th><th>交易日</th><th>轨道</th><th>模型成交状态</th></tr></thead><tbody>${episodeRows}</tbody></table></div>` : ''}</div>` : '';
   const reviewRows = (review.horizons || []).map(horizon => {
-    const values = (review.episodes || []).map(item => item.observations?.[horizon])
-      .filter(item => item?.status === 'observed').map(item => item.returnPct);
-    const average = values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : null;
-    return `<tr><td>${horizon}日</td><td>${values.length}</td><td class="${pctClass(average)}">${reportPct(average)}</td></tr>`;
+    const cells = ['observations','triggerObservations','nextOpenProxyObservations','executionObservations'].map(field=>{
+      const saved = review.horizonSummaries?.[horizon]?.[field];
+      if(saved) return `<td>${saved.count}</td><td class="${pctClass(saved.meanReturnPct)}">${reportPct(saved.meanReturnPct)}</td>`;
+      const values = (review.episodes || []).filter(item=>field !== 'executionObservations' || item.execution?.verified === true)
+        .map(item=>field === 'nextOpenProxyObservations' ? item.nextOpenProxy?.observations?.[horizon] : item[field]?.[horizon]).filter(item=>item?.status === 'observed')
+        .map(item=>field === 'executionObservations' ? item.netReturnPct : item.returnPct)
+        .filter(value=>typeof value === 'number' && Number.isFinite(value));
+      const average = values.length ? values.reduce((sum,value)=>sum+value,0)/values.length : null;
+      return `<td>${values.length}</td><td class="${pctClass(average)}">${reportPct(average)}</td>`;
+    }).join('');
+    return `<tr><td>${horizon}日</td>${cells}</tr>`;
+  }).join('');
+  const detail = value=>escapeHtml(value === null || value === undefined || value === '' ? '待核验'
+    : typeof value === 'object' ? JSON.stringify(value) : value);
+  const path = report.market?.path;
+  const anchors = Array.isArray(path) ? path : Object.entries(path?.anchors || {}).map(([label,row])=>({...row,label}));
+  const pathRows = anchors.map(row=>`<tr><td>${detail(row.label)}</td><td>${detail(row.quoteObservedAt || row.fetchedAt)}</td><td>${detail(row.marketRegime?.label || row.state)}</td><td>${detail(row.breadth)}</td><td>${reportMoney(row.turnover)}</td><td>${detail(row.limits)}</td></tr>`).join('');
+  const favoriteRows = (report.favorites?.rows || []).map(row=>`<tr><td>${detail(row.label)}</td><td>${detail(row.code)}</td><td>${detail(row.name)}</td><td>${detail(row.addedAt)}</td><td>${reportPrice(row.referencePrice)}</td><td>${reportPrice(row.currentPrice)}</td><td class="${pctClass(row.returnPct)}">${reportPct(row.returnPct)}</td><td>${detail(row.attribution)}</td><td>${detail(row.originalPlanStatus)}</td></tr>`).join('');
+  const legacyAccount = report.portfolio?.legacy || {};
+  const researchReport = report.portfolio?.research;
+  const accountHtml = `<div class="report-account-grid"><div><h4>历史手工模拟</h4><p>${legacyAccount.positions?.length || 0} 只持仓，${legacyAccount.missingCodes?.length || 0} 只缺最终收盘价；已核验持仓浮盈亏 <b class="${pctClass(legacyAccount.coveredUnrealizedPnl)}">${legacyAccount.coveredUnrealizedPnl == null ? '--' : money(legacyAccount.coveredUnrealizedPnl)}</b>。初始现金/费用未记录，不计算账户净值。</p></div><div><h4>规则模拟</h4><p>${researchReport ? `估值${researchReport.valuationStatus === 'complete' ? '完整' : '部分缺失'}；现金 ${money(researchReport.cash)}，权益 ${researchReport.equity == null ? '--' : money(researchReport.equity)}，已实现 ${money(researchReport.realizedPnl)}，未实现 ${researchReport.unrealizedPnl == null ? '--' : money(researchReport.unrealizedPnl)}，费用 ${money(researchReport.feesPaid)}，当日损益 ${researchReport.dayPnl == null ? '--' : money(researchReport.dayPnl)}，最大回撤 ${researchReport.maxDrawdownPct == null ? '--' : reportPct(researchReport.maxDrawdownPct)}` : '尚未创建规则模拟账户'}</p></div></div>`;
+  const conditionRows = (report.nextDayConditions || []).map(row=>`<tr><td>${detail(row.code)}</td><td>${detail(row.planId)}</td><td>${detail(row.entryPermission)}</td><td>${detail(row.trigger)}</td><td>${detail(row.invalidation)}</td><td>${detail(row.expiresAt)}</td><td>${reportPrice(row.maxEntryPrice)}</td></tr>`).join('');
+  const shadowRows = (review.shadowReplay?.variants || []).map(row=>`<tr><td>${detail(row.id)}</td><td>${row.coverage?.executed || 0}</td><td>${row.coverage?.missing || 0}</td><td>${row.coverage?.unexecuted || 0}</td><td class="${pctClass(row.netReturnPct)}">${reportPct(row.netReturnPct)}</td><td>${detail(row.validation)}</td></tr>`).join('');
+  const themeReplayActive = (review.shadowReplay?.variants || []).some(row=>row.id === 'themeBaseline');
+  const themeShadowRows = ['H5','H6','H7'].map(id => {
+    const decisions = (report.strategyExperiments?.decisions || []).filter(row => row.id === id);
+    return `<tr><td>${id}</td><td>${decisions.filter(row => row.status === 'pass').length}</td><td>${decisions.filter(row => row.status === 'fail').length}</td><td>${decisions.filter(row => row.status === 'unknown').length}</td></tr>`;
   }).join('');
   const forward = review.forwardValidation;
   const forwardHtml = forward ? `<p>前瞻验证：冻结后 ${forward.tradingDays}/${forward.requiredTradingDays} 个交易日；A ${forward.routes?.A?.mature || 0}/30，B ${forward.routes?.B?.mature || 0}/30 个成熟可成交episode。${escapeHtml(forward.reason)}；不会自动调权。</p>` : '';
   const performance = report.recommendations?.performance || {};
   const checkpointHtml = (report.checkpoints || []).map(item => `<li><b>${escapeHtml(item.label)}</b>：${item.status === 'covered' ? '已覆盖' : item.status === 'stale' ? '最近快照过期' : '缺失'}${item.publishedAt ? ` · ${escapeHtml(item.publishedAt)}` : ''}${item.reason ? ` · ${escapeHtml(item.reason)}` : ''}</li>`).join('') || '<li>没有检查点记录</li>';
   const performanceHtml = `<div class="report-performance"><p><b>全天首次发布观察：</b>${performance.published?.count || 0}只，平均 <span class="${pctClass(performance.published?.averageReturnPct)}">${reportPct(performance.published?.averageReturnPct)}</span>，中位数 <span class="${pctClass(performance.published?.medianReturnPct)}">${reportPct(performance.published?.medianReturnPct)}</span>；<b>真实触发：</b>${performance.triggered?.count || 0}只。观察表现不等于账户收益。</p><ul>${checkpointHtml}</ul></div>`;
-  return `<div class="report-view">
+  const termRows = (report.termDefinitions || []).map(row => `<tr><td>${escapeHtml(row.id)}</td><td>${escapeHtml(row.name)}</td><td>${escapeHtml(row.status)}</td><td>${escapeHtml(row.version)}</td><td>${escapeHtml(row.definition)}</td><td>${escapeHtml(row.limit)}</td></tr>`).join('');
+  return `<div class="report-view" data-active-page="${reportPage}">
     <div class="report-head"><div><h2>${escapeHtml(report.tradeDate)} 全局收盘报告</h2><p>修订 r${String(report.revision || 0).padStart(3,'0')} · ${report.status === 'complete' ? '数据完整' : report.status === 'preview' ? '盘中预览' : '部分数据缺失'} · ${escapeHtml(report.generatedAt || '')}</p></div>
       <div class="report-actions"><select id="reportDateSelect">${options}</select><input id="reportDate" type="date" value="${escapeHtml(report.tradeDate)}" /><button id="generateReport" class="primary" ${reportLoading ? 'disabled' : ''}>${reportLoading ? '生成中' : '重新生成'}</button><button id="openReportBrowser">浏览器打开</button></div>
     </div>
+    <nav class="report-page-tabs" aria-label="报告页面"><button data-report-page="review" class="${reportPage === 'review' ? 'active' : ''}">每日复盘</button><button data-report-page="plan" class="${reportPage === 'plan' ? 'active' : ''}">次日预案</button><button data-report-page="terms" class="${reportPage === 'terms' ? 'active' : ''}">术语与规则</button></nav>
     <div class="report-summary">${escapeHtml(report.summary || '')}</div>
     <div class="report-stat-grid"><div><span>上涨</span><b class="up">${breadth.up ?? '--'}</b></div><div><span>下跌</span><b class="down">${breadth.down ?? '--'}</b></div><div><span>平盘</span><b>${breadth.flat ?? '--'}</b></div><div><span>成交额</span><b>${reportMoney(report.market?.turnover)}</b></div><div><span>方案A</span><b>${report.recommendations?.stable?.length || 0}</b></div><div><span>方案B</span><b>${report.recommendations?.momentum?.length || 0}</b></div><div><span>A/B重叠</span><b>${report.recommendations?.overlapCount || 0}</b></div><div><span>收藏样本</span><b>${report.favorites?.count || 0}</b></div></div>
     <section class="report-section"><div class="report-section-head"><h3>推荐复盘</h3><div class="report-tabs"><button data-report-track="all" class="${reportRecommendationTrack === 'all' ? 'active' : ''}">全部</button><button data-report-track="stable" class="${reportRecommendationTrack === 'stable' ? 'active' : ''}">方案A</button><button data-report-track="momentum" class="${reportRecommendationTrack === 'momentum' ? 'active' : ''}">方案B</button><button data-report-track="best" class="${reportRecommendationTrack === 'best' ? 'active' : ''}">最佳10</button><button data-report-track="worst" class="${reportRecommendationTrack === 'worst' ? 'active' : ''}">最差10</button></div></div>${performanceHtml}<div class="table-wrap report-table-wrap"><table class="report-table"><thead><tr><th>代码</th><th>名称</th><th>板块</th><th>方案</th><th>角色</th><th>周期</th><th>信号时点</th><th>最早可买</th><th>最早可卖</th><th>推荐时价格</th><th>当时涨幅</th><th>当日收盘</th><th>收盘涨幅</th><th>推荐后表现</th><th>数据</th></tr></thead><tbody>${reportRecommendationRows(report)}</tbody></table></div></section>
-    <section class="report-section"><h3>已发布推荐评价</h3><p>发布批次 ${review.counts?.publishedBatches || 0}，快照记录 ${review.counts?.publishedSignals || 0} 条，合并后 ${review.counts?.episodes || 0} 个观察episode；可观察 ${review.counts?.observations?.observed || 0}，未到期 ${review.counts?.observations?.immature || 0}，到期缺行情 ${review.counts?.observations?.missing || 0}；次日开盘可成交代理 ${review.counts?.execution?.executable || 0}，未成交 ${review.counts?.execution?.unfilled || 0}，证据不足 ${review.counts?.execution?.unverified || 0}。参考涨幅不等于账户净收益。</p>${forwardHtml}<div class="table-wrap report-table-wrap"><table class="report-table"><thead><tr><th>窗口</th><th>可观察</th><th>平均参考涨幅</th></tr></thead><tbody>${reviewRows || '<tr><td colspan="3">尚无成熟样本</td></tr>'}</tbody></table></div><p class="report-note">${escapeHtml(review.reason || `本地历史及已存报告收盘最新 ${review.historyLatestDate || '待核验'}；复权与公司行为仍需核验`)}</p></section>
+    <section class="report-section"><h3>已发布推荐评价</h3><p>发布批次 ${review.counts?.publishedBatches || 0}，快照记录 ${review.counts?.publishedSignals || 0} 条，合并后 ${review.counts?.episodes || 0} 个观察episode；可观察 ${review.counts?.observations?.observed || 0}，未到期 ${review.counts?.observations?.immature || 0}，到期缺行情 ${review.counts?.observations?.missing || 0}；核验成交 ${review.counts?.execution?.executable || 0}，未成交 ${review.counts?.execution?.unfilled || 0}，证据不足 ${review.counts?.execution?.unverified || 0}。观察、触发与成交分别起算；开盘代理不是正式策略收益，缺失不填0。</p>${forwardHtml}<div class="table-wrap report-table-wrap"><table class="report-table"><thead><tr><th>窗口</th><th>发布样本</th><th>发布观察</th><th>触发样本</th><th>触发观察</th><th>开盘代理样本</th><th>代理观察</th><th>成交样本</th><th>扣费收益</th></tr></thead><tbody>${reviewRows || '<tr><td colspan="9">尚无成熟样本</td></tr>'}</tbody></table></div>${episodePageHtml}<p class="report-note">${escapeHtml(review.reason || `本地历史及已存报告收盘最新 ${review.historyLatestDate || '待核验'}；复权与公司行为仍需核验`)}</p></section>
+    <section class="report-section"><h3>大盘状态路径</h3><div class="table-wrap report-table-wrap"><table class="report-table"><thead><tr><th>锚点</th><th>报价时点</th><th>状态</th><th>广度</th><th>成交额</th><th>涨跌停</th></tr></thead><tbody>${pathRows || '<tr><td colspan="6">盘中路径缺失，不用收盘数据补造。</td></tr>'}</tbody></table></div><p>${detail(report.market?.regime?.shadowPath)}</p></section>
+    <section class="report-section report-plan-page"><h3>次日条件清单</h3><p>盘后条件不代表次日已触发；冻结价格及期限，T+1限制继续适用。</p><div class="table-wrap report-table-wrap"><table class="report-table"><thead><tr><th>代码</th><th>计划</th><th>许可</th><th>触发</th><th>失效</th><th>期限</th><th>最高入场价</th></tr></thead><tbody>${conditionRows || '<tr><td colspan="7">无冻结计划</td></tr>'}</tbody></table></div></section>
+    <section class="report-section"><h3>同资金影子回放</h3><p>H1–H4 对照原基线；${themeReplayActive ? 'H5–H7 对照冻结日后同资金题材基线。' : 'H5–H7 尚未到前瞻回放起点。'}保守次日开盘模拟，不等于实际成交；证据与成熟样本不足时不自动升级策略。</p><div class="table-wrap report-table-wrap"><table class="report-table"><thead><tr><th>方案</th><th>模拟入场</th><th>未知</th><th>未成交</th><th>扣费净值收益</th><th>分路线验证</th></tr></thead><tbody>${shadowRows || '<tr><td colspan="6">尚未积累有效前瞻数据</td></tr>'}</tbody></table></div>${report.strategyExperiments?.themeManifest ? `<h4>H5–H7 前瞻证据采集</h4><p>冻结版本 ${escapeHtml(report.strategyExperiments.themeManifest.version)}，最早观察 ${escapeHtml(report.strategyExperiments.themeManifest.firstTradeDate)}。${themeReplayActive ? '影子回放已接入，未成熟或证据未知不计成交。' : '当前仅记录通过、拒绝与未知，尚未到回放起点。'}</p><div class="table-wrap report-table-wrap"><table class="report-table"><thead><tr><th>实验</th><th>通过</th><th>拒绝</th><th>未知</th></tr></thead><tbody>${themeShadowRows}</tbody></table></div>` : ''}</section>
     <section class="report-section"><h3>历史推荐跟踪</h3><p>原推荐日期见信号时点；表现为从原参考价至本日收盘的观察涨幅，不等于成交收益。</p><div class="table-wrap report-table-wrap"><table class="report-table"><thead><tr><th>代码</th><th>名称</th><th>板块</th><th>方案</th><th>角色</th><th>周期</th><th>原信号日期</th><th>最早可买</th><th>最早可卖</th><th>原参考价</th><th>原当时涨幅</th><th>本日收盘</th><th>本日涨幅</th><th>累计观察</th><th>数据</th></tr></thead><tbody>${reportRecommendationRows(report,report.recommendations?.followUp || [])}</tbody></table></div></section>
-    <section class="report-section"><h3>板块轮动</h3>${sectors.length ? `<div class="report-sector-list">${sectors.map(item => `<div><b>${escapeHtml(item.name || '')}</b><span class="${pctClass(item.changePct)}">${reportPct(item.changePct)}</span><small>${escapeHtml(item.rotationPhase?.phase || item.rotationState || item.capitalTrend?.phase || '阶段待确认')} · 主力净额 ${reportMoney(item.mainNetInflow)}</small></div>`).join('')}</div>` : '<div class="report-note">板块历史快照缺失，未使用当前板块数据回填。</div>'}</section>
-    <section class="report-section"><h3>收藏与账户</h3><p>排除重点关注和personal后 ${report.favorites?.count || 0} 条，有效 ${report.favorites?.validCount || 0} 条，等权平均 <b class="${pctClass(report.favorites?.averageReturnPct)}">${reportPct(report.favorites?.averageReturnPct)}</b>。收藏表现不是实际成交收益。</p><p>报告内持仓 ${report.portfolio?.positions?.length || 0} 只。${escapeHtml(report.portfolio?.unavailableReason || '模拟账户按实际记录展示。')}</p></section>
+    <section class="report-section"><h3>板块轮动</h3>${sectors.length ? `<div class="report-sector-list">${sectors.map(item => `<div><b>${escapeHtml(item.name || '')}</b><span class="${pctClass(item.changePct)}">${reportPct(item.changePct)}</span><small>${escapeHtml(item.themeRegime?.state ? `双轨影子：${item.themeRegime.state}（${item.themeRegime.capital?.direction || '资金待核验'}）` : item.rotationPhase?.phase || item.rotationState || item.capitalTrend?.phase || '阶段待确认')} · 主力净额 ${reportMoney(item.mainNetInflow)}</small></div>`).join('')}</div>` : '<div class="report-note">板块历史快照缺失，未使用当前板块数据回填。</div>'}</section>
+    <section class="report-section"><h3>收藏与账户</h3><p>全部收藏 ${report.favorites?.count || 0} 条，代码去重 ${report.favorites?.codeCount || 0} 只，有效 ${report.favorites?.validCount || 0} 条，代码等权平均 <b class="${pctClass(report.favorites?.averageReturnPct)}">${reportPct(report.favorites?.averageReturnPct)}</b>。多标签不重复增加敞口；当前收藏存在幸存者偏差，收藏表现不是实际成交收益。原始计划缺失 ${report.favorites?.missingOriginalCount || 0} 条；已移除事件 ${report.favoriteHistory?.removedCount || 0} 条。</p><div class="table-wrap report-table-wrap"><table class="report-table"><thead><tr><th>标签</th><th>代码</th><th>名称</th><th>加入时点</th><th>参考价</th><th>观察价</th><th>观察涨幅</th><th>归因</th><th>原计划</th></tr></thead><tbody>${favoriteRows || '<tr><td colspan="9">无收藏观察</td></tr>'}</tbody></table></div>${accountHtml}<p>${escapeHtml(report.portfolio?.unavailableReason || '')}</p></section>
     <section class="report-section"><h3>消息与异常</h3>${news.length ? `<div class="report-news">${news.map(item => `<button data-report-news-link="${escapeHtml(item.url || '')}"><b>${escapeHtml(item.title || '')}</b><span>${escapeHtml(item.publishedAt || '时间待核验')} · ${escapeHtml(item.source || '来源待核验')}</span></button>`).join('')}</div>` : '<div class="report-note">没有可核验的冻结消息。</div>'}<ul class="report-warnings">${warnings.length ? warnings.map(item => `<li>${escapeHtml(item)}</li>`).join('') : '<li>无异常</li>'}</ul></section>
+    <section class="report-section report-terms-page"><h3>术语与规则</h3><div class="table-wrap report-table-wrap"><table class="report-table"><thead><tr><th>命名空间</th><th>术语</th><th>状态</th><th>版本</th><th>定义</th><th>限制</th></tr></thead><tbody>${termRows || '<tr><td colspan="6">旧版报告未保存术语字典</td></tr>'}</tbody></table></div></section>
   </div>`;
 }
 
 async function loadDailyReport(date, revision = null){
   if(!window.stockApi?.getDailyReport) return;
+  reportEpisodeRequestId++;
+  reportEpisodePage = null;
+  reportEpisodeLoading = false;
   reportLoading = true;
   renderStocks();
   try{
@@ -1511,6 +1578,9 @@ async function loadDailyReport(date, revision = null){
 }
 
 async function openDailyReports(){
+  reportEpisodeRequestId++;
+  reportEpisodePage = null;
+  reportEpisodeLoading = false;
   cancelPendingSearch();
   currentViewSource = 'report';
   activeDetailCode = null;
@@ -1538,6 +1608,9 @@ async function openDailyReports(){
 async function generateReportFromView(){
   const date = $('reportDate')?.value || reportDateToday();
   if(!date || !window.stockApi?.generateDailyReport) return;
+  reportEpisodeRequestId++;
+  reportEpisodePage = null;
+  reportEpisodeLoading = false;
   reportLoading = true;
   renderStocks();
   try{
@@ -1554,6 +1627,26 @@ async function generateReportFromView(){
 }
 
 function bindDailyReportInteractions(){
+  document.querySelectorAll('[data-report-episode-page]').forEach(button => button.onclick = async () => {
+    const report = activeDailyReport?.report || activeDailyReport;
+    if(!report || reportEpisodeLoading) return;
+    const requestId = ++reportEpisodeRequestId;
+    reportEpisodeLoading = true;
+    renderStocks();
+    try{
+      const page = await window.stockApi.getDailyReportEpisodePage({date:report.tradeDate,
+        revision:report.revision,page:Number(button.dataset.reportEpisodePage)});
+      if(requestId === reportEpisodeRequestId) {
+        reportEpisodePage = page;
+        if(!page) notify('报告明细不可用', 'warn');
+      }
+    }catch(error){if(requestId === reportEpisodeRequestId) notify(`读取报告明细失败：${error.message || error}`, 'error');}
+    finally{if(requestId === reportEpisodeRequestId){reportEpisodeLoading = false;renderStocks();}}
+  });
+  document.querySelectorAll('[data-report-page]').forEach(button => button.onclick = () => {
+    reportPage = button.dataset.reportPage;
+    renderStocks();
+  });
   $('reportDateSelect')?.addEventListener('change', event => void loadDailyReport(event.target.value));
   $('generateReport')?.addEventListener('click', () => void generateReportFromView());
   $('openReportBrowser')?.addEventListener('click', async () => {
@@ -1787,6 +1880,8 @@ function renderLabels(){
       }, 3000);
       return;
     }
+    const removedLabel = labels.find(l => l.name === name);
+    if(removedLabel) recordRemovedFavorite(removedLabel,removedLabel.stocks || []);
     labels = labels.filter(l => l.name !== name);
     delete labelSorts[name];
     activeLabel = labels[0]?.name || '';
@@ -1842,6 +1937,7 @@ function removeContextLabelStock(){
   const label = labels.find(item => item.name === activeLabel);
   const stock = label?.stocks.find(item => item.code === code);
   if(!stock) return closeLabelStockMenu();
+  recordRemovedFavorite(label,[stock]);
   label.stocks = label.stocks.filter(item => item.code !== code);
   selected.delete(code);
   saveState({successMessage:`已从标签「${label.name}」删除 ${stock.name}`});
@@ -2123,6 +2219,7 @@ function renderHistoryAnalysis(s, result){
     ? `<p><b>大盘推荐快照：</b>${escapeHtml(s.signal || s.marketSignal || '待确认')}，推荐评分 ${escapeHtml(Math.round(Number(s.signalScore)))} / 100，推荐时判断 ${escapeHtml(s.verdict || '等待确认')}。该评分保留用于推荐列表排序，不替代本次个股技术评分。</p>`
     : '';
   const marketContext = stockMarketContext(s);
+  const themeRegimeHtml = s.themeRegimes?.length ? `<p><b>题材双轨（影子观察）：</b>${s.themeRegimes.map(row => `${escapeHtml(row.name)}：${escapeHtml(row.state)}，资金${escapeHtml(row.capital?.direction || '待核验')}`).join('；')}。不改变下方冻结计划与当前许可。</p>` : '';
   const corporateRisk = result?.riskProfile;
   const reductionText = corporateRisk?.reduction?.status === 'risk'
     ? corporateRisk.reduction.events.map(event => `${event.startDate}至${event.endDate}${event.estimated ? '（估算）' : ''}`).join('、')
@@ -2132,7 +2229,11 @@ function renderHistoryAnalysis(s, result){
     : corporateRisk?.unlock?.status === 'clear' ? '未发现安排' : '未确认';
   const corporateRiskHtml = corporateRisk ? `<p class="corporate-risk"><b>未来半年公司风险：</b>${escapeHtml(corporateRisk.summary || '未确认')}；ST：${escapeHtml(corporateRisk.st?.status === 'risk' ? '有当前标记' : '无当前标记')}；减持：${escapeHtml(reductionText)}；解禁：${escapeHtml(unlockText)}。<br><b>核验窗口：</b>${escapeHtml(corporateRisk.windowStart || '--')} 至 ${escapeHtml(corporateRisk.windowEnd || '--')}；<b>数据源：</b>${escapeHtml(corporateRisk.source || '公开公司公告与限售解禁数据')}</p>`
     : '<p class="corporate-risk"><b>未来半年公司风险：</b>未确认。</p>';
-  const plan = a.tradePlan;
+  const activePlan = a.activePlan || s.planState;
+  const intradayPlan = a.intradayPlan || s.intradayPlanState;
+  const intradayStructure = a.intradayStructure || s.intradayStructure;
+  const intradayHtml = intradayStructure || intradayPlan ? `<p><b>60分钟结构回踩（影子研究）：</b>${escapeHtml({watch:'箱体观察',departed:'离开箱体', 'retest-confirmed':'回踩已确认',invalid:'结构失效',expired:'结构过期',unknown:'数据待核验'}[intradayStructure?.state] || '本轮数据待核验')}；箱体 ${yuan(intradayStructure?.boxLower ?? intradayPlan?.tradePlan?.boxLower)}-${yuan(intradayStructure?.boxUpper ?? intradayPlan?.tradePlan?.boxUpper)}，确认价 ${yuan(intradayPlan?.tradePlan?.confirmationPrice || intradayStructure?.confirmationPrice)}，失效价 ${yuan(intradayPlan?.tradePlan?.invalidationPrice || intradayStructure?.invalidationPrice)}。${intradayPlan?.currentPermission === 'allowed' ? '5分钟触发已记录，仍须核验最新报价、风险与可成交条件。' : `当前不授予入场许可：${escapeHtml(intradayPlan?.reason || '缺少完整结构或后续5分钟触发证据')}`} ${intradayPlan?.earliestSellDate ? `若本日实际买入，最早可卖日 ${escapeHtml(intradayPlan.earliestSellDate)}。` : ''}</p>` : '';
+  const plan = activePlan?.tradePlan || a.tradePlan;
   const breakout = a.breakoutPotential || a.consolidationBreakout;
   const entryAssessment = a.entryAssessment;
   const holdingProfile = a.holdingProfile || result?.investmentAnalysis?.holdingProfile || s.holdingProfile;
@@ -2147,16 +2248,17 @@ function renderHistoryAnalysis(s, result){
     : '<p><b>横盘突破评估：</b>历史行情不足，暂不能形成箱体判断。</p>';
   const tradePlanHtml = plan ? `<div class="trade-plan">
       <h4>条件化操作参考</h4>
-      <p><b>当前主路径：</b>${escapeHtml(plan.setupType || '待确认')}；预计成交价 ${yuan(plan.expectedEntryPrice)}；第一目标净盈亏比 ${Number.isFinite(Number(plan.rewardRisk)) ? formatNumber(plan.rewardRisk,2) : '--'}。${Number(plan.rewardRisk) >= 2 ? '达到研究观察门槛，仍需满足入场许可。' : '未达到2.0，不据此生成入场许可。'}</p>
-      <p><b>回踩低吸备选区间：</b>${yuan(plan.entryLow)}-${yuan(plan.entryHigh)}。${plan.enabled ? '价格真实进入区间并缩量企稳后，按回踩路径重新计算。' : '当前趋势条件不合格，暂不执行。'}</p>
+      ${activePlan ? `<p><b>冻结推荐计划：</b>${escapeHtml(activePlan.planId)} · r${escapeHtml(activePlan.revision)} · ${escapeHtml({watch:'观察',armed:'等待触发',allowed:'已记录触发',blocked:'风险排除',expired:'已过期',completed:'已完成'}[activePlan.state] || '待核验')}；${escapeHtml(activePlan.reason || '')}。${activePlan.currentPermission !== 'allowed' ? '当前条件未通过，不授予入场许可。' : '触发记录不等于已成交；首次回踩5分钟条件仍属影子验证。'}</p>` : ''}
+      <p><b>当前主路径：</b>${escapeHtml(plan.setupType || '待确认')}；预计成交价 ${yuan(plan.expectedEntryPrice)}；第一目标净盈亏比 ${plan.rewardRisk != null && Number.isFinite(Number(plan.rewardRisk)) ? formatNumber(plan.rewardRisk,2) : '待核验'}。${Number(plan.rewardRisk) >= 2 ? '达到研究观察门槛，仍需满足入场许可。' : '未达到2.0或目标未核验，不据此生成入场许可。'}</p>
+      <p><b>计划入场区间：</b>${yuan(plan.entryLow)}-${yuan(plan.entryHigh)}；最高入场价 ${yuan(plan.maxEntryPrice)}。越价放弃，不随刷新抬高目标；第一目标依据 ${escapeHtml(plan.targetEvidence?.reason || '待核验')}。</p>
       <p><b>分批建仓：</b>${(plan.entrySteps || []).map((step, index) => `第${index + 1}笔${step.buyPct}%：${escapeHtml(step.condition)}`).join('；')}</p>
-      <p><b>确认价：</b>${yuan(plan.confirmationPrice)}。未满足收盘与量比条件，不执行最后一笔。</p>
-      <p><b>研究观察期限：</b>最早买入 ${escapeHtml(plan.earliestBuyDate || '待核验')}，若该日成交最早 ${escapeHtml(plan.earliestSellDate || '待核验')} 可卖；未在 ${escapeHtml(plan.entryExpiryDate || '待核验')} 前触发则本计划失效。T+1期间触发风险也不能当日卖出。</p>
+      <p><b>确认价：</b>${yuan(plan.confirmationPrice)}。${activePlan?.confirmationTimeframe === '5-minute-completed' ? '完整5分钟K线越过冻结高点且守住支撑；首次回踩最早下一交易日确认，60分钟结构需在结构完成后确认。' : '突破采用收盘确认与同口径1.5-4倍量能；回踩按缩量承接路径独立核验。'}</p>
+      <p><b>研究观察期限：</b>最早买入 ${escapeHtml(activePlan?.earliestBuyDate || plan.earliestBuyDate || '待核验')}，若该日成交最早 ${escapeHtml(activePlan?.earliestSellDate || plan.earliestSellDate || '待核验')} 可卖；未在 ${escapeHtml(activePlan?.entryExpiryDate || plan.entryExpiryDate || '待核验')} 前触发则本计划失效。T+1期间触发风险也不能当日卖出。</p>
       <p><b>失效 / 压力退出：</b>结构失效 ${yuan(plan.invalidationPrice)}，隔夜与滑点压力退出 ${yuan(plan.stressExitPrice)}；估算双边成本和滑点 ${formatPct(plan.transactionCostPct)}。T+1期间不能假设触价即可卖出。</p>
       <p><b>分批止盈：</b>${(plan.targets || []).map((target, index) => `第${index + 1}档 ${yuan(target.price)} 卖出${target.sellPct}%`).join('；')}。</p>
       <p><b>移动保护：</b>${(plan.targetNotes || []).map(escapeHtml).join('；')}。</p>
       <p><b>仓位上限示例：</b>若账户单笔最大可承受损失限定为总资金1%，按当前止损距离反推，计划总仓位不超过${formatNumber(plan.maxPositionPct, 1)}%。</p>
-      <p><b>计算依据：</b>${escapeHtml(plan.rationale || '')}。价格均为动态参考，刷新行情后会重算。</p>
+      <p><b>计算依据：</b>${escapeHtml(plan.rationale || '')}。${activePlan ? '以上计划价格与期限保留原始冻结值，当前分析可变化，但不静默移动旧计划。' : '当前分析为动态参考，不代表已经建立或触发推荐计划。'}</p>
     </div>` : '';
   analysisBox.innerHTML = `<b>股票分析：</b>${escapeHtml(`${conclusion}${capital}${marketContext}`)}`;
   box.innerHTML = `<h3>综合实时行情、资金、趋势、消息与大盘分析</h3>
@@ -2189,8 +2291,10 @@ function renderHistoryAnalysis(s, result){
       <p><b>消息面：</b>${escapeHtml(a.newsImpact || result.newsContext?.summary || '未获取到有效消息')}</p>
       ${corporateRiskHtml}
       <p class="market-context"><b>大盘与消息联动：</b>${escapeHtml(marketContext)}</p>
+      ${themeRegimeHtml}
     </div>
     ${investmentAnalysisHtml(result)}
+    ${intradayHtml}
     ${tradePlanHtml}
     <p><b>预计观察窗口：</b>${escapeHtml(a.entryWindow)} <b>持仓观察：</b>${escapeHtml(a.exitWindow)}</p>
     <p><b>历史数据源：</b>${escapeHtml(a.source || result.source || '--')}；<b>最新交易日：</b>${escapeHtml(a.latestTradeDate || result.latestTradeDate || '--')}；<b>观察时点：</b>${escapeHtml(a.observationPhase?.label || result.observationPhase?.label || '待确认')}；<b>分析时间：</b>${a.analyzedAt ? escapeHtml(new Date(a.analyzedAt).toLocaleString('zh-CN', {hour12:false})) : '--'}</p>
@@ -2206,6 +2310,8 @@ function mergeFundFlow(code, result){
     mainNetPct: result.mainNetPct,
     fundFlowSource: result.source,
     fundFlowDate: result.tradeDate,
+    fundFlowObservedAt:result.observedAt || result.fetchedAt || '',
+    fundFlowStatus:result.stale || stock.tradeDate && result.tradeDate !== stock.tradeDate ? 'stale' : result.mainNetInflow == null ? 'missing' : 'observed',
     fundFlowEstimated: Boolean(result.estimated)
   } : stock;
   stocks = stocks.map(merge);
@@ -2225,7 +2331,7 @@ function renderFundFlow(s){
     if(node) node.textContent = metricValue(value, formatter);
   });
   const source = document.querySelector(`[data-fund-source-for="${s.code}"]`);
-  if(source) source.innerHTML = `<b>资金数据：</b>${escapeHtml(s.fundFlowSource || '接口未提供')}${s.fundFlowDate ? `；<b>交易日：</b>${escapeHtml(s.fundFlowDate)}` : ''}${s.fundFlowEstimated ? '；按公开逐笔成交方向及金额估算，不等同于 Level-2 机构账户数据。' : ''}`;
+  if(source) source.innerHTML = `<b>资金数据：</b>${escapeHtml(s.fundFlowSource || '接口未提供')}${s.fundFlowDate ? `；<b>交易日：</b>${escapeHtml(s.fundFlowDate)}` : ''}${s.fundFlowStatus === 'stale' || s.tradeDate && s.fundFlowDate && s.tradeDate !== s.fundFlowDate ? '；资金时点与当前行情不同，仅作历史参考，不参与当前确认。' : ''}${s.fundFlowEstimated ? '；按公开逐笔成交方向及金额估算，不等同于 Level-2 机构账户数据。' : ''}`;
 }
 
 async function loadStockFundFlow(s, force=false){
@@ -2265,6 +2371,7 @@ async function loadLatestDetailQuote(s){
       if(!result.quotes.length) throw new Error(result.errors.join('；') || '未获取到最新行情');
       applyQuoteData(result.quotes);
       const updated = findStockByCode(s.code);
+      renderFundFlow(updated);
       const values = {
         price: yuan(updated.price), changePct: formatPct(updated.changePct), change: formatNumber(updated.change),
         open: yuan(updated.open), high: yuan(updated.high), low: yuan(updated.low), prevClose: yuan(updated.prevClose),
@@ -2411,6 +2518,7 @@ function formatChartVolume(value){
 function chartLegendHtml(period){
   if(period === 'minute') return `<span><i class="legend-price"></i>价格</span><span><i class="legend-average"></i>成交均价</span><span><i class="legend-zero"></i>昨收 / 0%线</span><span><i class="legend-volume"></i>成交量</span>`;
   if(period === 'five-day') return `<span><i class="legend-price"></i>价格</span><span><i class="legend-volume"></i>成交量</span>`;
+  if(period === 'hour60') return `<span><i class="legend-up"></i>上涨60分钟K</span><span><i class="legend-down"></i>下跌60分钟K</span><span><i class="legend-volume"></i>成交量（股）</span><span><i class="legend-ma5"></i>MA5</span><span><i class="legend-ma10"></i>MA10</span><span><i class="legend-ma20"></i>MA20</span><span><i class="legend-box-upper"></i>箱体上沿</span><span><i class="legend-box-lower"></i>箱体下沿</span><span><i class="legend-confirm"></i>确认价</span><span><i class="legend-invalidate"></i>失效价</span><span>灰色K线尚未完成</span>`;
   return `<span><i class="legend-up"></i>上涨K线</span><span><i class="legend-down"></i>下跌K线</span><span><i class="legend-volume"></i>成交量</span><span><i class="legend-ma5"></i>MA5 短线</span><span><i class="legend-ma10"></i>MA10 短中期</span><span><i class="legend-ma20"></i>MA20 月度趋势</span><span><i class="legend-ma30"></i>MA30 中期趋势</span><span><i class="legend-ma60"></i>MA60 中长期趋势</span>`;
 }
 
@@ -2444,6 +2552,10 @@ function renderStockChart(canvas, rows, period, selectedIndex=null, referencePri
   const plotWidth = width - margin.left - margin.right;
   const validReference = Number(referencePrice) > 0 ? Number(referencePrice) : null;
   const prices = rows.flatMap(row => [Number(row.low) || Number(row.close), Number(row.high) || Number(row.close)]);
+  const structure = period === 'hour60' ? canvas._stockChartState?.structure : null;
+  const structureLines = [['boxUpper','#2563eb'],['boxLower','#7c3aed'],['confirmationPrice','#d97706'],['invalidationPrice','#dc2626']]
+    .filter(([key]) => Number(structure?.[key]) > 0).map(([key,color]) => ({price:Number(structure[key]),color}));
+  prices.push(...structureLines.map(row => row.price));
   if(period === 'minute' && validReference) prices.push(validReference);
   let minPrice = Math.min(...prices);
   let maxPrice = Math.max(...prices);
@@ -2522,7 +2634,7 @@ function renderStockChart(canvas, rows, period, selectedIndex=null, referencePri
       const high = Number(row.high) || Math.max(open, close);
       const low = Number(row.low) || Math.min(open, close);
       const x = xAt(index);
-      const color = close >= open ? '#dc2626' : '#16a34a';
+      const color = row.isFinal === false && period === 'hour60' ? '#94a3b8' : close >= open ? '#dc2626' : '#16a34a';
       ctx.strokeStyle = color;
       ctx.fillStyle = color;
       ctx.beginPath(); ctx.moveTo(x, yAt(high)); ctx.lineTo(x, yAt(low)); ctx.stroke();
@@ -2550,8 +2662,19 @@ function renderStockChart(canvas, rows, period, selectedIndex=null, referencePri
     drawMa(5, '#2563eb');
     drawMa(10, '#d97706');
     drawMa(20, '#7c3aed');
-    drawMa(30, '#0891b2');
-    drawMa(60, '#475569');
+    if(period !== 'hour60') {
+      drawMa(30, '#0891b2');
+      drawMa(60, '#475569');
+    }
+  }
+  if(structureLines.length){
+    ctx.save();
+    ctx.setLineDash([4,4]);
+    structureLines.forEach(line => {
+      ctx.strokeStyle = line.color;
+      ctx.beginPath(); ctx.moveTo(margin.left,yAt(line.price)); ctx.lineTo(width-margin.right,yAt(line.price)); ctx.stroke();
+    });
+    ctx.restore();
   }
 
   const barStep = plotWidth / Math.max(rows.length, 1);
@@ -2704,18 +2827,28 @@ function bindStockChartInteraction(canvas){
   });
 }
 
-function drawStockChart(canvas, inputRows, period, referencePrice=null){
+function drawStockChart(canvas, inputRows, period, referencePrice=null, structure=null){
   if(!canvas) return;
   const rows = (inputRows || []).filter(row => Number.isFinite(Number(row.close)) && Number(row.close) > 0);
   if(!rows.length) return;
   const width = Math.max(520, Math.floor(canvas.getBoundingClientRect().width || 760));
   const validReference = Number(referencePrice) > 0 ? Number(referencePrice) : null;
-  canvas._stockChartState = { rows, period, referencePrice:validReference, selectedIndex:null, locked:false, dragging:false, width, marginLeft:54, plotWidth:width - 68 };
+  canvas._stockChartState = { rows, period, structure, referencePrice:validReference, selectedIndex:null, locked:false, dragging:false, width, marginLeft:54, plotWidth:width - 68 };
   canvas.dataset.locked = 'false';
   canvas.dataset.hasAverageLine = String(period === 'minute');
   canvas.dataset.hasZeroLine = String(period === 'minute' && validReference != null);
   bindStockChartInteraction(canvas);
   renderStockChart(canvas, rows, period, null, validReference);
+}
+
+function chartMetaText(result, period, referencePrice){
+  const latestIndex = result.rows.length - 1;
+  const closeSummary = period === 'minute' ? '' : ` · 收盘 ${yuan(Number(result.rows[latestIndex]?.close))} · 涨跌 ${formatPct(chartChangePct(result.rows, latestIndex, period, referencePrice))}`;
+  const averages = ['day','week','month'].includes(period) ? ' · 均线 MA5 / MA10 / MA20 / MA30 / MA60' : '';
+  const structure = period === 'hour60' ? ` · 结构 ${result.structure?.state || '待核验'}` : '';
+  const partial = period === 'hour60' && result.rows[latestIndex]?.isFinal === false ? ' · 末根未完成' : '';
+  const stale = result.stale ? ' · 旧缓存，不能确认新买点' : '';
+  return `${result.source || '行情接口'} · ${result.rows.length} 个数据点${averages}${closeSummary}${structure}${partial}${stale}`;
 }
 
 async function loadStockChart(s, period = 'day', force=false){
@@ -2731,10 +2864,8 @@ async function loadStockChart(s, period = 'day', force=false){
   if(!force && detailChartCache.has(cacheKey)){
     const result = detailChartCache.get(cacheKey);
     const referencePrice = result.previousClose ?? s.prevClose;
-    drawStockChart(canvas, result.rows, period, referencePrice);
-    const latestIndex = result.rows.length - 1;
-    const closeSummary = period === 'minute' ? '' : ` · 收盘 ${yuan(Number(result.rows[latestIndex]?.close))} · 涨跌 ${formatPct(chartChangePct(result.rows, latestIndex, period, referencePrice))}`;
-    meta.textContent = `${result.source || '行情接口'} · ${result.rows.length} 个数据点${period === 'day' || period === 'week' || period === 'month' ? ' · 均线 MA5 / MA10 / MA20 / MA30 / MA60' : ''}${closeSummary}`;
+    drawStockChart(canvas, result.rows, period, referencePrice, result.structure);
+    meta.textContent = chartMetaText(result,period,referencePrice);
     return result;
   }
   if(detailRequestPending.has(`chart:${cacheKey}`)) return detailRequestPending.get(`chart:${cacheKey}`);
@@ -2751,10 +2882,8 @@ async function loadStockChart(s, period = 'day', force=false){
       detailChartCache.set(cacheKey, result);
       if(activeChartPeriod.get(s.code) !== period || !canvas.isConnected) return result;
       const referencePrice = result.previousClose ?? s.prevClose;
-      drawStockChart(canvas, result.rows, period, referencePrice);
-      const latestIndex = result.rows.length - 1;
-      const closeSummary = period === 'minute' ? '' : ` · 收盘 ${yuan(Number(result.rows[latestIndex]?.close))} · 涨跌 ${formatPct(chartChangePct(result.rows, latestIndex, period, referencePrice))}`;
-      meta.textContent = `${result.source || '行情接口'} · ${result.rows.length} 个数据点${period === 'day' || period === 'week' || period === 'month' ? ' · 均线 MA5 / MA10 / MA20 / MA30 / MA60' : ''}${closeSummary}`;
+      drawStockChart(canvas, result.rows, period, referencePrice, result.structure);
+      meta.textContent = chartMetaText(result,period,referencePrice);
       return result;
     }catch(err){
       meta.textContent = `走势加载失败：${err.message || err}`;
@@ -2987,7 +3116,7 @@ function renderDetailPanel(){
     ${researchAccountPanel(s)}
     <div class="detail-chart">
       <div class="chart-head"><div class="chart-title"><h3>个股走势</h3><button class="small chart-refresh" data-chart-refresh="${s.code}" title="重新加载当前周期走势" aria-label="刷新个股走势">刷新</button></div><div class="chart-tabs">
-        ${[['minute','分时'],['five-day','五日'],['day','日K'],['week','周K'],['month','月K']].map(([key,label]) => `<button class="small ${chartPeriod === key ? 'active' : ''}" data-chart-period="${key}" data-chart-code="${s.code}">${label}</button>`).join('')}
+        ${[['minute','分时'],['five-day','五日'],['hour60','60分钟'],['day','日K'],['week','周K'],['month','月K']].map(([key,label]) => `<button class="small ${chartPeriod === key ? 'active' : ''}" data-chart-period="${key}" data-chart-code="${s.code}">${label}</button>`).join('')}
       </div></div>
       <div class="chart-legend" data-chart-legend="${s.code}">${chartLegendHtml(chartPeriod)}</div>
       <canvas class="stock-chart" data-chart-for="${s.code}" aria-label="${escapeHtml(s.name)}走势图" tabindex="0"></canvas>
@@ -3105,8 +3234,16 @@ function applyQuoteData(quotes){
       lowerLimit: q.lowerLimit ?? s.lowerLimit,
       totalMarketCap: q.totalMarketCap ?? s.totalMarketCap,
       floatMarketCap: q.floatMarketCap ?? s.floatMarketCap,
-      mainNetInflow: q.mainNetInflow ?? s.mainNetInflow,
-      mainNetPct: q.mainNetPct ?? s.mainNetPct,
+      mainNetInflow: q.mainNetInflow ?? null,
+      mainNetPct: q.mainNetPct ?? null,
+      mainInflow:q.mainInflow ?? null,
+      mainOutflow:q.mainOutflow ?? null,
+      fundFlowDate:q.fundFlowDate || '',
+      fundFlowObservedAt:q.fundFlowObservedAt || '',
+      fundFlowSource:q.fundFlowSource || '',
+      fundFlowStatus:q.fundFlowStatus || 'missing',
+      tradeDate:q.tradeDate || '',
+      quoteObservedAt:q.quoteObservedAt || '',
       source: q.source || s.source,
       fetchedAt: q.fetchedAt || s.fetchedAt,
       stale: Boolean(q.stale),
@@ -3450,6 +3587,7 @@ $('deleteSelectedFromLabel').onclick = () => {
   const l = labels.find(x => x.name === activeLabel);
   const hasSelectedInLabel = (l?.stocks || []).some(s => selected.has(s.code));
   if(!labelEditMode || !hasSelectedInLabel) return;
+  recordRemovedFavorite(l,l.stocks.filter(s => selected.has(s.code)));
   labels = labels.map(l => l.name === activeLabel ? {...l, stocks:l.stocks.filter(s => !selected.has(s.code))} : l);
   selected.clear();
   saveState({successMessage:`已从标签「${activeLabel}」删除选中股票`});
@@ -3490,7 +3628,11 @@ addLog('info', restored ? '应用已启动，已加载上次保存的标签；�
 renderStocks();
 hydrateUserState();
 loadResearchAccount().then(() => { if(activeDetailCode || currentViewSource === 'portfolio') renderStocks(); });
-window.stockApi?.onFullMarketResearchProgress?.(renderFullMarketResearchStatus);
+window.stockApi?.onFullMarketResearchProgress?.(status=>{
+  const wasFailed = latestFullMarketResearchStatus?.state === 'failed';
+  renderFullMarketResearchStatus(status);
+  if(status?.state === 'failed' && !wasFailed) notify(`全市场历史任务失败：${String(status.error || status.message || '线程异常').split('\n')[0]}`, 'error');
+});
 window.stockApi?.onDailyReportProgress?.(progress => {
   if(progress?.state === 'completed'){
     if(currentViewSource === 'report') void openDailyReports();

@@ -25,6 +25,7 @@ contextBridge.exposeInMainWorld('stockApi', {
   markResearchAccount: (request) => ipcRenderer.invoke('mark-research-account', request),
   listDailyReports: () => ipcRenderer.invoke('list-daily-reports'),
   getDailyReport: (request) => ipcRenderer.invoke('get-daily-report', request),
+  getDailyReportEpisodePage: (request) => ipcRenderer.invoke('get-daily-report-episode-page', request),
   generateDailyReport: (request) => ipcRenderer.invoke('generate-daily-report', request),
   openDailyReport: (request) => ipcRenderer.invoke('open-daily-report', request),
   onDailyReportProgress: (callback) => {

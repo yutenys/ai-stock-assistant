@@ -23,7 +23,7 @@ test('保存成功提示等待磁盘回执，失败时不误报成功',async()=>
   const notices=[];
   let complete;
   const context=harness(['saveState'],{
-    STORAGE_KEY:'test-state',labels:[],activeLabel:'',labelSorts:{},portfolio:[],simulatedTrades:[],
+    STORAGE_KEY:'test-state',labels:[],removedFavoriteEvents:[],activeLabel:'',labelSorts:{},portfolio:[],simulatedTrades:[],
     localStorage:{setItem(){}},addLog(){},notify:(message,type)=>notices.push({message,type}),
     window:{stockApi:{saveUserState:()=>new Promise(resolve=>{complete=resolve;})}}
   });
@@ -260,6 +260,13 @@ test('推荐卡片优先使用统一评分快照并明确周期待确认',()=>{
   const html=context.recommendationCardHtml({code:'600001',name:'测试',signalScore:70,scoreCard:{recommendation:82},price:10});
   assert.match(html,/推荐评分 82/);
   assert.match(html,/周期待确认/);
+  const pending=context.recommendationCardHtml({code:'600001',name:'测试',price:10,
+    intradayStructure:{state:'retest-confirmed'},intradayPlanState:{currentPermission:'watch'}});
+  assert.match(pending,/60分回踩待确认/);
+  assert.doesNotMatch(pending,/60分影子触发/);
+  const triggered=context.recommendationCardHtml({code:'600001',name:'测试',price:10,
+    intradayStructure:{state:'retest-confirmed'},intradayPlanState:{currentPermission:'allowed'}});
+  assert.match(triggered,/60分影子触发/);
 });
 
 test('新版模拟交易不再静默截断500条历史记录',()=>{

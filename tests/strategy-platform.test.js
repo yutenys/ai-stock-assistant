@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 
 const {
   createDataEnvelope,
+  percentile,
   detectBreakoutContext,
   buildFactorSnapshot,
   evaluateStrategyRegistry,
@@ -12,6 +13,18 @@ const {
   mergeEventLifecycle
 } = require('../lib/strategy-platform');
 const {nextTradingDay} = require('../lib/trade-time');
+
+test('全市场 RPS 同值排名与单次分位数计算一致', () => {
+  const rows = Array.from({length:6000}, (_, index) => ({factor:{code:String(index).padStart(6,'0'),close:10,
+    returns:{d20:index % 31,d60:index % 47,d120:index % 53,d250:index % 67}}}));
+  const result = buildFactorSnapshot(rows,{universeSize:rows.length,complete:true});
+  assert.equal(result.complete,true);
+  for (const [period,modulo] of [[20,31],[60,47],[120,53],[250,67]]) {
+    assert.equal(result.factors[0][`rps${period}`],percentile(rows.map((_,index)=>index % modulo),0));
+    assert.ok(result.factors.every(row=>Number.isFinite(row[`rps${period}`])));
+    assert.ok(result.factors.at(-1)[`rps${period}`] > result.factors[0][`rps${period}`]);
+  }
+});
 
 test('C类影子规则保留量能边界且不授予入场许可', () => {
   const rows = Array.from({length:20}, (_, index) => ({date:`2026-08-${String(index + 1).padStart(2, '0')}`,volume:100}));

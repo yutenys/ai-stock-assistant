@@ -55,6 +55,8 @@ const {
   classifyMarketRegime,
   confirmMarketRecovery,
   updateMarketRotationHistory,
+  favoriteRowsFromState,
+  compactReportMarketPath,
   priorMarketRotationSnapshot,
   buildStrategyScoreCard,
   mergeSectorCapitalRows,
@@ -878,9 +880,11 @@ test('单日资金仍为正但快速减速，先记录影子降级而不直接�
 
 test('同交易日资金从峰值明显回撤时不再作为轮动主线确认',()=>{
   const previous={tradeDate:'2026-09-14',sectors:[{name:'元件',rotationScore:82,changePct:3,
-    mainNetInflow:10e8,mainNetPct:4,capitalEstimated:false,capitalStale:false}]};
+    mainNetInflow:10e8,mainNetPct:4,capitalEstimated:false,capitalStale:false,capitalSource:'fixture',boardType:'industry',
+    memberCodes:['600001','600002'],capitalObservedAt:'2026-09-14T10:00:00+08:00'}]};
   const sector=annotateSectorRotation([{name:'元件',rotationScore:68,changePct:2,upRatio:.7,
-    mainNetInflow:2e8,mainNetPct:1,capitalEstimated:false,capitalStale:false}],previous,'2026-09-14')[0];
+    mainNetInflow:2e8,mainNetPct:1,capitalEstimated:false,capitalStale:false,capitalSource:'fixture',boardType:'industry',
+    memberCodes:['600001','600002'],capitalObservedAt:'2026-09-14T10:20:00+08:00'}],previous,'2026-09-14')[0];
   assert.equal(sector.rotationIntraday.retreating,true);
   assert.equal(sector.rotationIntraday.retreatRatio,.8);
   assert.equal(sector.rotationState,'盘中资金回撤');
@@ -1420,6 +1424,35 @@ test('后台全市场结果保留待筛身份且不冒充当轮推荐', () => {
   assert.equal(buildBackgroundWatchRecommendations(scored,{...screening,candidates:[{...screening.candidates[0],ma30:null}]},tradeDate,Date.parse('2026-09-14T08:00:00.000Z')).length,0);
 });
 
+test('负向资金扩大与不可比成员不能被写成资金未回撤',()=>{
+  const previous={tradeDate:'2026-09-14',sectors:[{name:'农业',mainNetInflow:-.2e8,
+    capitalSource:'fixture',boardType:'industry',memberCodes:['600001'],capitalObservedAt:'2026-09-14T10:00:00+08:00'}]};
+  const current={name:'农业',mainNetInflow:-15e8,capitalSource:'fixture',boardType:'industry',
+    memberCodes:['600001'],capitalObservedAt:'2026-09-14T10:20:00+08:00'};
+  const sector=annotateSectorRotation([current],previous,'2026-09-14')[0];
+  assert.equal(sector.rotationIntraday.flowState,'净流出扩大');
+  assert.match(sector.rotationIntraday.summary,/净流出扩大/);
+  const unknown=annotateSectorRotation([{...current,memberCodes:[]}],
+    {tradeDate:previous.tradeDate,sectors:[{...previous.sectors[0],memberCodes:[]}]},'2026-09-14')[0];
+  assert.equal(unknown.rotationIntraday.flowState,'盘中资金轨迹待积累');
+});
+
+test('收藏快照透传且历史时间点不再重复嵌入板块成员',()=>{
+  const snapshot={modelVersion:'v26',sourceType:'recommendation',planId:'plan-one',favoriteEventId:'event-one'};
+  const rows=favoriteRowsFromState({labels:[{id:'l1',name:'观察',stocks:[{code:'600001',name:'测试',
+    favoriteBasePrice:10,favoriteAddedAt:'2026-10-09T10:00:00+08:00',favoriteEntrySnapshot:snapshot}]}]},
+    new Map([['600001',{price:11,changePct:1}]]),'2026-10-09');
+  assert.equal(rows[0].favoriteEntrySnapshot,snapshot);
+  assert.equal(rows[0].modelVersion,'v26');
+  assert.equal(rows[0].favoriteEventId,'event-one');
+  const rich={snapshotId:'s1',tradeDate:'2026-10-09',breadth:{up:2,down:1},
+    sectors:[{name:'农业',memberCodes:Array.from({length:1000},(_,i)=>String(i).padStart(6,'0'))}],
+    limits:{upCount:1,downCount:0}};
+  const path=compactReportMarketPath({snapshots:[rich],anchors:{close:rich},peakBreadth:rich});
+  assert.equal(path.snapshots[0].sectors,undefined);
+  assert.ok(JSON.stringify(path).length < 2000);
+});
+
 test('未来交易日不能生成正式收盘报告', async () => {
   const {nextTradingDay} = require('../lib/trade-time');
   const future = nextTradingDay(chinaClockParts().date);
@@ -1436,7 +1469,7 @@ test('跨日轮动快照保留收盘基线，重启和同日刷新不覆盖昨�
   history = updateMarketRotationHistory(history, today);
   history = updateMarketRotationHistory(history, {...closed, fetchedAt:'2026-09-16T06:00:00Z',turnover:50,observationPhase:{phase:'intraday'}});
   const baseline = priorMarketRotationSnapshot(JSON.parse(JSON.stringify(history)), today.tradeDate);
-  assert.equal(history.length,1);
+  assert.equal(history.length,2);
   assert.equal(baseline.turnover,100);
   assert.equal(priorMarketRotationSnapshot(history,'2026-09-21'),null);
   const current = [{name:'软件',rotationScore:60,capitalEstimated:false,boardType:'industry',capitalSource:'fixture'}];
@@ -1819,15 +1852,50 @@ test('交易计划按实际入场路径计算第一目标净盈亏比', () => {
   assert.ok(plan.legacyRangeRewardRisk > plan.rewardRisk);
 });
 
-test('个股走势返回分时五日日周月五种周期', { timeout: 60000 }, async () => {
+test('交易计划保留最近真实阻力，突破后不以旧确认价计算收益', () => {
+  const plan = buildTradePlan({latestPrice:12, supportPrice:10, resistance:11, rangeHigh:12.2,
+    ma5:11, ma10:10.8, ma20:10.5, ma30:10, atr14:1, volumeRatio:2, verdict:'可关注'});
+  assert.equal(plan.expectedEntryPrice,12);
+  assert.equal(plan.targets[0].price,12.2);
+  assert.equal(plan.targets[0].basis,'结构阻力');
+  assert.equal(plan.researchEntryEligible,false);
+  const high = buildTradePlan({latestPrice:12.5, supportPrice:10, resistance:11, rangeHigh:12.2,
+    ma5:11, ma10:10.8, ma20:10.5, ma30:10, atr14:1, volumeRatio:2, verdict:'可关注'});
+  assert.equal(high.targetEvidence.status,'missing');
+  assert.equal(high.rewardRisk,null);
+});
+
+test('市场历史保留盘中路径和最终快照，重复缓存不形成新锚', () => {
+  const early = {tradeDate:'2026-10-08',fetchedAt:'2026-10-08T01:45:10Z',quoteObservedAt:'2026-10-08T01:45:00Z',
+    snapshotId:'early',breadth:{up:4300,down:1145,flat:10},indices:[{code:'sh',changePct:.32}],
+    turnover:10,observationPhase:{phase:'intraday'},sectors:[{name:'电池',memberCodes:['600001'],capitalSource:'fixture'}]};
+  let rows = updateMarketRotationHistory([],early);
+  rows = updateMarketRotationHistory(rows,{...early,fetchedAt:'2026-10-08T02:00:00Z'});
+  assert.equal(rows[0].snapshots.length,1);
+  const close = {...early,snapshotId:'close',quoteObservedAt:'2026-10-08T07:00:00Z',fetchedAt:'2026-10-08T07:01:00Z',
+    breadth:{up:1697,down:3748,flat:10},observationPhase:{phase:'closed'}};
+  rows = updateMarketRotationHistory(rows,close);
+  assert.equal(rows[0].snapshots.length,2);
+  assert.equal(rows[0].breadth.down,3748);
+  assert.equal(rows[0].anchors['09:45'].snapshotId,'early');
+  assert.equal(rows[0].anchors.close.snapshotId,'close');
+  const regime=classifyMarketRegime(close,rows[0].snapshots[0]);
+  assert.ok(Math.abs(regime.upRatioDelta - (1697-4300)/5445)<1e-8);
+});
+
+test('个股走势返回分时五日60分钟及日周月周期', { timeout: 60000 }, async () => {
   const handler = handlers.get('fetch-stock-chart');
   assert.equal(typeof handler, 'function');
-  for (const period of ['minute', 'five-day', 'day', 'week', 'month']) {
+  for (const period of ['minute', 'five-day', 'hour60', 'day', 'week', 'month']) {
     const result = await handler(null, { code: '600519', period });
     assert.equal(result.period, period);
     assert.ok(result.rows.length >= (period === 'minute' ? 1 : 20), `${period} 数据不足`);
     assert.ok(result.rows.every(row => row.time && row.close > 0));
     if (period === 'minute') assert.ok(result.previousClose > 0);
+    if (period === 'hour60') {
+      assert.ok(result.rows.every(row=>row.volumeUnit === 'share' && row.adjustment === 'raw'));
+      assert.equal(result.structure?.algorithmVersion,'range-retest-60m-v1');
+    }
   }
 });
 
@@ -2416,7 +2484,7 @@ test('推荐账本记录完整候选和三周期快照', () => {
     momentumRecommendations:[],
     recommendationCoverage:{scanned:5000,analyzed:100,rejectedCandidates:[{code:'600002',reason:'industry-unresolved'}],modelVersion:'test-v1'}
   });
-  assert.equal(entry.schemaVersion, 2);
+  assert.equal(entry.schemaVersion, 3);
   assert.equal(entry.inputCutoffAt, '2026-09-11T08:00:00.000Z');
   assert.equal(entry.publishedAt, '2026-09-11T08:00:06.000Z');
   assert.equal(entry.recommendations[0].holdingPeriod, '波段');
@@ -2750,12 +2818,13 @@ test('合并候选通道后按行业轮流精筛，避免同一行业重复挤�
   assert.equal(selectMarketRecommendationCandidates(input, 30).length, 7);
 });
 
-test('行业分散不能挤掉已经通过轮动和强势通道的优先候选', () => {
+test('优先通道保留行业代表但不让重叠单行业占满精筛额度', () => {
   const priority = Array.from({length:4}, (_, index) => ({code:`P${index}`,industry:'证券'}));
   const broad = Array.from({length:12}, (_, index) => ({code:`G${index}`,industry:`行业${index}`}));
   const result = selectMarketRecommendationCandidates({rotationScreened:priority.slice(0,2),momentumScreened:priority.slice(2),breakoutScreened:broad},8);
-  assert.equal(result.filter(item => item.industry === '证券').length, 4);
-  assert.equal(new Set(result.map(item => item.industry)).size, 5);
+  assert.equal(result.filter(item => item.industry === '证券').length, 1);
+  assert.equal(new Set(result.map(item => item.industry)).size, 8);
+  assert.ok(result.some(item=>item.code === 'P0'));
 });
 
 test('强势追踪单独成组并限制每个板块数量', () => {

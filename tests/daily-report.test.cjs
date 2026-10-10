@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const {readReportSummary,readCacheSummary} = require('../lib/large-json');
 
 const {
   calculateRecommendationPerformance,
@@ -12,6 +13,58 @@ const {
   buildDailyReport,
   renderDailyReportHtml
 } = require('../lib/daily-report');
+
+test('报告三个视图共用冻结术语并区分本地与外部B2',()=>{
+  const report = buildDailyReport({tradeDate:'2026-10-09',removedFavoriteEvents:[{favoriteEventId:'f1',code:'600001',removedAt:'2026-10-09T10:00:00+08:00'}]});
+  const html = renderDailyReportHtml(report);
+  assert.match(html,/id="page-review"/);
+  assert.match(html,/id="next-day-plan"/);
+  assert.match(html,/id="report-terms"/);
+  assert.equal(report.termDefinitions.find(row => row.id === 'track.B').status,'现行规则');
+  assert.equal(report.termDefinitions.find(row => row.id === 'external.chan.B2').status,'外部术语');
+  assert.match(html,/不映射为本地方案B或接力B2/);
+  assert.equal(report.favoriteHistory.removedCount,1);
+  assert.match(html,/已移除事件 1 条/);
+});
+
+test('实际大盘路径对象和影子决策能渲染，缺失锚点不补造',()=>{
+  const report=buildDailyReport({tradeDate:'2026-10-09',market:{path:{snapshots:[],anchors:{'10:00':{
+    fetchedAt:'2026-10-09T10:00:00+08:00',breadth:{up:1000,down:4000},source:'fixture'}}}},
+    strategyExperiments:{manifest:{parameterVersion:'test',frozenAt:'2026-10-09T09:00:00+08:00'},
+      decisions:[{id:'H3',status:'pass'}]}});
+  const html=renderDailyReportHtml(report);
+  assert.match(html,/10:00/);
+  assert.match(html,/预注册影子实验/);
+  assert.match(html,/H3<\/td><td>1/);
+  assert.doesNotMatch(html,/14:30/);
+});
+
+test('超大旧报告按结构化路径跳过重复时间点和episode明细', async t => {
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'large-report-'));
+  t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+  const file=path.join(root,'report.json');
+  fs.writeFileSync(file,JSON.stringify({tradeDate:'2026-10-09',revision:1,
+    market:{breadth:{up:100},path:{snapshots:[{huge:'x'.repeat(10000)}]}},
+    publishedOutcomes:{counts:{episodes:2},episodes:[{huge:'x'.repeat(10000)}]},
+    recommendations:{all:[{code:'600001'}]}}));
+  const report=await readReportSummary(file);
+  assert.equal(report.market.path,null);
+  assert.deepEqual(report.publishedOutcomes.episodes,[]);
+  assert.equal(report.publishedOutcomes.counts.episodes,2);
+  assert.equal(report.recommendations.all[0].code,'600001');
+});
+
+test('旧大盘缓存的日内重复板块明细可流式压缩', async t => {
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'large-cache-'));
+  t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+  const file=path.join(root,'cache.json');
+  fs.writeFileSync(file,JSON.stringify({savedAt:1,data:[{tradeDate:'2026-10-09',
+    breadth:{up:1},sectors:[{name:'农业',memberCodes:['600001']}],
+    snapshots:[{sectors:[{huge:'x'.repeat(10000)}]}],anchors:{close:{huge:'x'.repeat(10000)}}}]}));
+  const days=await readCacheSummary(file,'market-rotation-history');
+  assert.equal(days[0].sectors[0].memberCount,1);
+  assert.equal(days[0].snapshots,undefined);
+});
 const {
   DailyReportStore,
   readLedgerEntriesForDate,
@@ -49,6 +102,19 @@ test('两个交易日的超声电子报告分别使用对应收盘价和红色�
   assert.match(renderDailyReportHtml(current), /<td>25\.22<\/td>/);
   assert.match(renderDailyReportHtml(current), /class="up">\+0\.08%/);
   assert.doesNotMatch(renderDailyReportHtml(current), /class="up">\+7\.78%/);
+});
+
+test('盘后首发不计当日平盘，旧仓缺价只披露已核验部分', () => {
+  const report=buildDailyReport({tradeDate:'2026-10-09',
+    stable:[{code:'600001',price:10,publishedAt:'2026-10-09T15:05:00+08:00'}],
+    closingQuotes:[{code:'600001',price:10,changePct:0,tradeDate:'2026-10-09',isFinal:true},
+      {code:'600002',price:12,changePct:2,tradeDate:'2026-10-09',isFinal:true}],
+    portfolio:{legacy:{positions:[{code:'600002',quantity:100,costPrice:10},{code:'600003',quantity:100,costPrice:10}]}}});
+  assert.equal(report.recommendations.performance.published.count,0);
+  assert.equal(report.recommendations.all[0].dataStatus,'盘后发布，未进入当日评价窗');
+  assert.equal(report.portfolio.legacy.coveredUnrealizedPnl,200);
+  assert.deepEqual(report.portfolio.legacy.missingCodes,['600003']);
+  assert.equal(report.portfolio.legacy.accountEquity,null);
 });
 
 test('报告分开展示已发布推荐观察表现和可模拟成交计数', () => {
@@ -123,9 +189,125 @@ test('每日报告保留A/B重叠但全局去重并披露缺失数据', () => {
   assert.equal(report.recommendations.all.find(row => row.code === '600002').dataStatus, '收盘行情缺失');
   assert.deepEqual(report.recommendations.best.map(row => row.code), ['600001']);
   assert.deepEqual(report.recommendations.worst.map(row => row.code), ['600001']);
-  assert.equal(report.favorites.count, 1);
-  assert.equal(report.favorites.averageReturnPct, 10);
+  assert.equal(report.favorites.count, 3);
+  assert.equal(report.favorites.codeCount, 2);
+  assert.equal(report.favorites.averageReturnPct, 0);
   assert.deepEqual(report.dataQuality.warnings, ['逐日资金缺失']);
+});
+
+test('all favorite labels survive; code risk and missing original plans remain explicit', () => {
+  const report = buildDailyReport({tradeDate:'2026-10-08',favorites:[
+    {code:'600001',label:'personal',addedAt:'2026-09-30',referencePrice:10,currentPrice:11,entryPermission:'watch'},
+    {code:'600001',label:'重点关注',addedAt:'2026-10-08',referencePrice:11,currentPrice:11,entryPermission:'blocked',riskReasons:['risk']},
+    {code:'600002',label:'other',referencePrice:null,currentPrice:8}
+  ]});
+  assert.deepEqual(report.favorites.rows.map(row => row.label), ['personal','重点关注','other']);
+  assert.equal(report.favorites.byLabel.length,3);
+  assert.equal(report.favorites.byCode.find(row => row.code === '600001').entryPermission,'blocked');
+  assert.equal(report.favorites.missingOriginalCount,3);
+  assert.equal(report.favorites.unknownVersionCount,3);
+  assert.equal(report.favorites.rows[2].returnPct,null);
+  const html = renderDailyReportHtml(report);
+  assert.match(html,/personal/);
+  assert.match(html,/重点关注/);
+  assert.match(html,/幸存者偏差/);
+  assert.match(html,/原始计划缺失/);
+  assert.doesNotMatch(html,/排除重点关注/);
+});
+
+test('trigger observation starts at recorded trigger price, not publication price', () => {
+  const report = buildDailyReport({tradeDate:'2026-10-08',stable:[
+    {code:'600001',price:10,entryPermission:'allowed',triggeredAt:'2026-10-08T10:00:00+08:00',
+      triggerEvent:{id:'event',type:'entry-allowed',verified:true,source:'local',referencePrice:11,occurredAt:'2026-10-08T10:00:00+08:00'}},
+    {code:'600002',price:10,entryPermission:'allowed',triggeredAt:'2026-10-08T10:00:00+08:00'}
+  ],closingQuotes:['600001','600002'].map(code => ({code,price:12,changePct:2,tradeDate:'2026-10-08',isFinal:true}))});
+  assert.equal(report.recommendations.performance.published.averageReturnPct,20);
+  assert.equal(report.recommendations.performance.triggered.count,1);
+  assert.equal(report.recommendations.performance.triggered.averageReturnPct,9.09);
+});
+
+test('report renders path anchors, sector evidence, next-day expiry and isolated legacy scope', () => {
+  const report = buildDailyReport({tradeDate:'2026-10-08',
+    market:{path:[{label:'早盘',observedAt:'10:00',state:'weak',source:'local',breadth:{up:1,down:9}}],sourceSwitches:['source changed']},
+    sectors:[{name:'sector',stateTransitions:[{from:'watch',to:'blocked'}],evidence:{diffusion:'narrow',capital:'missing'},dataQuality:{missing:['capital']}}],
+    nextDayConditions:[{code:'600001',trigger:'completed bar',invalidation:'support lost',expiresAt:'2026-10-09T15:00:00+08:00',dataPrerequisites:['5m']}],
+    legacyBroadList:[{code:'600003',price:5}],dataQuality:{missing:['indices']}
+  });
+  assert.equal(report.recommendations.all.length,0);
+  assert.equal(report.legacyBroadList.count,1);
+  const html = renderDailyReportHtml(report);
+  for (const text of ['早盘','weak','source changed','watch','blocked','narrow','capital','completed bar','support lost','2026-10-09','5m','兼容广泛名单','indices']) assert.ok(html.includes(text),text);
+});
+
+test('unknown and immature outcomes never render as zero or enter execution statistics', () => {
+  const report = buildDailyReport({tradeDate:'2026-10-08',publishedOutcomes:{horizons:[1],counts:{execution:{executable:9}},episodes:[
+    {observations:{1:{status:'observed',returnPct:null}},nextOpenProxy:{status:'executable'},execution:{status:'unknown'},executionObservations:{1:{status:'immature',returnPct:0}}},
+    {observations:{1:{status:'observed',returnPct:2}},triggerObservations:{1:{status:'observed',returnPct:-1}},execution:{status:'unfilled'},executionObservations:{1:{status:'observed',returnPct:0}}},
+    {nextOpenProxy:{status:'executable'},execution:{status:'executable',verified:false},executionObservations:{1:{status:'observed',returnPct:99,netReturnPct:99}}}
+  ]}});
+  const html = renderDailyReportHtml(report);
+  assert.match(html,/发布后观察/);
+  assert.match(html,/触发后观察/);
+  assert.match(html,/nextOpenProxy/);
+  assert.match(html,/已核验成交 0/);
+  assert.match(html,/class="up">\+2\.00%/);
+  assert.match(html,/class="down">-1\.00%/);
+  assert.doesNotMatch(html,/class="(?:up|down)">0\.00%/);
+  assert.doesNotMatch(html,/99\.00%/);
+});
+
+test('verified execution displays net costs separately from price observations', () => {
+  const html = renderDailyReportHtml(buildDailyReport({tradeDate:'2026-10-08',publishedOutcomes:{horizons:[1],
+    counts:{execution:{executable:1},nextOpenProxy:{executable:2}},episodes:[
+      {execution:{status:'executable',verified:true},executionObservations:{1:{status:'observed',returnPct:5,netReturnPct:4.5}}}
+    ]}}));
+  assert.match(html,/已核验成交 1/);
+  assert.match(html,/class="up">\+4\.50%/);
+});
+
+test('strict calendar dates reject rollover and browser revision must exist', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(),'report-calendar-'));
+  t.after(() => fs.rmSync(root,{recursive:true,force:true}));
+  const store = new DailyReportStore(root);
+  assert.throws(() => store.directory('2026-02-30'),/日期无效/);
+  await store.save('2026-10-08',{summary:'test'});
+  assert.equal(await store.htmlPath('2026-10-08',2),null);
+  fs.unlinkSync(path.join(root,'2026-10-08','report-r001.html'));
+  assert.equal(await store.htmlPath('2026-10-08',1),null);
+});
+
+test('corrupt same-hash JSON or HTML creates a fresh complete revision', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(),'report-corrupt-'));
+  t.after(() => fs.rmSync(root,{recursive:true,force:true}));
+  const store = new DailyReportStore(root);
+  const report = {summary:'test'};
+  await store.save('2026-10-08',report);
+  fs.writeFileSync(path.join(root,'2026-10-08','report-r001.json'),'{broken');
+  assert.equal((await store.save('2026-10-08',report)).revision,2);
+  fs.writeFileSync(path.join(root,'2026-10-08','report-r002.html'),'wrong revision');
+  assert.equal((await store.save('2026-10-08',report)).revision,3);
+  assert.match(fs.readFileSync(await store.htmlPath('2026-10-08'),'utf8'),/修订 r003/);
+});
+
+test('compact ledger preserves frozen plan, trigger, terminal and risk contract', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(),'report-contract-'));
+  t.after(() => fs.rmSync(root,{recursive:true,force:true}));
+  const file = path.join(root,'ledger.jsonl');
+  const item = {code:'600001',signalId:'signal',planId:'plan',planRevision:2,episodeId:'episode',
+    entryPermission:'expired',terminal:true,expiresAt:'2026-10-09T15:00:00+08:00',maxEntryPrice:12,
+    riskChecks:{allowed:false},costAssumptions:{slippageBps:10},
+    triggerEvent:{id:'trigger',type:'entry-allowed',observedAt:'2026-10-08T10:00:00+08:00',price:11},
+    plan:{entryExpiryDate:'2026-10-09',expectedEntryPrice:11},planState:'expired',
+    tradePlan:{entryExpiryDate:'2026-10-09',expectedEntryPrice:11},
+    earliestBuyDate:'2026-10-09',earliestSellDate:'2026-10-12',
+    executionEvidence:{type:'quote',verified:true,price:11,observedAt:'2026-10-08T10:05:00+08:00'},
+    quote:{price:11,tradeDate:'2026-10-08',quoteObservedAt:'2026-10-08T10:00:00+08:00',huge:'discard'}};
+  fs.writeFileSync(file,JSON.stringify({tradeDate:'2026-10-08',batchId:'batch',recommendations:[item]})+'\n');
+  const compact = (await readLedgerEntriesForDate(file,'2026-10-08',{compact:true})).entries[0].recommendations[0];
+  for (const key of ['planId','planRevision','episodeId','terminal','expiresAt','maxEntryPrice','riskChecks','costAssumptions','triggerEvent','tradePlan','plan','planState','earliestBuyDate','earliestSellDate','executionEvidence']) assert.deepEqual(compact[key],item[key],key);
+  assert.equal(compact.quoteTradeDate,'2026-10-08');
+  assert.equal(compact.quoteObservedAt,item.quote.quoteObservedAt);
+  assert.equal(compact.quote,undefined);
 });
 
 test('报告区分发布观察、触发观察并显示检查点缺失原因', () => {
@@ -133,7 +315,8 @@ test('报告区分发布观察、触发观察并显示检查点缺失原因', ()
     tradeDate:'2026-09-30',
     stable:[
       {code:'600001',price:10,changePct:1,publishedAt:'2026-09-30T01:59:00Z',entryPermission:'watch'},
-      {code:'600002',price:20,changePct:2,publishedAt:'2026-09-30T03:28:00Z',entryPermission:'allowed',triggeredAt:'2026-09-30T03:29:00Z'}
+      {code:'600002',price:20,changePct:2,publishedAt:'2026-09-30T03:28:00Z',entryPermission:'allowed',triggeredAt:'2026-09-30T03:29:00Z',
+        triggerEvent:{id:'trigger',type:'entry-allowed',verified:true,source:'local',referencePrice:20,occurredAt:'2026-09-30T03:29:00Z'}}
     ],
     closingQuotes:[
       {code:'600001',price:9,changePct:-9,tradeDate:'2026-09-30',isFinal:true},
@@ -188,6 +371,26 @@ test('报告存储对相同输入幂等且数据更正生成修订', async () =>
   assert.equal((await store.load('2026-09-18')).report.summary, 'corrected');
   assert.ok(fs.existsSync(path.join(root, '2026-09-18', 'report-r001.html')));
   assert.ok(fs.existsSync(path.join(root, '2026-09-18', 'report-r002.json')));
+});
+
+test('分块报告明细按页读取并验证哈希，不读取整份旧报告', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(),'report-detail-page-'));
+  t.after(() => fs.rmSync(root,{recursive:true,force:true}));
+  const date = '2026-10-09', directory = path.join(root,date,'outcome-details');
+  fs.mkdirSync(directory,{recursive:true});
+  const rows = [{episodeId:'a'},{episodeId:'b'},{episodeId:'c'}];
+  const content = rows.map(JSON.stringify).join('\n')+'\n';
+  const sha256 = require('node:crypto').createHash('sha256').update(content).digest('hex');
+  const file = `outcome-details/${sha256}.jsonl`;
+  fs.writeFileSync(path.join(root,date,file),content);
+  const store = new DailyReportStore(root);
+  await store.save(date,{tradeDate:date,publishedOutcomes:{episodeChunks:[{file,sha256,count:3,bytes:Buffer.byteLength(content)}]}});
+  assert.match(fs.readFileSync(path.join(root,date,'report-r001.html'),'utf8'),/离线浏览器可打开同目录下的原始JSONL明细块/);
+  assert.deepEqual((await store.episodePage(date,null,0,2)).rows,rows.slice(0,2));
+  assert.deepEqual((await store.episodePage(date,null,1,2)).rows,rows.slice(2));
+  assert.equal((await store.episodePage(date,null,1,2)).hasMore,false);
+  fs.appendFileSync(path.join(root,date,file),'{}\n');
+  await assert.rejects(store.episodePage(date,null,0,2),/校验失败/);
 });
 
 test('同一交易日报告并发保存按输入顺序生成完整修订', async () => {

@@ -48,8 +48,13 @@ app.whenReady().then(async () => {
       worst:[{code:'600001',name:'方案A测试',industry:'半导体',tracks:['A'],primaryRole:'资金前排',holdingPeriod:'短线',checkpoint:'10:00',changePct:1,closeChangePct:3,priceReturnPct:1.98,dataStatus:'完整'}],
       overlapCount:0
     },
-    favorites:{count:4,validCount:3,averageReturnPct:1.25,rows:[]},
-    portfolio:{positions:[]}, news:[{title:'测试收盘消息',url:'https://example.com/report-news',publishedAt:'2026-09-18 15:00',source:'测试源'}],
+    favorites:{count:4,codeCount:3,validCount:3,averageReturnPct:1.25,missingOriginalCount:4,rows:[
+      {label:'personal',code:'600001',name:'手工收藏测试',referencePrice:10,currentPrice:10.2,returnPct:2,originalPlanStatus:'missing'},
+      {label:'重点关注',code:'600002',name:'重点收藏测试',referencePrice:10,currentPrice:9.9,returnPct:-1,originalPlanStatus:'missing'}]},
+    portfolio:{positions:[]},nextDayConditions:[{code:'600001',planId:'test-plan',entryPermission:'watch',trigger:'突破确认'}],
+    publishedOutcomes:{counts:{episodes:1},episodeChunks:[{count:1,file:'outcome-details/test.jsonl'}]},
+    termDefinitions:[{id:'track.B',name:'方案B',status:'现行规则',version:'v26',definition:'强势追踪',limit:'不等于接力B2'}],
+    news:[{title:'测试收盘消息',url:'https://example.com/report-news',publishedAt:'2026-09-18 15:00',source:'测试源'}],
     dataQuality:{warnings:['逐日资金明细缺失']}
   };
   for (const rows of Object.values(dailyReport.recommendations)) {
@@ -57,6 +62,7 @@ app.whenReady().then(async () => {
   }
   ipcMain.handle('list-daily-reports', async () => [{tradeDate:'2026-09-18',latestRevision:1,status:'partial'}]);
   ipcMain.handle('get-daily-report', async () => ({manifest:{latestRevision:1},report:dailyReport}));
+  ipcMain.handle('get-daily-report-episode-page', async () => ({rows:[{episodeId:'event-1',code:'600001',tradeDate:'2026-09-18',tracks:['A'],execution:{status:'unverified'}}],total:1,page:0,limit:20,hasMore:false}));
   ipcMain.handle('generate-daily-report', async () => { reportGenerateCount += 1; return {preview:true,report:{...dailyReport,revision:0,status:'preview'}}; });
   ipcMain.handle('open-daily-report', async (_event, request) => { reportBrowserOpenCount += 1; reportBrowserRequests.push(request); return {ok:true,file:'report.html'}; });
   ipcMain.handle('search-a-share-stocks', async (_event, keyword) => {
@@ -240,6 +246,8 @@ app.whenReady().then(async () => {
       };
     }),
     previousClose: 6.18,
+    structure:request.period === 'hour60' ? {state:'retest-confirmed',boxLower:6.4,boxUpper:6.7,
+      confirmationPrice:6.9,invalidationPrice:6.2} : null,
     source: `测试${request.period}行情#${++chartRequestCount}`,
     errors: []
   }));
@@ -301,6 +309,16 @@ app.whenReady().then(async () => {
   await win.loadFile(path.join(__dirname, '..', 'index.html'));
   await win.webContents.executeJavaScript(`localStorage.clear(); location.reload()`);
   await new Promise(resolve => setTimeout(resolve, 50));
+  await win.webContents.executeJavaScript(`document.getElementById('startFullMarketResearch').click()`);
+  await new Promise(resolve => setTimeout(resolve, 30));
+  win.webContents.send('full-market-research-progress',{state:'failed',completed:120,total:5000,
+    message:'全市场历史任务线程异常',error:'ERR_WORKER_OUT_OF_MEMORY: JS heap out of memory'});
+  await new Promise(resolve => setTimeout(resolve, 30));
+  const fullMarketTaskState = await win.webContents.executeJavaScript(`({
+    status:document.getElementById('fullMarketResearchStatus')?.textContent || '',
+    button:document.getElementById('startFullMarketResearch')?.textContent || '',
+    commandUsable:!document.getElementById('commandInput')?.disabled
+  })`);
   await win.webContents.executeJavaScript(`
     document.getElementById('commandInput').value = '中药';
     document.getElementById('generateBtn').click();
@@ -377,7 +395,7 @@ app.whenReady().then(async () => {
     }
   };
   const chartState = await win.webContents.executeJavaScript(`(async () => {
-    const periods = ['minute', 'five-day', 'day', 'week', 'month'];
+    const periods = ['minute', 'five-day', 'hour60', 'day', 'week', 'month'];
     const rendered = [];
     const features = [];
     for (const period of periods) {
@@ -866,6 +884,21 @@ app.whenReady().then(async () => {
       if(document.querySelector('.report-table')) break;
     }
     const initial = document.getElementById('stockContainer').innerText;
+    document.querySelector('[data-report-page="plan"]').click();
+    const planTab = getComputedStyle(document.querySelector('.report-plan-page')).display !== 'none'
+      && getComputedStyle(document.querySelector('.report-terms-page')).display === 'none'
+      && document.querySelector('.report-plan-page').innerText.includes('test-plan');
+    document.querySelector('[data-report-page="terms"]').click();
+    const termsTab = getComputedStyle(document.querySelector('.report-terms-page')).display !== 'none'
+      && getComputedStyle(document.querySelector('.report-plan-page')).display === 'none'
+      && document.querySelector('.report-terms-page').innerText.includes('track.B');
+    document.querySelector('[data-report-page="review"]').click();
+    document.querySelector('[data-report-episode-page="0"]:not([disabled])').click();
+    for(let index = 0; index < 30; index += 1){
+      await new Promise(resolve => setTimeout(resolve, 10));
+      if(document.querySelector('.report-episode-page')?.innerText.includes('event-1')) break;
+    }
+    const episodePage = document.querySelector('.report-episode-page')?.innerText.includes('event-1');
     const trackButton = document.querySelector('[data-report-track="momentum"]');
     if(!trackButton) return {initial,error:'momentum tab missing',html:document.getElementById('stockContainer').innerHTML,active:document.getElementById('reportView').classList.contains('active')};
     trackButton.click();
@@ -895,7 +928,7 @@ app.whenReady().then(async () => {
     await new Promise(resolve => setTimeout(resolve, 450));
     const survivesInFlightSearch = document.getElementById('reportView').classList.contains('active')
       && document.getElementById('stockContainer').innerText.includes('全局收盘报告');
-    return {initial,momentum,best,survivesPendingSearch,survivesInFlightSearch,active:document.getElementById('reportView').classList.contains('active'),hasBrowserButton:Boolean(document.getElementById('openReportBrowser')),warning:document.querySelector('.report-warnings')?.innerText || ''};
+    return {initial,planTab,termsTab,episodePage,momentum,best,survivesPendingSearch,survivesInFlightSearch,active:document.getElementById('reportView').classList.contains('active'),hasBrowserButton:Boolean(document.getElementById('openReportBrowser')),warning:document.querySelector('.report-warnings')?.innerText || ''};
   })()`);
   reportState.browserOpenCount = reportBrowserOpenCount;
   reportState.browserRequests = reportBrowserRequests;
@@ -921,11 +954,13 @@ app.whenReady().then(async () => {
     backToTopState: ${JSON.stringify(backToTopState)},
     focusAfterAdd: ${JSON.stringify(focusAfterAdd)},
     multiLabelState: ${JSON.stringify(multiLabelState)},
+    removedFavoriteEvents: ${JSON.stringify(savedUserState?.removedFavoriteEvents || [])},
     focusAfterDelete: ${JSON.stringify(focusAfterDelete)},
     detailState: ${JSON.stringify(detailState)},
     detailClickQuoteState: ${JSON.stringify(detailClickQuoteState)},
     detailRefreshState: ${JSON.stringify(detailRefreshState)},
     chartState: ${JSON.stringify(chartState)},
+    fullMarketTaskState: ${JSON.stringify(fullMarketTaskState)},
     labelModalState: ${JSON.stringify(labelModalState)},
     refreshedLabelText: ${JSON.stringify(refreshedLabelText)},
     refreshedLabelMetrics: ${JSON.stringify(refreshedLabelMetrics)},
@@ -987,13 +1022,13 @@ app.whenReady().then(async () => {
     && state.backToTopState.right === '22px'
     && state.backToTopState.bottom === '22px';
   const multiLabelUsable = state.multiLabelState.some(text => /半导体\s+1只/.test(text))
-    && state.multiLabelState.some(text => /医疗\s+1只/.test(text));
+    && state.multiLabelState.some(text => /医疗\s+1只/.test(text))
+    && state.removedFavoriteEvents.some(row => row.code && row.removedAt && row.favoriteEventId);
   const detailUsable = state.detailState.text.includes('所属行业：中药')
     && state.detailState.holdingPeriodTag === '短线'
     && state.detailState.text.includes('净流入166.62万')
-    && state.detailState.text.includes('主力流入3266.20万')
-    && state.detailState.text.includes('流出3099.58万')
-    && state.detailState.text.includes('腾讯逐笔成交汇总估算')
+    && state.detailState.text.includes('主力流入接口未提供')
+    && state.detailState.text.includes('流出接口未提供')
     && state.detailState.text.includes('近3个月累计上涨18.42%')
     && state.detailState.text.includes('未来3-10个交易日')
     && state.detailState.text.includes('离场 / 风控')
@@ -1015,7 +1050,7 @@ app.whenReady().then(async () => {
     && state.detailState.text.includes('20日均量1.5-4.0倍')
     && state.detailState.text.includes('收盘跌破8.00元')
     && state.detailState.text.includes('MA30 ¥6.42')
-    && state.detailState.text.includes('回踩低吸备选区间：¥6.11-¥6.25')
+    && state.detailState.text.includes('计划入场区间：¥6.11-¥6.25')
     && state.detailState.text.includes('第1档 ¥7.40 卖出30%')
     && state.detailState.text.includes('计划总仓位不超过30.0%')
     && state.detailState.text.includes('未来半年公司风险')
@@ -1153,9 +1188,10 @@ app.whenReady().then(async () => {
     && state.chartState.features[0]?.averageLine === 'true'
     && state.chartState.features[0]?.zeroLine === 'true'
     && /价格[\s\S]*成交均价[\s\S]*昨收 \/ 0%线/.test(state.chartState.features[0]?.legend || '')
-    && state.chartState.features.slice(2).every(item => /上涨K线[\s\S]*下跌K线[\s\S]*MA5 短线[\s\S]*MA30 中期趋势[\s\S]*MA60 中长期趋势/.test(item.legend))
+    && /上涨60分钟K[\s\S]*箱体上沿[\s\S]*箱体下沿[\s\S]*确认价[\s\S]*失效价/.test(state.chartState.features[2]?.legend || '')
+    && state.chartState.features.slice(3).every(item => /上涨K线[\s\S]*下跌K线[\s\S]*MA5 短线[\s\S]*MA30 中期趋势[\s\S]*MA60 中长期趋势/.test(item.legend))
     && state.chartState.features.slice(1).every(item => /收盘 ¥[\d.]+ · 涨跌 [+-]?[\d.]+%/.test(item.meta))
-    && JSON.stringify(state.chartState.tabs) === JSON.stringify(['分时', '五日', '日K', '周K', '月K'])
+    && JSON.stringify(state.chartState.tabs) === JSON.stringify(['分时', '五日', '60分钟', '日K', '周K', '月K'])
     && state.chartState.refresh.exists
     && state.chartState.refresh.text === '刷新'
     && state.chartState.refresh.disabled === false
@@ -1238,6 +1274,7 @@ app.whenReady().then(async () => {
     && state.tableScoreState.includes('消息确认')
     && !state.tableScoreState.includes('已突破');
   const reportUsable = state.reportState.active
+    && state.reportState.planTab && state.reportState.termsTab && state.reportState.episodePage
     && state.reportState.survivesPendingSearch
     && state.reportState.survivesInFlightSearch
     && state.reportState.hasBrowserButton
@@ -1246,6 +1283,11 @@ app.whenReady().then(async () => {
     && state.reportState.initial.includes('方案B测试')
     && state.reportState.initial.includes('推荐时价格')
     && state.reportState.initial.includes('当日收盘')
+    && state.reportState.initial.includes('手工收藏测试')
+    && state.reportState.initial.includes('重点收藏测试')
+    && state.reportState.initial.includes('触发观察')
+    && state.reportState.initial.includes('扣费收益')
+    && !state.reportState.initial.includes('排除重点关注和personal')
     && state.reportState.initial.includes('10.20')
     && state.reportState.momentum.includes('方案B测试')
     && !state.reportState.momentum.includes('方案A测试')
@@ -1255,7 +1297,7 @@ app.whenReady().then(async () => {
     && state.reportState.browserOpenCount === 2
     && state.reportState.browserRequests[1]?.revision === 0
     && state.reportState.generateCount === 1;
-  if (state.title !== '股票观察助手' || state.heading !== state.title || !state.hasApi || !state.stockContainer || state.statusFixed !== 'fixed' || state.focusAfterAdd !== 'searchInput' || state.focusAfterDelete !== 'searchInput' || !inputsUsable || !desktopLayoutUsable || !backToTopUsable || !multiLabelUsable || !detailUsable || !detailClickQuoteUsable || !marketUsable || !liveNewsUsable || !chartUsable || !simulationUsable || !labelModalUsable || !labelSortUsable || !labelRenameUsable || !favoriteChangeUsable || !labelListUsable || !reportUsable || errors.length) {
+  if (state.title !== '股票观察助手' || state.heading !== state.title || !state.hasApi || !state.stockContainer || state.statusFixed !== 'fixed' || state.focusAfterAdd !== 'searchInput' || state.focusAfterDelete !== 'searchInput' || !inputsUsable || !desktopLayoutUsable || !backToTopUsable || !multiLabelUsable || !detailUsable || !detailClickQuoteUsable || !marketUsable || !liveNewsUsable || !chartUsable || !simulationUsable || !labelModalUsable || !labelSortUsable || !labelRenameUsable || !favoriteChangeUsable || !labelListUsable || !reportUsable || !state.fullMarketTaskState.status.includes('ERR_WORKER_OUT_OF_MEMORY') || state.fullMarketTaskState.button !== '恢复任务' || !state.fullMarketTaskState.commandUsable || errors.length) {
     console.error(JSON.stringify({ state, checks: { inputsUsable, desktopLayoutUsable, backToTopUsable, multiLabelUsable, detailUsable, detailClickQuoteUsable, marketUsable, liveNewsUsable, chartUsable, simulationUsable, labelModalUsable, labelSortUsable, labelRenameUsable, favoriteChangeUsable, labelListUsable, reportUsable }, errors }, null, 2));
     app.exit(1);
     return;
