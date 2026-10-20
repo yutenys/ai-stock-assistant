@@ -458,7 +458,7 @@ function renderMarketOverview(result){
   if(Number.isFinite(Number(coverage.consolidationCandidates))) structureCounts.push(`横盘候选 ${coverage.consolidationCandidates} 只`);
   if(Number.isFinite(Number(coverage.fundFlowAvailable))) {
     const capitalDetail = Number.isFinite(Number(coverage.fundFlowDirect))
-      ? `（逐日明细 ${coverage.fundFlowDaily ?? Math.max(0,(coverage.fundFlowDirect || 0)-(coverage.fundFlowAggregate || 0))}，真实多日汇总 ${coverage.fundFlowAggregate || 0}，量价代理 ${coverage.fundFlowEstimated || 0}）` : '';
+      ? `（逐日完整 ${coverage.fundFlowDaily ?? Math.max(0,(coverage.fundFlowDirect || 0)-(coverage.fundFlowAggregate || 0))}，逐日部分 ${coverage.fundFlowPartial || 0}，真实多日汇总 ${coverage.fundFlowAggregate || 0}，量价代理 ${coverage.fundFlowEstimated || 0}）` : '';
     structureCounts.push(`阶段资金可用 ${coverage.fundFlowAvailable} 只${capitalDetail}`);
   }
   const accumulationCoverage = structureCounts.length ? `；${structureCounts.join('，')}` : '';
@@ -482,6 +482,12 @@ function renderMarketOverview(result){
   const rejectionSummary = Object.entries(coverage.outcomeGateFailures || {}).sort((a,b) => b[1]-a[1]).slice(0,4)
     .map(([reason,count]) => `${gateLabels[reason] || reason} ${count}`).join('、');
   if(rejectionSummary) $('marketRecommendationCoverage').textContent += `；当轮筛选首要未通过原因：${rejectionSummary}`;
+  if(coverage.planFunnel) {
+    const funnel=coverage.planFunnel;
+    const reasons=Object.entries(funnel.reasons || {}).sort((a,b)=>b[1]-a[1]).slice(0,2)
+      .map(([reason,count])=>`${reason} ${count}`).join('、');
+    $('marketRecommendationCoverage').textContent += `；展示计划 ${funnel.discovered}，数据可用 ${funnel.dataAvailable ?? '--'}，结构成立 ${funnel.structureEstablished ?? '--'}，价格可行 ${funnel.priceFeasible}，风险通过 ${funnel.riskPassed ?? '--'}，等待触发 ${funnel.armed}，历史触发 ${funnel.triggered}，当前许可 ${funnel.currentlyAllowed}，核验成交待独立确认${reasons ? `；未通过：${reasons}` : ''}`;
+  }
   if(coverage.noChaseBreakdown && coverage.outcomeGateFailures?.['no-chase']) {
     const hot = coverage.noChaseBreakdown;
     $('marketRecommendationCoverage').textContent += `（不宜追高条件可重叠：涨停${hot.limitUp}、涨幅过大${hot.change8}、RSI过热${hot.rsi80}、盘中量比过高${hot.quoteVolume}、日量爆量${hot.dailyVolume}）`;
@@ -1330,12 +1336,16 @@ function researchPortfolioHtml(){
     return `<div class="portfolio-trades research-account-summary"><h3>研究模拟账户</h3><div class="simulation-order research-account-create"><label>初始资金<input data-research-initial-cash type="number" min="10000" step="10000" value="1000000" /></label><button class="primary" data-create-research-account>创建研究账户</button></div></div>`;
   }
   const positions = researchAccount.positions || [];
-  const rows = positions.map(position => `<tr data-detail-code="${position.code}"><td><b>${escapeHtml(position.name)}</b><small>${position.code}</small></td><td>${escapeHtml(position.industry || '行业待确认')}</td><td>${position.quantity}股</td><td>${yuan(position.currentPrice)} / ${yuan(position.costPrice)}</td><td>${money(position.marketValue)}</td><td class="${pctClass(Number(position.marketValue || 0) - Number(position.costValue || 0))}">${money(Number(position.marketValue || 0) - Number(position.costValue || 0))}</td></tr>`).join('');
+  const rows = positions.map(position => {
+    const giveback=Number(position.peakObservedPrice) > 0 && Number(position.currentPrice) > 0
+      ? (Number(position.currentPrice)/Number(position.peakObservedPrice)-1)*100 : null;
+    return `<tr data-detail-code="${position.code}"><td><b>${escapeHtml(position.name)}</b><small>${position.code}</small></td><td>${escapeHtml(position.industry || '行业待确认')}</td><td>${position.quantity}股 / 可卖${position.availableQuantity ?? '--'}股</td><td>${yuan(position.currentPrice)} / ${yuan(position.costPrice)}</td><td>${money(position.marketValue)}</td><td class="${pctClass(Number(position.marketValue || 0) - Number(position.costValue || 0))}">${money(Number(position.marketValue || 0) - Number(position.costValue || 0))}</td><td class="${pctClass(giveback)}">${giveback === null ? '待跟踪' : formatPct(giveback)}</td></tr>`;
+  }).join('');
   const concentration = researchAccount.concentration?.byIndustry || [];
   return `<div class="portfolio-trades research-account-summary"><div class="simulation-title"><div><h3>研究模拟账户</h3><small>独立费用、T+1和成交拒绝记录；不改写原模拟持仓</small></div><span class="simulation-holding">${positions.length} 只持仓</span></div>
     <div class="portfolio-summary"><div><span>初始资金</span><b>${money(researchAccount.initialCash)}</b></div><div><span>可用现金</span><b>${money(researchAccount.cash)}</b></div><div><span>持仓市值</span><b>${money(researchAccount.marketValue)}</b></div><div><span>账户权益</span><b>${money(researchAccount.equity ?? researchAccount.cash)}</b></div><div><span>已实现收益</span><b class="${pctClass(researchAccount.realizedPnl)}">${money(researchAccount.realizedPnl)}</b></div></div>
     ${concentration.length ? `<div class="portfolio-concentration"><b>研究账户行业集中度</b>${concentration.slice(0,5).map(item => `<span>${escapeHtml(item.industry)} ${(item.weight * 100).toFixed(1)}%</span>`).join('')}</div>` : ''}
-    ${rows ? `<div class="table-wrap"><table><thead><tr><th>股票</th><th>行业</th><th>数量</th><th>现价 / 成本</th><th>市值</th><th>浮盈亏</th></tr></thead><tbody>${rows}</tbody></table></div>` : '<div class="portfolio-empty">研究账户暂无持仓，可从个股详情执行研究买入。</div>'}
+    ${rows ? `<div class="table-wrap"><table><thead><tr><th>股票</th><th>行业</th><th>持仓 / 可卖</th><th>现价 / 成本</th><th>市值</th><th>浮盈亏</th><th>跟踪后高点回吐</th></tr></thead><tbody>${rows}</tbody></table></div>` : '<div class="portfolio-empty">研究账户暂无持仓，可从个股详情执行研究买入。</div>'}
   </div>`;
 }
 
@@ -1520,7 +1530,10 @@ function renderDailyReportView(){
   const detail = value=>escapeHtml(value === null || value === undefined || value === '' ? '待核验'
     : typeof value === 'object' ? JSON.stringify(value) : value);
   const path = report.market?.path;
-  const anchors = Array.isArray(path) ? path : Object.entries(path?.anchors || {}).map(([label,row])=>({...row,label}));
+  const anchors = Array.isArray(path) ? path : [
+    ...(path?.peakBreadth ? [{...path.peakBreadth,label:'含竞价全天峰值'}] : []),
+    ...(path?.continuousPeakBreadth ? [{...path.continuousPeakBreadth,label:'连续交易峰值'}] : []),
+    ...Object.entries(path?.anchors || {}).map(([label,row])=>({...row,label}))];
   const pathRows = anchors.map(row=>`<tr><td>${detail(row.label)}</td><td>${detail(row.quoteObservedAt || row.fetchedAt)}</td><td>${detail(row.marketRegime?.label || row.state)}</td><td>${detail(row.breadth)}</td><td>${reportMoney(row.turnover)}</td><td>${detail(row.limits)}</td></tr>`).join('');
   const favoriteRows = (report.favorites?.rows || []).map(row=>`<tr><td>${detail(row.label)}</td><td>${detail(row.code)}</td><td>${detail(row.name)}</td><td>${detail(row.addedAt)}</td><td>${reportPrice(row.referencePrice)}</td><td>${reportPrice(row.currentPrice)}</td><td class="${pctClass(row.returnPct)}">${reportPct(row.returnPct)}</td><td>${detail(row.attribution)}</td><td>${detail(row.originalPlanStatus)}</td></tr>`).join('');
   const legacyAccount = report.portfolio?.legacy || {};
@@ -1533,6 +1546,15 @@ function renderDailyReportView(){
     const decisions = (report.strategyExperiments?.decisions || []).filter(row => row.id === id);
     return `<tr><td>${id}</td><td>${decisions.filter(row => row.status === 'pass').length}</td><td>${decisions.filter(row => row.status === 'fail').length}</td><td>${decisions.filter(row => row.status === 'unknown').length}</td></tr>`;
   }).join('');
+  const qualityReplayActive = (review.shadowReplay?.variants || []).some(row=>row.id === 'qualityBaseline');
+  const qualityShadowRows = ['Q1','Q2','Q3'].map(id => {
+    const decisions=(report.strategyExperiments?.decisions || []).filter(row=>row.id === id);
+    return `<tr><td>${id}</td><td>${decisions.filter(row=>row.status === 'pass').length}</td><td>${decisions.filter(row=>row.status === 'fail').length}</td><td>${decisions.filter(row=>row.status === 'unknown').length}</td></tr>`;
+  }).join('');
+  const qualityHtml = report.strategyExperiments?.qualityManifest
+    ? `<section class="report-section"><h3>每周质量影子实验</h3><p>Q1 买点排序、Q2 连续交易路径与板块联合降级、Q3 新入场与持仓退出分离；冻结版本 ${escapeHtml(report.strategyExperiments.qualityManifest.version)}，最早观察 ${escapeHtml(report.strategyExperiments.qualityManifest.firstTradeDate)}。${qualityReplayActive ? '独立同资金基线已接入。' : '尚未到前向回放起点。'}未成熟样本和证据未知不计成交，也不自动切换正式策略。</p><div class="table-wrap report-table-wrap"><table class="report-table"><thead><tr><th>实验</th><th>通过</th><th>拒绝</th><th>未知</th></tr></thead><tbody>${qualityShadowRows}</tbody></table></div></section>` : '';
+  const funnel = report.market?.planFunnel;
+  const funnelHtml = funnel ? `<section class="report-section"><h3>推荐计划漏斗</h3><p>展示计划 ${escapeHtml(funnel.discovered)}，数据可用 ${escapeHtml(funnel.dataAvailable ?? '--')}，结构成立 ${escapeHtml(funnel.structureEstablished ?? '--')}，价格可行 ${escapeHtml(funnel.priceFeasible)}，风险通过 ${escapeHtml(funnel.riskPassed ?? '--')}，等待触发 ${escapeHtml(funnel.armed)}，历史触发 ${escapeHtml(funnel.triggered)}，当前许可 ${escapeHtml(funnel.currentlyAllowed)}；核验成交以账户事实为准。未通过原因：${detail(funnel.reasons)}。</p></section>` : '';
   const forward = review.forwardValidation;
   const forwardHtml = forward ? `<p>前瞻验证：冻结后 ${forward.tradingDays}/${forward.requiredTradingDays} 个交易日；A ${forward.routes?.A?.mature || 0}/30，B ${forward.routes?.B?.mature || 0}/30 个成熟可成交episode。${escapeHtml(forward.reason)}；不会自动调权。</p>` : '';
   const performance = report.recommendations?.performance || {};
@@ -1549,8 +1571,10 @@ function renderDailyReportView(){
     <section class="report-section"><div class="report-section-head"><h3>推荐复盘</h3><div class="report-tabs"><button data-report-track="all" class="${reportRecommendationTrack === 'all' ? 'active' : ''}">全部</button><button data-report-track="stable" class="${reportRecommendationTrack === 'stable' ? 'active' : ''}">方案A</button><button data-report-track="momentum" class="${reportRecommendationTrack === 'momentum' ? 'active' : ''}">方案B</button><button data-report-track="best" class="${reportRecommendationTrack === 'best' ? 'active' : ''}">最佳10</button><button data-report-track="worst" class="${reportRecommendationTrack === 'worst' ? 'active' : ''}">最差10</button></div></div>${performanceHtml}<div class="table-wrap report-table-wrap"><table class="report-table"><thead><tr><th>代码</th><th>名称</th><th>板块</th><th>方案</th><th>角色</th><th>周期</th><th>信号时点</th><th>最早可买</th><th>最早可卖</th><th>推荐时价格</th><th>当时涨幅</th><th>当日收盘</th><th>收盘涨幅</th><th>推荐后表现</th><th>数据</th></tr></thead><tbody>${reportRecommendationRows(report)}</tbody></table></div></section>
     <section class="report-section"><h3>已发布推荐评价</h3><p>发布批次 ${review.counts?.publishedBatches || 0}，快照记录 ${review.counts?.publishedSignals || 0} 条，合并后 ${review.counts?.episodes || 0} 个观察episode；可观察 ${review.counts?.observations?.observed || 0}，未到期 ${review.counts?.observations?.immature || 0}，到期缺行情 ${review.counts?.observations?.missing || 0}；核验成交 ${review.counts?.execution?.executable || 0}，未成交 ${review.counts?.execution?.unfilled || 0}，证据不足 ${review.counts?.execution?.unverified || 0}。观察、触发与成交分别起算；开盘代理不是正式策略收益，缺失不填0。</p>${forwardHtml}<div class="table-wrap report-table-wrap"><table class="report-table"><thead><tr><th>窗口</th><th>发布样本</th><th>发布观察</th><th>触发样本</th><th>触发观察</th><th>开盘代理样本</th><th>代理观察</th><th>成交样本</th><th>扣费收益</th></tr></thead><tbody>${reviewRows || '<tr><td colspan="9">尚无成熟样本</td></tr>'}</tbody></table></div>${episodePageHtml}<p class="report-note">${escapeHtml(review.reason || `本地历史及已存报告收盘最新 ${review.historyLatestDate || '待核验'}；复权与公司行为仍需核验`)}</p></section>
     <section class="report-section"><h3>大盘状态路径</h3><div class="table-wrap report-table-wrap"><table class="report-table"><thead><tr><th>锚点</th><th>报价时点</th><th>状态</th><th>广度</th><th>成交额</th><th>涨跌停</th></tr></thead><tbody>${pathRows || '<tr><td colspan="6">盘中路径缺失，不用收盘数据补造。</td></tr>'}</tbody></table></div><p>${detail(report.market?.regime?.shadowPath)}</p></section>
+    ${funnelHtml}
     <section class="report-section report-plan-page"><h3>次日条件清单</h3><p>盘后条件不代表次日已触发；冻结价格及期限，T+1限制继续适用。</p><div class="table-wrap report-table-wrap"><table class="report-table"><thead><tr><th>代码</th><th>计划</th><th>许可</th><th>触发</th><th>失效</th><th>期限</th><th>最高入场价</th></tr></thead><tbody>${conditionRows || '<tr><td colspan="7">无冻结计划</td></tr>'}</tbody></table></div></section>
     <section class="report-section"><h3>同资金影子回放</h3><p>H1–H4 对照原基线；${themeReplayActive ? 'H5–H7 对照冻结日后同资金题材基线。' : 'H5–H7 尚未到前瞻回放起点。'}保守次日开盘模拟，不等于实际成交；证据与成熟样本不足时不自动升级策略。</p><div class="table-wrap report-table-wrap"><table class="report-table"><thead><tr><th>方案</th><th>模拟入场</th><th>未知</th><th>未成交</th><th>扣费净值收益</th><th>分路线验证</th></tr></thead><tbody>${shadowRows || '<tr><td colspan="6">尚未积累有效前瞻数据</td></tr>'}</tbody></table></div>${report.strategyExperiments?.themeManifest ? `<h4>H5–H7 前瞻证据采集</h4><p>冻结版本 ${escapeHtml(report.strategyExperiments.themeManifest.version)}，最早观察 ${escapeHtml(report.strategyExperiments.themeManifest.firstTradeDate)}。${themeReplayActive ? '影子回放已接入，未成熟或证据未知不计成交。' : '当前仅记录通过、拒绝与未知，尚未到回放起点。'}</p><div class="table-wrap report-table-wrap"><table class="report-table"><thead><tr><th>实验</th><th>通过</th><th>拒绝</th><th>未知</th></tr></thead><tbody>${themeShadowRows}</tbody></table></div>` : ''}</section>
+    ${qualityHtml}
     <section class="report-section"><h3>历史推荐跟踪</h3><p>原推荐日期见信号时点；表现为从原参考价至本日收盘的观察涨幅，不等于成交收益。</p><div class="table-wrap report-table-wrap"><table class="report-table"><thead><tr><th>代码</th><th>名称</th><th>板块</th><th>方案</th><th>角色</th><th>周期</th><th>原信号日期</th><th>最早可买</th><th>最早可卖</th><th>原参考价</th><th>原当时涨幅</th><th>本日收盘</th><th>本日涨幅</th><th>累计观察</th><th>数据</th></tr></thead><tbody>${reportRecommendationRows(report,report.recommendations?.followUp || [])}</tbody></table></div></section>
     <section class="report-section"><h3>板块轮动</h3>${sectors.length ? `<div class="report-sector-list">${sectors.map(item => `<div><b>${escapeHtml(item.name || '')}</b><span class="${pctClass(item.changePct)}">${reportPct(item.changePct)}</span><small>${escapeHtml(item.themeRegime?.state ? `双轨影子：${item.themeRegime.state}（${item.themeRegime.capital?.direction || '资金待核验'}）` : item.rotationPhase?.phase || item.rotationState || item.capitalTrend?.phase || '阶段待确认')} · 主力净额 ${reportMoney(item.mainNetInflow)}</small></div>`).join('')}</div>` : '<div class="report-note">板块历史快照缺失，未使用当前板块数据回填。</div>'}</section>
     <section class="report-section"><h3>收藏与账户</h3><p>全部收藏 ${report.favorites?.count || 0} 条，代码去重 ${report.favorites?.codeCount || 0} 只，有效 ${report.favorites?.validCount || 0} 条，代码等权平均 <b class="${pctClass(report.favorites?.averageReturnPct)}">${reportPct(report.favorites?.averageReturnPct)}</b>。多标签不重复增加敞口；当前收藏存在幸存者偏差，收藏表现不是实际成交收益。原始计划缺失 ${report.favorites?.missingOriginalCount || 0} 条；已移除事件 ${report.favoriteHistory?.removedCount || 0} 条。</p><div class="table-wrap report-table-wrap"><table class="report-table"><thead><tr><th>标签</th><th>代码</th><th>名称</th><th>加入时点</th><th>参考价</th><th>观察价</th><th>观察涨幅</th><th>归因</th><th>原计划</th></tr></thead><tbody>${favoriteRows || '<tr><td colspan="9">无收藏观察</td></tr>'}</tbody></table></div>${accountHtml}<p>${escapeHtml(report.portfolio?.unavailableReason || '')}</p></section>
@@ -2201,6 +2225,9 @@ function renderHistoryAnalysis(s, result){
   const capital = typeof s.mainNetInflow === 'number'
     ? `当前主力流入${metricValue(s.mainInflow, money)}、流出${metricValue(s.mainOutflow, money)}，${s.mainNetInflow >= 0 ? '净流入' : '净流出'}${money(Math.abs(s.mainNetInflow))}${typeof s.mainNetPct === 'number' ? `，净占比${formatPct(s.mainNetPct)}` : ''}。`
     : '当前主力资金接口未返回有效数据，不沿用历史资金值。';
+  const fundCoverage = result?.fundFlowPeriod?.coverage;
+  const fundCoverageHtml = fundCoverage ? `<p><b>逐日资金覆盖：</b>${escapeHtml(fundCoverage.status === 'complete' ? '同源窗口完整'
+    : fundCoverage.status === 'conflict' ? '存在未解决冲突' : fundCoverage.status === 'partial' ? '窗口部分可用' : '不可用')}；已核验 ${escapeHtml(fundCoverage.coveredDates?.length || 0)}/${escapeHtml(fundCoverage.expectedDates?.length || 0)} 日，缺失 ${escapeHtml(fundCoverage.missingDates?.length || 0)} 日。${fundCoverage.status === 'complete' ? '' : '缺口未补齐前不用于连续流入或吸筹确认。'}</p>` : '';
   const hasRecommendationScore = s.signalScore !== null && s.signalScore !== '' && Number.isFinite(Number(s.signalScore));
   const displayedScore = a.score;
   const scoreLabel = '当前技术评分 / 100';
@@ -2249,10 +2276,11 @@ function renderHistoryAnalysis(s, result){
   const tradePlanHtml = plan ? `<div class="trade-plan">
       <h4>条件化操作参考</h4>
       ${activePlan ? `<p><b>冻结推荐计划：</b>${escapeHtml(activePlan.planId)} · r${escapeHtml(activePlan.revision)} · ${escapeHtml({watch:'观察',armed:'等待触发',allowed:'已记录触发',blocked:'风险排除',expired:'已过期',completed:'已完成'}[activePlan.state] || '待核验')}；${escapeHtml(activePlan.reason || '')}。${activePlan.currentPermission !== 'allowed' ? '当前条件未通过，不授予入场许可。' : '触发记录不等于已成交；首次回踩5分钟条件仍属影子验证。'}</p>` : ''}
+      ${plan.feasibility?.status && plan.feasibility.status !== 'feasible' ? `<p><b>当前价格结构没有合格买点：</b>${escapeHtml(plan.feasibility.reason || '缺少可核验价格区间')}。</p>` : ''}
       <p><b>当前主路径：</b>${escapeHtml(plan.setupType || '待确认')}；预计成交价 ${yuan(plan.expectedEntryPrice)}；第一目标净盈亏比 ${plan.rewardRisk != null && Number.isFinite(Number(plan.rewardRisk)) ? formatNumber(plan.rewardRisk,2) : '待核验'}。${Number(plan.rewardRisk) >= 2 ? '达到研究观察门槛，仍需满足入场许可。' : '未达到2.0或目标未核验，不据此生成入场许可。'}</p>
       <p><b>计划入场区间：</b>${yuan(plan.entryLow)}-${yuan(plan.entryHigh)}；最高入场价 ${yuan(plan.maxEntryPrice)}。越价放弃，不随刷新抬高目标；第一目标依据 ${escapeHtml(plan.targetEvidence?.reason || '待核验')}。</p>
       <p><b>分批建仓：</b>${(plan.entrySteps || []).map((step, index) => `第${index + 1}笔${step.buyPct}%：${escapeHtml(step.condition)}`).join('；')}</p>
-      <p><b>确认价：</b>${yuan(plan.confirmationPrice)}。${activePlan?.confirmationTimeframe === '5-minute-completed' ? '完整5分钟K线越过冻结高点且守住支撑；首次回踩最早下一交易日确认，60分钟结构需在结构完成后确认。' : '突破采用收盘确认与同口径1.5-4倍量能；回踩按缩量承接路径独立核验。'}</p>
+      <p><b>确认价：</b>${yuan(plan.confirmationPrice)}。${activePlan?.confirmationTimeframe === '5-minute-completed' ? '形态形成后须有完整5分钟K线越过冻结高点且守住支撑；交易时间内满足条件可当日评估，60分钟结构需在结构完成后确认。' : '突破采用收盘确认与同口径1.5-4倍量能；回踩按缩量承接路径独立核验。'}</p>
       <p><b>研究观察期限：</b>最早买入 ${escapeHtml(activePlan?.earliestBuyDate || plan.earliestBuyDate || '待核验')}，若该日成交最早 ${escapeHtml(activePlan?.earliestSellDate || plan.earliestSellDate || '待核验')} 可卖；未在 ${escapeHtml(activePlan?.entryExpiryDate || plan.entryExpiryDate || '待核验')} 前触发则本计划失效。T+1期间触发风险也不能当日卖出。</p>
       <p><b>失效 / 压力退出：</b>结构失效 ${yuan(plan.invalidationPrice)}，隔夜与滑点压力退出 ${yuan(plan.stressExitPrice)}；估算双边成本和滑点 ${formatPct(plan.transactionCostPct)}。T+1期间不能假设触价即可卖出。</p>
       <p><b>分批止盈：</b>${(plan.targets || []).map((target, index) => `第${index + 1}档 ${yuan(target.price)} 卖出${target.sellPct}%`).join('；')}。</p>
@@ -2260,6 +2288,12 @@ function renderHistoryAnalysis(s, result){
       <p><b>仓位上限示例：</b>若账户单笔最大可承受损失限定为总资金1%，按当前止损距离反推，计划总仓位不超过${formatNumber(plan.maxPositionPct, 1)}%。</p>
       <p><b>计算依据：</b>${escapeHtml(plan.rationale || '')}。${activePlan ? '以上计划价格与期限保留原始冻结值，当前分析可变化，但不静默移动旧计划。' : '当前分析为动态参考，不代表已经建立或触发推荐计划。'}</p>
     </div>` : '';
+  const researchPosition = researchAccount?.positions?.find(position => position.code === s.code);
+  const manualPosition = portfolioPosition(s.code);
+  const researchGiveback = Number(researchPosition?.peakObservedPrice) > 0 && Number(researchPosition?.currentPrice) > 0
+    ? (Number(researchPosition.currentPrice)/Number(researchPosition.peakObservedPrice)-1)*100 : null;
+  const holdingConclusionHtml = researchPosition ? `<p><b>已有持仓（研究账户）：</b>成本 ${yuan(researchPosition.costPrice)}，持仓 ${escapeHtml(researchPosition.quantity)} 股、当前可卖 ${escapeHtml(researchPosition.availableQuantity ?? '待核验')} 股；浮盈亏 ${money(Number(researchPosition.marketValue || 0)-Number(researchPosition.costValue || 0))}。${researchGiveback === null ? '持仓后高点回吐待跟踪。' : `跟踪后高点 ${yuan(researchPosition.peakObservedPrice)}，回吐 ${formatPct(researchGiveback)}。`}${researchPosition.quoteStatus === 'fresh' ? '' : '当前估值非当日完整报价，处置需重新核验。'}新开仓结论不自动适用于旧仓。</p>`
+    : manualPosition?.quantity > 0 ? `<p><b>已有持仓（原模拟）：</b>成本 ${yuan(manualPosition.costPrice)}，持仓 ${escapeHtml(manualPosition.quantity)} 股，当前浮盈亏 ${money(portfolioMetrics(manualPosition).floatingPnl)}；原模拟账户未保存逐批可卖数量和完整持仓高点，不据此生成自动卖出结论。</p>` : '';
   analysisBox.innerHTML = `<b>股票分析：</b>${escapeHtml(`${conclusion}${capital}${marketContext}`)}`;
   box.innerHTML = `<h3>综合实时行情、资金、趋势、消息与大盘分析</h3>
     <div class="analysis-verdict">
@@ -2272,6 +2306,7 @@ function renderHistoryAnalysis(s, result){
     ${holdingProfileHtml}
     <div class="analysis-grid">
       ${entryAssessmentHtml}
+      ${holdingConclusionHtml}
       <p><b>趋势：</b>${escapeHtml(a.summary)}</p>
       <p><b>涨跌表现：</b>近5日 ${formatPct(a.return5)}；近20日 ${formatPct(a.return20)}；近60日 ${formatPct(a.return60)}</p>
       <p><b>均线综合：</b>${escapeHtml(a.maAlignment || '--')}；MA5 ${yuan(a.ma5)}；MA10 ${yuan(a.ma10)}；MA20 ${yuan(a.ma20)}；MA30 ${yuan(a.ma30)}；MA60 ${yuan(a.ma60)}；RSI14 ${formatNumber(a.rsi14)}</p>
@@ -2279,6 +2314,7 @@ function renderHistoryAnalysis(s, result){
       <p><b>布林带：</b>上轨 ${yuan(a.bollUpper)}；中轨 ${yuan(a.bollMiddle)}；下轨 ${yuan(a.bollLower)}</p>
       <p><b>当前放量：</b>${escapeHtml(a.volume)} 当前量比 ${formatNumber(a.volumeRatio)}。</p>
       <p><b>阶段主力资金：</b>${escapeHtml(a.capitalSetupAssessment?.summary || '阶段主力资金数据不可用，本次不据此调整评分。')}</p>
+      ${fundCoverageHtml}
       ${a.historicalOutcomeAssessment?.summary ? `<p><b>本地推荐复盘：</b>${escapeHtml(a.historicalOutcomeAssessment.summary)}</p>` : ''}
       <p><b>底部蓄势结构：</b>${escapeHtml(a.accumulationSetup?.summary || '历史行情不足，暂不能评估五线粘合与三次放量。')} ${a.capitalSetupAssessment?.status ? `<b>综合状态：</b>${escapeHtml(a.capitalSetupAssessment.status)}。` : ''}</p>
       ${breakoutHtml}

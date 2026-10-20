@@ -32,7 +32,26 @@ test('trimming intraday samples preserves earlier peak and available anchors',()
   }
   assert.equal(history[0].snapshots.length,96);
   assert.equal(history[0].peakBreadth.snapshotId,'early');
+  assert.equal(history[0].continuousPeakBreadth.snapshotId,'early');
   assert.equal(history[0].anchors['09:45'].snapshotId,'early');
+});
+
+test('auction breadth peak is separate from continuous trading peak',()=>{
+  const base={tradeDate:'2026-10-09',fetchedAt:'2026-10-09T01:25:00Z',
+    quoteObservedAt:'2026-10-09T01:25:00Z',breadth:{up:900,down:100,sampleCount:1000},
+    observationPhase:{phase:'intraday'}};
+  let history=api.updateMarketRotationHistory([],{...base,snapshotId:'auction'});
+  history=api.updateMarketRotationHistory(history,{...base,snapshotId:'open',
+    fetchedAt:'2026-10-09T01:45:00Z',quoteObservedAt:'2026-10-09T01:45:00Z',
+    breadth:{up:700,down:300,sampleCount:1000}});
+  const close={...base,snapshotId:'close',fetchedAt:'2026-10-09T07:01:00Z',
+    quoteObservedAt:'2026-10-09T07:00:00Z',breadth:{up:500,down:500,sampleCount:1000}};
+  history=api.updateMarketRotationHistory(history,close);
+  assert.equal(history[0].peakBreadth.snapshotId,'auction');
+  assert.equal(history[0].continuousPeakBreadth.snapshotId,'open');
+  const path=api.marketPathEvidence(close,history[0]);
+  assert.equal(path.peakBreadthDropPp,40);
+  assert.equal(path.continuousPeakBreadthDropPp,20);
 });
 
 test('capital source or members switching cannot claim a same-day fund retreat',()=>{

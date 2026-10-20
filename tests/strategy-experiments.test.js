@@ -38,6 +38,38 @@ const plan = () => signal().analysis.tradePlan;
 const replay = (signals, prices, extra = {}) => api.replayStrategyExperiments({manifest:manifest(),signals,prices,
   asOfDate:'2026-09-22',...extra});
 
+test('每周质量实验冻结后才采样，缺连续交易路径不能据集合竞价降级',()=>{
+  const quality=api.createWeeklyQualityManifest({frozenAt:'2026-09-10T10:00:00+08:00',modelVersion:'v26'});
+  assert.equal(quality.firstTradeDate,'2026-09-11');
+  assert.equal(quality.promotionAllowed,false);
+  const item={modelVersion:'v26',track:'B',planState:{feasibility:{status:'feasible'}},
+    momentumDecision:{firstPullback:true,noChase:false}};
+  const context={manifest:quality,tradeDate:'2026-09-14',cutoffAt:at('2026-09-14'),
+    marketRegime:{tradeDate:'2026-09-14',observedAt:at('2026-09-14'),
+      shadowPath:{peakBreadthDropPp:30,continuousPeakBreadthDropPp:2,
+        priorLimitUpPremium:{coverage:1,averageChangePct:-2}}},
+    sector:{tradeDate:'2026-09-14',observedAt:at('2026-09-14'),rotationIntraday:{retreating:true}}};
+  const decisions=api.evaluateWeeklyQualityShadow(item,context);
+  assert.deepEqual(decisions.map(row=>row.status),['pass','pass','pass']);
+  assert.equal(api.evaluateWeeklyQualityShadow(item,{...context,marketRegime:{...context.marketRegime,
+    shadowPath:{peakBreadthDropPp:30}}})[1].status,'unknown');
+  assert.equal(api.evaluateWeeklyQualityShadow(item,{...context,marketRegime:{...context.marketRegime,
+    shadowPath:{...context.marketRegime.shadowPath,continuousPeakBreadthDropPp:10}}})[1].status,'fail');
+  assert.deepEqual(api.evaluateWeeklyQualityShadow(item,{...context,tradeDate:'2026-09-10'}).map(row=>row.status),
+    ['unknown','unknown','unknown']);
+});
+
+test('每周质量回放有独立基线且未达到前瞻样本时保持 pending',()=>{
+  const quality=api.createWeeklyQualityManifest({frozenAt:'2026-09-10T10:00:00+08:00',modelVersion:'v26'});
+  const item=signal();
+  item.shadowExperiments=['Q1','Q2','Q3'].map(id=>({id,version:quality.version,status:'pass',reasons:['fixture']}));
+  const output=replay([item],[bar('2026-09-15'),bar('2026-09-16')],{qualityManifest:quality});
+  assert.deepEqual(output.variants.filter(row=>row.id.startsWith('Q')).map(row=>row.baselineId),
+    ['qualityBaseline','qualityBaseline','qualityBaseline']);
+  assert.equal(output.variants.find(row=>row.id==='Q1').validation.B.status,'pending');
+  assert.equal(output.variants.find(row=>row.id==='Q1').promotionAllowed,false);
+});
+
 test('manifest is deeply frozen, deterministic and rejects implicit transaction assumptions', () => {
   assert.equal(typeof api.createStrategyExperimentManifest,'function');
   const first = manifest();
@@ -60,7 +92,8 @@ test('filters are independent; unknown sector/date/coverage and cutoff never pas
   assert.equal(evaluate(item,{marketRegime:{...item.marketRegime,riskOff:true}})[1].status,'fail');
   assert.equal(evaluate(item,{marketRegime:{...item.marketRegime,breadthTrend:'明显走弱'}})[1].status,'fail');
   assert.equal(evaluate(item,{marketRegime:{...item.marketRegime,observedAt:undefined}})[1].status,'unknown');
-  assert.equal(evaluate(item,{marketRegime:{...item.marketRegime,shadowPath:{peakBreadthDropPp:10}}})[1].status,'fail');
+  assert.equal(evaluate(item,{marketRegime:{...item.marketRegime,shadowPath:{continuousPeakBreadthDropPp:10}}})[1].status,'fail');
+  assert.equal(evaluate(item,{marketRegime:{...item.marketRegime,shadowPath:{peakBreadthDropPp:10}}})[1].status,'unknown');
   assert.equal(evaluate(item,{marketRegime:{...item.marketRegime,shadowPath:{status:'unknown'}}})[1].status,'unknown');
   assert.equal(evaluate(item,{sector:{...item.sector,tradeDate:'2026-09-15'}})[2].status,'unknown');
   assert.equal(evaluate(item,{sector:{...item.sector,participation:{coverage:.2,memberCount:20}}})[2].status,'unknown');

@@ -63,6 +63,18 @@ test('研究账户按最新可用报价计算真实权益和集中度', () => {
   assert.ok(marked.concentration.byIndustry[0].weight > .5);
 });
 
+test('研究账户保留跟踪后价格峰值，过期行情不改写峰值且T+1可卖量独立',()=>{
+  let account=createResearchAccount({accountId:'peak',initialCash:100000,rules});
+  account=executeResearchOrder(account,{side:'buy',code:'600001',price:10,quantity:100,
+    tradeDate:'2026-09-14'}).account;
+  account=markResearchAccount(account,[{code:'600001',price:12,tradeDate:'2026-09-15'}],'2026-09-15');
+  assert.equal(account.positions[0].peakObservedPrice,12);
+  assert.equal(account.positions[0].availableQuantity,100);
+  account=markResearchAccount(account,[{code:'600001',price:11,tradeDate:'2026-09-16'}],'2026-09-16');
+  assert.equal(account.positions[0].peakObservedPrice,12);
+  assert.equal(account.positions[0].currentPrice,11);
+});
+
 test('研究账户部分行情缺失时保留上次有效估值并标记过期', () => {
   let account = createResearchAccount({accountId:'r-1', initialCash:100000, rules});
   account = executeResearchOrder(account, {side:'buy', code:'600001', price:10, quantity:5000, tradeDate:'2026-09-14'}).account;

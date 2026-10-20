@@ -57,6 +57,7 @@ const {
   updateMarketRotationHistory,
   favoriteRowsFromState,
   compactReportMarketPath,
+  compactMarketOverviewForCache,
   priorMarketRotationSnapshot,
   buildStrategyScoreCard,
   mergeSectorCapitalRows,
@@ -102,6 +103,7 @@ const {
   assessRecommendationTimingRisk,
   buildFutureRiskProfile,
   summarizeFundFlowRows,
+  applyExpectedFundFlowCoverage,
   estimateFundFlowFromHistory,
   fundFlowPeriodEvidence,
   outcomeStatsAdjustment,
@@ -376,7 +378,34 @@ test('逐日资金保留百分比单位并标记不足十日，汇总不丢弃�
   const retained = mergeFundFlowSnapshot(full,{tradeDate:'2026-09-10',mainNetInflow:100,mainNet5:500,mainNet10:1000,estimated:false},'2026-09-10');
   assert.equal(retained.positiveDays,10);
   assert.equal(retained.aggregateOnly,undefined);
+  const nextDay = mergeFundFlowSnapshot(full,{tradeDate:'2026-09-11',mainNetInflow:100,estimated:false},'2026-09-11');
+  assert.equal(nextDay.aggregateOnly,undefined);
+  assert.equal(nextDay.endDate,'2026-09-10');
   assert.equal(summarizeEastmoneyFundHistory(['bad','2026-09-09,-,0'],10).available,false);
+});
+
+test('逐日资金必须覆盖价格日历窗口才允许连续资金判断', () => {
+  const summary = summarizeEastmoneyFundHistory([
+    '2026-09-01,100,0,0,0,0,0.5',
+    '2026-09-03,100,0,0,0,0,0.5'
+  ],2);
+  const result = applyExpectedFundFlowCoverage('600001',summary,['2026-09-01','2026-09-02','2026-09-03'],'2026-09-03');
+  assert.equal(result.complete,false);
+  assert.equal(result.coverageStatus,'partial');
+  assert.deepEqual(result.coverage.missingDates,['2026-09-02']);
+  assert.match(fundFlowPeriodEvidence(result),/不用于连续流入判断/);
+  assert.equal(analyzeCapitalWindows(result,'2026-09-03').confirmed,false);
+
+  const shortHistory = summarizeEastmoneyFundHistory([
+    '2026-09-01,100,0,0,0,0,0.5',
+    '2026-09-02,100,0,0,0,0,0.5'
+  ],10);
+  const shortResult = applyExpectedFundFlowCoverage('600001',shortHistory,
+    ['2026-09-01','2026-09-02'],'2026-09-02');
+  assert.equal(shortResult.complete,false);
+  assert.equal(shortResult.coverageStatus,'partial');
+  assert.equal(shortResult.coverage.insufficientHistory,true);
+  assert.match(shortResult.fallbackReason,/样本仅2\/10日/);
 });
 
 test('数据中心区分无记录与业务错误，查询失败不能当作无风险',()=>{
@@ -589,6 +618,16 @@ test('新浪股数转换为手后与实时报价合并，量比和资金估算�
   assert.equal(analyzeHistory(merged).volumeRatio,1.5);
   assert.equal(estimateFundFlowFromHistory(normalized,10).rows[0].amount,1000000);
   assert.equal(normalizeSinaHistoryRows([{...rows[0],volume:null}])[0].volume,null);
+});
+
+test('盘中累计量不能当作完整日量确认放量或缩量', () => {
+  const rows = Array.from({length:65}, (_, index) => ({date:new Date(Date.UTC(2026,5,index+1)).toISOString().slice(0,10),
+    open:10,close:10,high:10.5,low:9.5,volume:index === 64 ? 60 : 1000}));
+  const analysis=analyzeHistory(rows,{observationPhase:{phase:'intraday',tradeDate:rows.at(-1).date}});
+  assert.equal(analysis.volumeRatio,null);
+  assert.equal(analysis.intradayCumulativeVolumeRatio,.06);
+  assert.match(analysis.volume,/不能据此判定缩量/);
+  assert.equal(analysis.tradePlan.enabled,false);
 });
 
 test('真实当日流出阻止估算资金误判入场，过期当日资金不能用于确认', () => {
@@ -859,8 +898,10 @@ test('新上市异常涨幅不冒充成熟板块普涨或强势扩散',()=>{
 });
 
 test('大盘状态记录上涨广度相对前一快照明显走弱',()=>{
-  const previous={breadth:{up:3500,down:1800},indices:[{changePct:.5}]};
-  const current=classifyMarketRegime({breadth:{up:2500,down:2800},indices:[{changePct:0}]},previous);
+  const previous={snapshotId:'before',quoteObservedAt:'2026-10-19T10:00:00+08:00',
+    breadth:{up:3500,down:1800},indices:[{changePct:.5}]};
+  const current=classifyMarketRegime({snapshotId:'after',quoteObservedAt:'2026-10-19T10:05:00+08:00',
+    breadth:{up:2500,down:2800},indices:[{changePct:0}]},previous);
   assert.ok(current.upRatioDelta < -.1);
   assert.equal(current.breadthTrend,'明显走弱');
   assert.match(current.evidence.join('；'),/上涨广度较前次/);
@@ -1226,6 +1267,29 @@ test('大盘消息备用搜索使用已定义关键词', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
   const body = source.slice(source.indexOf('async function fetchMarketNews'), source.indexOf('async function fetchLiveNews'));
   assert.match(body, /const keyword = 'A股 大盘 板块 资金 今日 最新消息';/);
+});
+
+test('全市场任务旧线程回调不能清空或终止恢复后的新线程', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const body = source.slice(source.indexOf('function startFullMarketResearch'), source.indexOf("app.on('before-quit'"));
+  assert.match(body, /const worker = new Worker\(__filename/);
+  assert.match(body, /if \(fullMarketWorker !== worker\) return;/);
+  assert.match(body, /worker\.terminate\(\);/);
+  assert.doesNotMatch(body, /fullMarketWorker\?\.terminate\(\)/);
+});
+
+test('主动取消全市场任务先解绑线程，不能记录为异常退出', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const start = source.indexOf("ipcMain.handle('cancel-full-market-research'");
+  const body = source.slice(start, source.indexOf('let reportStoreInstance', start));
+  assert.match(body, /const worker = fullMarketWorker;\s*fullMarketWorker = null;\s*if \(worker\) await worker\.terminate\(\);/);
+});
+
+test('应用退出时先解绑全市场线程，不能写入伪异常', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const start = source.indexOf("app.on('before-quit'");
+  const body = source.slice(start, source.indexOf("ipcMain.handle('fetch-market-overview'", start));
+  assert.match(body, /const worker = fullMarketWorker;\s*fullMarketWorker = null;\s*worker\?\.terminate\(\);/);
 });
 
 test('单股行情解析保留估值、换手和盘口指标', () => {
@@ -1789,7 +1853,12 @@ test('近三个月行情返回技术分析和观察窗口', { timeout: 60000 }, 
   assert.ok(plan.targets[0].price < plan.targets[1].price && plan.targets[1].price < plan.targets[2].price);
   assert.ok(plan.maxPositionPct > 0 && plan.maxPositionPct <= 30);
   assert.equal(typeof result.analysis.score, 'number');
-  assert.equal(typeof result.analysis.volumeRatio, 'number');
+  if (result.analysis.observationPhase?.phase === 'intraday') {
+    assert.equal(result.analysis.volumeRatio, null);
+    assert.equal(typeof result.analysis.intradayCumulativeVolumeRatio, 'number');
+  } else {
+    assert.equal(typeof result.analysis.volumeRatio, 'number');
+  }
   assert.ok(result.analysis.breakoutPrice > 0);
   assert.ok(result.analysis.supportPrice > 0);
   assert.ok(result.analysis.latestTradeDate);
@@ -1881,6 +1950,33 @@ test('市场历史保留盘中路径和最终快照，重复缓存不形成新�
   assert.equal(rows[0].anchors.close.snapshotId,'close');
   const regime=classifyMarketRegime(close,rows[0].snapshots[0]);
   assert.ok(Math.abs(regime.upRatioDelta - (1697-4300)/5445)<1e-8);
+});
+
+test('大盘缓存只保留可复用板块证据，历史路径保留跨日题材轮次', () => {
+  const themeRegime={themeId:'BK1',name:'电池',boardType:'industry',tradeDate:'2026-10-09',
+    memberRevision:'revision-1',episodeId:'episode-1',runTradingDays:2,missingDates:0,
+    phase:'扩散试探',capital:{source:'fixture',netInflow:100,observedAt:'2026-10-09T07:00:00Z'}};
+  const sector={name:'电池',code:'BK1',boardType:'industry',memberCodes:['600001','600002'],
+    changes:Array(1000).fill(1),amounts:Array(1000).fill(100),themeRegime,
+    mainNetInflow:100,mainNetPct:2,capitalSource:'fixture',capitalEstimated:false,
+    capitalTradeDate:'2026-10-09',capitalObservedAt:'2026-10-09T07:00:00Z',
+    memberSignature:'revision-1',participation:{coverage:1,divergent:false}};
+  const overview={tradeDate:'2026-10-09',fetchedAt:'2026-10-09T07:01:00Z',
+    observationPhase:{phase:'closed'},sectors:[sector],fundSectors:[sector],weakSectors:[sector],
+    recommendations:[{code:'600001'}],planTrackingCandidates:[{code:'600002',history:Array(1000).fill(1)}],
+    marketPath:{snapshots:[{snapshotId:'s1',tradeDate:'2026-10-09',sectors:Array(1000).fill(sector),
+      breadth:{up:2,down:1}}],anchors:{},peakBreadth:null}};
+  const compact=compactMarketOverviewForCache(overview);
+  assert.equal(compact.sectors[0].changes,undefined);
+  assert.deepEqual(compact.sectors[0].memberCodes,['600001','600002']);
+  assert.equal(compact.sectors[0].themeRegime.episodeId,'episode-1');
+  assert.equal(compact.planTrackingCandidates,undefined);
+  assert.equal(compact.marketPath.snapshots[0].sectors,undefined);
+  assert.equal(overview.sectors[0].changes.length,1000);
+  assert.ok(JSON.stringify(compact).length < 5000);
+  const history=updateMarketRotationHistory([],overview);
+  assert.equal(history[0].sectors[0].themeRegime.episodeId,'episode-1');
+  assert.equal(history[0].sectors[0].themeRegime.tradeDate,'2026-10-09');
 });
 
 test('个股走势返回分时五日60分钟及日周月周期', { timeout: 60000 }, async () => {
@@ -2061,7 +2157,7 @@ test('新浪新版阶段资金净额按元处理且缺失买卖分项时不伪�
   assert.equal(result.mainOutflow, null);
   assert.equal(result.grossFlowsAvailable, false);
   assert.ok(Math.abs(result.mainNetInflow - -15_257_263.46) < .01);
-  assert.ok(result.netRatio < 0);
+  assert.ok(Math.abs(result.netRatio - -2.707166) < .000001);
 });
 
 test('识别底部五线粘合后三次温和放量并开始多头发散', () => {

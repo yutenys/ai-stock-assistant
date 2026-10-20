@@ -39,6 +39,18 @@ test('实际大盘路径对象和影子决策能渲染，缺失锚点不补造',
   assert.doesNotMatch(html,/14:30/);
 });
 
+test('收盘报告对无可行买点只列观察条件，不伪装次日触发',()=>{
+  const report=buildDailyReport({tradeDate:'2026-10-09',stable:[{code:'600001',entryPermission:'watch',
+    tradePlan:{feasibility:{status:'empty',reason:'确认价高于最高入场价'},confirmationPrice:11,
+      maxEntryPrice:10}}],market:{planFunnel:{discovered:1,dataAvailable:1,structureEstablished:1,
+        priceFeasible:0,riskPassed:0,armed:0,
+        triggered:0,currentlyAllowed:0,reasons:{'确认价高于最高入场价':1}}}});
+  assert.match(report.nextDayConditions[0].trigger,/当前无合格买点/);
+  const html=renderDailyReportHtml(report);
+  assert.match(html,/推荐计划漏斗/);
+  assert.match(html,/数据可用 1，结构成立 1，价格可行 0，风险通过 0/);
+});
+
 test('超大旧报告按结构化路径跳过重复时间点和episode明细', async t => {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'large-report-'));
   t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
@@ -165,6 +177,12 @@ test('推荐角色要求对应证据且破位优先拒绝', () => {
   assert.equal(classifyRecommendationRole({analysis:{breakoutConfirmed:true,firstPullback:true,volumeRatio:.8}, capital:{mainNetInflow:100}}).primaryRole, '首次回踩');
   assert.equal(classifyRecommendationRole({analysis:{boxStable:true,volumeCompressed:true}, capital:{mainNetInflow:100}}).primaryRole, '吸筹/洗盘观察');
   assert.equal(classifyRecommendationRole({analysis:{boxStable:false}, capital:{available:false}}).primaryRole, '趋势观察');
+  assert.equal(classifyRecommendationRole({analysis:{supportIntact:true},capital:{mainNetInflow:100},
+    distanceToResistancePct:5}).primaryRole,'趋势观察');
+  assert.equal(classifyRecommendationRole({analysis:{supportIntact:true},capital:{mainNetInflow:100},
+    distanceToResistancePct:5,relativeStrength:75,sectorRelative:{comparable:true,sectorChangePct:3,stockChangePct:1}}).primaryRole,'健康滞涨');
+  assert.equal(classifyRecommendationRole({analysis:{supportIntact:true},capital:{mainNetInflow:100},
+    distanceToResistancePct:5,relativeStrength:75,sectorRelative:{comparable:true,sectorChangePct:3,stockChangePct:-2}}).primaryRole,'趋势观察');
 });
 
 test('每日报告保留A/B重叠但全局去重并披露缺失数据', () => {
