@@ -283,14 +283,15 @@ test('新版模拟交易不再静默截断500条历史记录',()=>{
 test('推荐结果严格、观察、强势三池互斥且不截断',()=>{
   const context=harness(['marketRecommendationPools']);
   const stable=[
-    {code:'1',recommendationTier:'严格推荐'},
-    {code:'2',recommendationTier:'观察候选'},
-    {code:'3',recommendationTier:'环境观察'}
+    {code:'1',recommendationTier:'严格推荐',planState:{currentPermission:'allowed'}},
+    {code:'2',recommendationTier:'观察候选',planState:{currentPermission:'watch'}},
+    {code:'3',recommendationTier:'环境观察',planState:{currentPermission:'blocked'}},
+    {code:'5',recommendationTier:'严格推荐',planState:{currentPermission:'armed'}}
   ];
   const momentum=[{code:'4',recommendationTier:'强势追踪'}];
   const pools=context.marketRecommendationPools(stable,momentum);
   assert.deepEqual(pools.strict.map(item=>item.code),['1']);
-  assert.deepEqual(pools.watch.map(item=>item.code),['2','3']);
+  assert.deepEqual(pools.watch.map(item=>item.code),['2','3','5']);
   assert.equal(pools.momentum.map(item=>item.code).join(','),'4');
 });
 

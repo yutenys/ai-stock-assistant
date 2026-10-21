@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const {advanceEntryPlan,planFeasibility,summarizeEntryPlans} = require('../lib/entry-plans');
+const {advanceEntryPlan,planFeasibility,summarizeEntryPlans,summarizeRecommendationPermissions} = require('../lib/entry-plans');
 
 const input = () => ({code:'600001',track:'B',modelVersion:'test',tradeDate:'2026-10-08',cutoffAt:'2026-10-08T15:01:00+08:00',
   analysis:{tradeDate:'2026-10-08',firstPullback:true,supportPrice:9,breakoutContext:{breakoutLevel:9},
@@ -62,6 +62,18 @@ test('计划漏斗区分历史触发、当前许可和未核验成交',()=>{
   assert.equal(summary.currentlyAllowed,0);
   assert.equal(summary.verifiedFills,null);
   assert.ok(Object.keys(summary.reasons).length >= 1);
+});
+
+test('严格推荐数量只由当前计划许可决定',()=>{
+  const summary=summarizeRecommendationPermissions([
+    {planState:{currentPermission:'allowed'}},
+    {planState:{currentPermission:'armed'}},
+    {planState:{currentPermission:'watch'}},
+    {planState:{currentPermission:'blocked'}},
+    {recommendationTier:'严格推荐'}
+  ]);
+  assert.deepEqual(summary,{discovered:5,strictQualified:1,watchQualified:4,armedQualified:1,
+    blockedQualified:1,expiredQualified:0,currentPermissions:{allowed:1,armed:1,watch:2,blocked:1,expired:0}});
 });
 
 test('触发后的旧许可在价格失效时撤销，历史触发仍可审计',()=>{

@@ -328,9 +328,11 @@ function recommendationConcentrationText(items){
 }
 
 function marketRecommendationPools(stable = [], momentum = []){
+  const permission = item => item.planState?.currentPermission || item.entryPermission
+    || item.strategyDecision?.entryPermission || 'watch';
   return {
-    strict:stable.filter(item => !['观察候选','环境观察'].includes(item.recommendationTier)),
-    watch:stable.filter(item => ['观察候选','环境观察'].includes(item.recommendationTier)),
+    strict:stable.filter(item => permission(item) === 'allowed'),
+    watch:stable.filter(item => permission(item) !== 'allowed'),
     momentum:[...momentum]
   };
 }
@@ -635,7 +637,7 @@ function badgeClass(v){
   return 'b-gray';
 }
 
-function stockTagValues(stock){
+function stockTagValues(stock = {}){
   const values = stock.marketSignal
     ? [stock.marketSignal, stock.newsLabel || stock.focus]
     : [stock.type, stock.status, stock.focus];
@@ -2246,7 +2248,14 @@ function renderHistoryAnalysis(s, result){
     ? `<p><b>大盘推荐快照：</b>${escapeHtml(s.signal || s.marketSignal || '待确认')}，推荐评分 ${escapeHtml(Math.round(Number(s.signalScore)))} / 100，推荐时判断 ${escapeHtml(s.verdict || '等待确认')}。该评分保留用于推荐列表排序，不替代本次个股技术评分。</p>`
     : '';
   const marketContext = stockMarketContext(s);
-  const themeRegimeHtml = s.themeRegimes?.length ? `<p><b>题材双轨（影子观察）：</b>${s.themeRegimes.map(row => `${escapeHtml(row.name)}：${escapeHtml(row.state)}，资金${escapeHtml(row.capital?.direction || '待核验')}`).join('；')}。不改变下方冻结计划与当前许可。</p>` : '';
+  const activePlan = a.activePlan || s.planState;
+  const permission = activePlan?.currentPermission || s.entryPermission || s.strategyDecision?.entryPermission || 'watch';
+  const permissionConfidence = permission === 'allowed' ? '高（当前条件已核验）'
+    : permission === 'armed' && activePlan?.feasibility?.status === 'feasible' ? '中（等待最后触发）'
+      : activePlan?.feasibility?.status === 'unknown' ? '低（关键数据缺失）' : '中低（仅观察）';
+  const concepts = (s.themeRegimes || []).filter(row=>row.boardType === 'concept').map(row=>row.name);
+  const catalysts = (s.themeRegimes || []).flatMap(row=>row.catalystEvidence || []);
+  const themeRegimeHtml = `<p><b>行业 / 概念 / 当日催化 / 当前许可：</b>${escapeHtml(s.industry || s.companyProfile?.industry || '行业待确认')}；概念 ${escapeHtml(concepts.join('、') || '待核验')}；催化 ${escapeHtml(catalysts.map(item=>item.title).filter(Boolean).join('、') || '无可核验当日催化')}；许可 ${escapeHtml({allowed:'允许评估成交',armed:'等待触发',watch:'观察',blocked:'风险阻止',expired:'计划过期'}[permission] || '观察')}，置信度 ${escapeHtml(permissionConfidence)}。</p>${s.themeRegimes?.length ? `<p><b>主题证据：</b>${s.themeRegimes.map(row => `${escapeHtml(row.name)}：${escapeHtml(row.state)}，资金${escapeHtml(row.capital?.direction || '待核验')}，连续核验${row.consecutiveVerifiedDays ?? '未知'}日`).join('；')}。行业、概念与催化分层记录，不改变冻结计划。</p>` : ''}`;
   const corporateRisk = result?.riskProfile;
   const reductionText = corporateRisk?.reduction?.status === 'risk'
     ? corporateRisk.reduction.events.map(event => `${event.startDate}至${event.endDate}${event.estimated ? '（估算）' : ''}`).join('、')
@@ -2256,7 +2265,6 @@ function renderHistoryAnalysis(s, result){
     : corporateRisk?.unlock?.status === 'clear' ? '未发现安排' : '未确认';
   const corporateRiskHtml = corporateRisk ? `<p class="corporate-risk"><b>未来半年公司风险：</b>${escapeHtml(corporateRisk.summary || '未确认')}；ST：${escapeHtml(corporateRisk.st?.status === 'risk' ? '有当前标记' : '无当前标记')}；减持：${escapeHtml(reductionText)}；解禁：${escapeHtml(unlockText)}。<br><b>核验窗口：</b>${escapeHtml(corporateRisk.windowStart || '--')} 至 ${escapeHtml(corporateRisk.windowEnd || '--')}；<b>数据源：</b>${escapeHtml(corporateRisk.source || '公开公司公告与限售解禁数据')}</p>`
     : '<p class="corporate-risk"><b>未来半年公司风险：</b>未确认。</p>';
-  const activePlan = a.activePlan || s.planState;
   const intradayPlan = a.intradayPlan || s.intradayPlanState;
   const intradayStructure = a.intradayStructure || s.intradayStructure;
   const intradayHtml = intradayStructure || intradayPlan ? `<p><b>60分钟结构回踩（影子研究）：</b>${escapeHtml({watch:'箱体观察',departed:'离开箱体', 'retest-confirmed':'回踩已确认',invalid:'结构失效',expired:'结构过期',unknown:'数据待核验'}[intradayStructure?.state] || '本轮数据待核验')}；箱体 ${yuan(intradayStructure?.boxLower ?? intradayPlan?.tradePlan?.boxLower)}-${yuan(intradayStructure?.boxUpper ?? intradayPlan?.tradePlan?.boxUpper)}，确认价 ${yuan(intradayPlan?.tradePlan?.confirmationPrice || intradayStructure?.confirmationPrice)}，失效价 ${yuan(intradayPlan?.tradePlan?.invalidationPrice || intradayStructure?.invalidationPrice)}。${intradayPlan?.currentPermission === 'allowed' ? '5分钟触发已记录，仍须核验最新报价、风险与可成交条件。' : `当前不授予入场许可：${escapeHtml(intradayPlan?.reason || '缺少完整结构或后续5分钟触发证据')}`} ${intradayPlan?.earliestSellDate ? `若本日实际买入，最早可卖日 ${escapeHtml(intradayPlan.earliestSellDate)}。` : ''}</p>` : '';

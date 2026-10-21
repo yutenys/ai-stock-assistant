@@ -456,6 +456,7 @@ app.whenReady().then(async () => {
   const marketBatchLabelState = await win.webContents.executeJavaScript(`(() => {
     const changeState = selector => [...document.querySelectorAll(selector)].map(node => ({ text:node.textContent.trim(), color:getComputedStyle(node).color }));
     const stablePanel = document.getElementById('marketStablePanel');
+    const watchPanel = document.getElementById('marketWatchPanel');
     const momentumPanel = document.getElementById('marketMomentumPanel');
     const initialTrack = !stablePanel.classList.contains('hidden') && momentumPanel.classList.contains('hidden');
     document.getElementById('marketMomentumTab').click();
@@ -472,10 +473,11 @@ app.whenReady().then(async () => {
     document.getElementById('saveMarketRecommendations').click();
     const momentumSavedCodes = (JSON.parse(localStorage.getItem('ai-stock-assistant-state-v1') || '{}').labels || [])
       .find(label => label.name === '强势追踪收藏')?.stocks?.map(stock => stock.code) || [];
-    document.getElementById('marketStableTab').click();
-    const stableRestored = !stablePanel.classList.contains('hidden') && momentumPanel.classList.contains('hidden');
-    const marketChanges = changeState('#marketRecommendations .market-current-change');
-    document.getElementById('addMarketRecommendations').click();
+    document.getElementById('marketWatchTab').click();
+    const watchRestored = stablePanel.classList.contains('hidden') && !watchPanel.classList.contains('hidden')
+      && momentumPanel.classList.contains('hidden');
+    const marketChanges = changeState('#marketWatchRecommendations .market-current-change');
+    document.getElementById('addMarketWatchRecommendations').click();
     const stockChoices = [...document.querySelectorAll('[data-market-stock-choice]')];
     const firstChoiceText = stockChoices[0]?.closest('.market-stock-choice')?.innerText || '';
     const labelsAboveStocks = Boolean(document.getElementById('marketLabelChoices').compareDocumentPosition(document.getElementById('marketStockChoices')) & Node.DOCUMENT_POSITION_FOLLOWING);
@@ -490,7 +492,7 @@ app.whenReady().then(async () => {
     const firstHeadLayout = firstHead ? { flexWrap:getComputedStyle(firstHead).flexWrap, whiteSpace:getComputedStyle(firstHead).whiteSpace, alignItems:getComputedStyle(firstHead).alignItems, headCenter:firstHead.getBoundingClientRect().top + firstHead.getBoundingClientRect().height / 2, priceCenter:firstPrice.getBoundingClientRect().top + firstPrice.getBoundingClientRect().height / 2 } : {};
     const stockHeads = [...document.querySelectorAll('#marketStockChoices .market-stock-head')];
     const allHeadsFit = stockHeads.every(head => head.scrollWidth <= head.clientWidth + 1);
-    const mainChangesWithinCards = [...document.querySelectorAll('#marketRecommendations .market-current-change')].every(node => node.getBoundingClientRect().right <= node.closest('.market-recommendation').getBoundingClientRect().right - 8);
+    const mainChangesWithinCards = [...document.querySelectorAll('#marketWatchRecommendations .market-current-change')].every(node => node.getBoundingClientRect().right <= node.closest('.market-recommendation').getBoundingClientRect().right - 8);
     const longName = [...document.querySelectorAll('#marketStockChoices .market-stock-name')].find(node => node.textContent === '北方稀土股份');
     const longNameFullyVisible = Boolean(longName) && longName.scrollWidth <= longName.clientWidth + 1 && getComputedStyle(longName).textOverflow !== 'ellipsis';
     const coloredCount = getComputedStyle(document.querySelector('.market-label-count')).color;
@@ -507,7 +509,7 @@ app.whenReady().then(async () => {
     document.querySelector('[data-market-recommendation="600200"]').click();
     const breakoutDetailTags = [...document.querySelectorAll('#detailPanel .detail-tags .badge')].map(node => node.textContent.trim());
     document.querySelector('[data-market-recommendation="603567"]').click();
-    return { initialTrack, momentumTrack, momentumModal, momentumSavedCodes, stableRestored, choiceCount:stockChoices.length, firstChoiceText, labelsAboveStocks, recommendationTitle, groupNames, groupOrders, hasIndividualIndustryTag, firstPriceText, marketChanges, choiceChanges, firstHeadLayout, allHeadsFit, mainChangesWithinCards, longNameFullyVisible, coloredCount, initialAll, afterClear, savedCount:label?.stocks?.length || 0, savedScore:savedStock?.score, savedSignalScore:savedStock?.signalScore, savedBreakoutTags:stockTagValues(savedBreakout), breakoutDetailTags, closed:document.getElementById('marketLabelPanel').classList.contains('hidden') };
+    return { initialTrack, momentumTrack, momentumModal, momentumSavedCodes, watchRestored, choiceCount:stockChoices.length, firstChoiceText, labelsAboveStocks, recommendationTitle, groupNames, groupOrders, hasIndividualIndustryTag, firstPriceText, marketChanges, choiceChanges, firstHeadLayout, allHeadsFit, mainChangesWithinCards, longNameFullyVisible, coloredCount, initialAll, afterClear, savedCount:label?.stocks?.length || 0, savedScore:savedStock?.score, savedSignalScore:savedStock?.signalScore, savedBreakoutTags:stockTagValues(savedBreakout), breakoutDetailTags, closed:document.getElementById('marketLabelPanel').classList.contains('hidden') };
   })()`);
   await win.webContents.executeJavaScript(`
     window.scrollTo(0, document.body.scrollHeight);
@@ -1101,7 +1103,7 @@ app.whenReady().then(async () => {
     && state.marketText.includes('资金截至2026-08-12')
     && state.marketText.includes('有效成分2只，上涨2只，小样本')
     && state.marketBatchLabelState.initialAll && state.marketBatchLabelState.afterClear
-    && state.marketBatchLabelState.initialTrack && state.marketBatchLabelState.momentumTrack && state.marketBatchLabelState.stableRestored
+    && state.marketBatchLabelState.initialTrack && state.marketBatchLabelState.momentumTrack && state.marketBatchLabelState.watchRestored
     && state.marketBatchLabelState.momentumModal.count === 1
     && JSON.stringify(state.marketBatchLabelState.momentumModal.codes) === JSON.stringify(['603151'])
     && JSON.stringify(state.marketBatchLabelState.momentumSavedCodes) === JSON.stringify(['603151'])

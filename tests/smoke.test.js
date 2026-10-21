@@ -716,6 +716,23 @@ test('板块成分覆盖同时预留行业和概念，重复名称不占据名�
   assert.equal(new Set(chosen.map(row=>row.name)).size,6);
 });
 
+test('板块成员预算按金额质量关注10比6比4分配且总量不增加', () => {
+  const make=(prefix,count,extra={})=>Array.from({length:count},(_,index)=>({
+    code:`${prefix}${String(index).padStart(3,'0')}`,name:`${prefix}-${index}`,
+    boardType:index%2 ? 'concept' : 'industry',mainNetInflow:1e9-index*1e6,
+    mainNetPct:5-index*.01,changePct:1,...extra
+  }));
+  const amount=make('A',10);
+  const quality=make('Q',6,{mainNetInflow:1e7,mainNetPct:12});
+  const priority=make('P',4,{mainNetInflow:-1e7,mainNetPct:-1,userExposure:true});
+  const chosen=selectSectorMemberBoards([...amount,...quality,...priority],20);
+  assert.equal(chosen.length,20);
+  assert.deepEqual(Object.fromEntries(['amount','quality','priority'].map(queue=>[
+    queue,chosen.filter(row=>row.memberSelectionQueue===queue).length])),{amount:10,quality:6,priority:4});
+  assert.ok(chosen.some(row=>row.boardType==='industry'));
+  assert.ok(chosen.some(row=>row.boardType==='concept'));
+});
+
 test('融资融券和财报筛选集合不冒充产业资金轮动', () => {
   const make=(code,name,net)=>({code,name,boardType:'concept',changePct:2,mainNetInflow:net,mainNetPct:5,mainNet5:net*3,mainNet10:net*5,memberCodes:['600001']});
   const rows=[make('BK0001','融资融券',9e10),make('BK0002','2026中报预增',8e10),make('BK0003','猪肉概念',2e9)];
@@ -1916,8 +1933,8 @@ test('交易计划按实际入场路径计算第一目标净盈亏比', () => {
   });
   assert.equal(plan.setupType, '突破确认');
   assert.equal(plan.expectedEntryPrice, plan.confirmationPrice);
-  assert.ok(plan.rewardRisk < 2);
-  assert.equal(plan.researchEntryEligible, false);
+  assert.ok(plan.rewardRisk > 2);
+  assert.equal(plan.researchEntryEligible, true);
   assert.ok(plan.legacyRangeRewardRisk > plan.rewardRisk);
 });
 
@@ -1932,6 +1949,20 @@ test('交易计划保留最近真实阻力，突破后不以旧确认价计算�
     ma5:11, ma10:10.8, ma20:10.5, ma30:10, atr14:1, volumeRatio:2, verdict:'可关注'});
   assert.equal(high.targetEvidence.status,'missing');
   assert.equal(high.rewardRisk,null);
+});
+
+test('回踩确认使用入场区间承接，突破确认位不能同时作为第一目标', () => {
+  const pullback = buildTradePlan({latestPrice:10, supportPrice:10, resistance:12, rangeHigh:13,
+    ma5:9.9, ma10:10.1, ma20:11.5, ma30:9.5, atr14:.5, volumeRatio:1.2, verdict:'等待确认'});
+  assert.equal(pullback.setupType,'回踩低吸');
+  assert.ok(pullback.confirmationPrice <= pullback.entryHigh);
+  assert.ok(pullback.confirmationPrice >= pullback.entryLow);
+  const breakout = buildTradePlan({latestPrice:9.5, supportPrice:8, resistance:10, rangeHigh:10,
+    ma5:9, ma10:9.2, ma20:9.3, ma30:8.5, atr14:.4, volumeRatio:1.2, verdict:'等待确认'});
+  assert.equal(breakout.setupType,'突破确认');
+  assert.equal(breakout.confirmationPrice,10);
+  assert.equal(breakout.targetEvidence.status,'missing');
+  assert.equal(breakout.targets[0].price,null);
 });
 
 test('市场历史保留盘中路径和最终快照，重复缓存不形成新锚', () => {
@@ -2581,6 +2612,9 @@ test('推荐账本记录完整候选和三周期快照', () => {
     recommendationCoverage:{scanned:5000,analyzed:100,rejectedCandidates:[{code:'600002',reason:'industry-unresolved'}],modelVersion:'test-v1'}
   });
   assert.equal(entry.schemaVersion, 3);
+  assert.match(entry.implementationVersion,/^(?:app-|git-)/);
+  assert.equal(entry.dataContractVersion,'2026-10-08-evidence-v2');
+  assert.equal(entry.planContractVersion,'entry-plan-v2');
   assert.equal(entry.inputCutoffAt, '2026-09-11T08:00:00.000Z');
   assert.equal(entry.publishedAt, '2026-09-11T08:00:06.000Z');
   assert.equal(entry.recommendations[0].holdingPeriod, '波段');
@@ -2620,6 +2654,15 @@ test('推荐账本冻结嵌套交易计划并保留唯一入场许可', () => {
   assert.equal(waiting.triggeredAt, '');
   const blocked = build({allowed:false,status:'结构失效'});
   assert.equal(blocked.entryPermission, 'blocked');
+});
+
+test('推荐账本保留计划当前armed许可而不是降级成普通观察', () => {
+  const entry=buildRecommendationLedgerEntry({tradeDate:'2026-10-20',fetchedAt:'2026-10-20T10:00:00+08:00',
+    recommendations:[{code:'600001',name:'测试',industry:'电子',price:10,
+      planState:{planId:'p1',revision:1,state:'armed',currentPermission:'armed',tradePlan:{}},
+      entryAssessment:{allowed:false,status:'等待触发'}}],momentumRecommendations:[]});
+  assert.equal(entry.recommendations[0].entryPermission,'armed');
+  assert.equal(entry.recommendations[0].decisionEvent.type,'entry-armed');
 });
 
 test('推荐账本保留计划过期状态且不记录触发时间', () => {
@@ -2869,6 +2912,19 @@ test('大盘消息保留真实市场风险与监管政策，不因过滤个股�
   }
   const now = Date.parse('2026-09-11T01:52:00Z');
   assert.equal(summarizeNews([{title:'A股大盘下滑，市场风险加剧',publishedAt:'2026-09-11T01:00:00Z'}],'',{now,scope:'market'}).signal,'偏谨慎');
+});
+
+test('境外央行和逆回购不冒充A股利好或公司回购', () => {
+  assert.equal(isMarketWideNews({title:'尼日利亚央行宣布维持利率不变'}),false);
+  assert.equal(isMarketWideNews({title:'新西兰央行宣布维持利率不变'}),false);
+  const now='2026-10-20T10:00:00+08:00';
+  const context=summarizeNews([{title:'中国人民银行开展逆回购操作',summary:'维护流动性合理充裕',
+    link:'https://example.com/pbc',publishedAt:'2026-10-20T09:00:00+08:00'}],'',{now,scope:'market'});
+  assert.equal(context.decisionItems[0]?.eventType,'货币政策操作');
+  assert.equal(context.decisionItems[0]?.region,'中国');
+  assert.ok(!context.positive.includes('回购'));
+  assert.match(summarizeNews([], '', {now,scope:'market'}).summary,/不可用|未取得/);
+  assert.equal(summarizeNews([], '', {now,scope:'market'}).evidenceStatus,'unavailable');
 });
 
 test('普通大盘负面消息只修正判断，已核实系统风险才阻止新入场', () => {

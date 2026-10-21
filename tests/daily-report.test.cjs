@@ -142,6 +142,30 @@ test('报告分开展示已发布推荐观察表现和可模拟成交计数', ()
   assert.match(html,/参考涨幅不等于账户净收益/);
 });
 
+test('当日报告披露亏损尾部、剔除最大赢家均值和收益集中度',()=>{
+  const stable=[10,10,10,10].map((price,index)=>({code:`60000${index}`,price,publishedAt:'2026-10-20T10:00:00+08:00'}));
+  const closes=[11,9.9,9.8,9.7].map((price,index)=>({code:`60000${index}`,price,changePct:(price/10-1)*100,
+    tradeDate:'2026-10-20',isFinal:true}));
+  const report=buildDailyReport({tradeDate:'2026-10-20',stable,closingQuotes:closes});
+  const summary=report.recommendations.performance.published;
+  assert.equal(summary.worstReturnPct,-3);
+  assert.equal(summary.averageExBestPct,-2);
+  assert.equal(summary.topPositiveContributionPct,100);
+  assert.match(renderDailyReportHtml(report),/剔除最大赢家 -2\.00%/);
+});
+
+test('报告保留实现、参数、数据和计划版本', () => {
+  const versions={implementationVersion:'git-abc123',parameterVersion:'params-v1',
+    dataContractVersion:'data-v2',planContractVersion:'plan-v2'};
+  const report=buildDailyReport({tradeDate:'2026-10-20',...versions});
+  for (const [key,value] of Object.entries(versions)) assert.equal(report[key],value);
+  const html=renderDailyReportHtml(report);
+  assert.match(html,/实现 git-abc123/);
+  assert.match(html,/参数 params-v1/);
+  assert.match(html,/数据契约 data-v2/);
+  assert.match(html,/计划契约 plan-v2/);
+});
+
 test('当日没有新推荐仍可独立跟踪上一交易日推荐', () => {
   const report=buildDailyReport({tradeDate:'2026-09-22',stable:[],momentum:[],
     followUp:[{code:'000823',name:'超声电子',price:23.71,changePct:1.41,originalTradeDate:'2026-09-21',
