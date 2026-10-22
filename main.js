@@ -451,7 +451,16 @@ function requestText(url, timeout = 12000, extraHeaders = {}, encoding = 'utf8',
       return;
     }
     const client = url.startsWith('http://') ? http : https;
-    const req = client.get(url, {
+    let settled = false;
+    let req;
+    const deadlineTimer = setTimeout(() => req?.destroy(new Error('请求超时')), remainingMs);
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadlineTimer);
+      callback(value);
+    };
+    req = client.get(url, {
       autoSelectFamily: true,
       autoSelectFamilyAttemptTimeout: 250,
       headers: {
@@ -462,12 +471,13 @@ function requestText(url, timeout = 12000, extraHeaders = {}, encoding = 'utf8',
     }, (res) => {
       const chunks = [];
       let receivedBytes = 0;
-      res.on('error', reject);
-      res.on('aborted', () => reject(new Error('行情响应中途断开')));
+      res.on('error', error => finish(reject, error));
+      res.on('aborted', () => finish(reject, new Error('行情响应中途断开')));
       if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location && redirectsLeft > 0) {
         const redirectedUrl = new URL(res.headers.location, url).toString();
         res.resume();
-        requestText(redirectedUrl, remainingMs, extraHeaders, encoding, redirectsLeft - 1, maxBytes, deadline).then(resolve, reject);
+        requestText(redirectedUrl, remainingMs, extraHeaders, encoding, redirectsLeft - 1, maxBytes, deadline)
+          .then(value => finish(resolve, value), error => finish(reject, error));
         return;
       }
       if (res.statusCode < 200 || res.statusCode >= 300) {
@@ -476,7 +486,7 @@ function requestText(url, timeout = 12000, extraHeaders = {}, encoding = 'utf8',
         const retryAfter = Number(res.headers['retry-after']);
         if (Number.isFinite(retryAfter) && retryAfter > 0) error.retryAfterMs = retryAfter * 1000;
         res.resume();
-        reject(error);
+        finish(reject, error);
         return;
       }
       res.on('data', chunk => {
@@ -490,10 +500,10 @@ function requestText(url, timeout = 12000, extraHeaders = {}, encoding = 'utf8',
       res.on('end', () => {
         const buffer = Buffer.concat(chunks);
         const text = encoding === 'utf8' ? buffer.toString('utf8') : new TextDecoder(encoding).decode(buffer);
-        resolve(text);
+        finish(resolve, text);
       });
     });
-    req.on('error', reject);
+    req.on('error', error => finish(reject, error));
     req.setTimeout(remainingMs, () => {
       req.destroy(new Error('请求超时'));
     });
@@ -611,6 +621,32 @@ function resolveObservationPhase(tradeDate, observedAt = Date.now(), { sourceObs
     : phase === 'intraday' ? '盘中快照'
       : phase === 'closed' ? '当日收盘' : '收盘待确认';
   return {phase, label, tradeDate:date, observedAt:new Date(observedAt).toISOString()};
+}
+
+function resolveMarketSessionPhase(tradeDate, observedAt = Date.now(), {sourceObservedAt = null} = {}) {
+  const clock = chinaClockParts(observedAt);
+  const date = String(tradeDate || '');
+  const base = {tradeDate:date,observedAt:new Date(observedAt).toISOString(),sourceObservedAt:sourceObservedAt || null};
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return {...base,phase:'unknown',label:'时点待确认',continuous:false,auction:false};
+  if (date < clock.date) return {...base,phase:'closed',label:'历史收盘',continuous:false,auction:false,historical:true};
+  if (date > clock.date) return {...base,phase:'invalid',label:'交易日异常',continuous:false,auction:false};
+  const tradingDay = isTradingDay(date);
+  if (tradingDay === false) return {...base,phase:'holiday',label:'休市',continuous:false,auction:false};
+  if (tradingDay === null) return {...base,phase:'unknown',label:'交易日历待更新',continuous:false,auction:false};
+  const minutes = clock.hour * 60 + clock.minute;
+  const sourceTime = typeof sourceObservedAt === 'number' ? sourceObservedAt : Date.parse(sourceObservedAt || '');
+  const sourceClock = Number.isFinite(sourceTime) ? chinaClockParts(sourceTime) : null;
+  const sourceMinutes = sourceClock?.date === date ? sourceClock.hour * 60 + sourceClock.minute : null;
+  const phase = minutes < 555 ? ['preopen','盘前']
+    : minutes < 565 ? ['opening-auction','开盘集合竞价']
+      : minutes < 570 ? ['opening-wait','开盘待确认']
+        : minutes < 690 ? ['morning','上午连续交易']
+          : minutes < 780 ? ['lunch','午间休市']
+            : minutes < 897 ? ['afternoon','下午连续交易']
+              : minutes < 900 ? ['closing-auction','收盘集合竞价']
+                : sourceMinutes !== null && sourceMinutes >= 900 ? ['closed','当日收盘'] : ['close-pending','收盘待确认'];
+  return {...base,phase:phase[0],label:phase[1],continuous:['morning','afternoon'].includes(phase[0]),
+    auction:['opening-auction','closing-auction'].includes(phase[0])};
 }
 
 function buildAiEvidencePrompt({code = '', analysisId = '', evidence = []} = {}) {
@@ -1125,7 +1161,7 @@ async function fetchTencentQuotes(codes) {
 }
 
 async function fetchTencentMarketIndices() {
-  const text = await getText('http://qt.gtimg.cn/q=s_sh000001,s_sz399001,s_sz399006', { Referer: 'http://gu.qq.com/' }, 'gb18030');
+  const text = await getText('https://qt.gtimg.cn/q=sh000001,sz399001,sz399006', { Referer: 'https://gu.qq.com/' }, 'gb18030');
   return text.split(/\r?\n/).map(line => {
     const body = (line.match(/="([\s\S]*?)"/) || [])[1] || '';
     const cols = body.split('~');
@@ -1133,8 +1169,10 @@ async function fetchTencentMarketIndices() {
     if (!cols[2] || price == null) return null;
     return {
       code: cols[2], name: cleanStockName(cols[1]), price,
-      change: finiteNumber(cols[4]), changePct: finiteNumber(cols[5]),
-      amount: finiteNumber(cols[9]) == null ? null : Number(cols[9]) * 1e6
+      change: finiteNumber(cols[31]), changePct: finiteNumber(cols[32]),
+      amount: finiteNumber(cols[37]) == null ? null : Number(cols[37]) * 10000,
+      quoteObservedAt:tencentQuoteObservedAt(cols[30]),
+      tradeDate:/^\d{8}/.test(String(cols[30] || '')) ? `${cols[30].slice(0,4)}-${cols[30].slice(4,6)}-${cols[30].slice(6,8)}` : ''
     };
   }).filter(Boolean);
 }
@@ -1226,6 +1264,59 @@ async function fetchTencentMarketBatch(symbols) {
     .filter(Boolean);
 }
 
+function summarizeMarketSnapshot(quotes, {observedAt = Date.now(), expectedCount = quotes.length} = {}) {
+  const dateCounts = new Map();
+  for (const quote of quotes) if (quote.tradeDate) dateCounts.set(quote.tradeDate,(dateCounts.get(quote.tradeDate) || 0) + 1);
+  const tradeDate = [...dateCounts.entries()].sort((a,b) => b[1] - a[1] || b[0].localeCompare(a[0]))[0]?.[0] || '';
+  const validQuotes = quotes.filter(quote => quote.tradeDate === tradeDate);
+  const invalidDateCount = quotes.length - validQuotes.length;
+  const sourceObservedAt = latestQuoteObservedAt(validQuotes);
+  const sessionPhase = resolveMarketSessionPhase(tradeDate, observedAt, {sourceObservedAt});
+  const breadth = validQuotes.reduce((sum, quote) => {
+    if ((quote.changePct || 0) > 0.005) sum.up++;
+    else if ((quote.changePct || 0) < -0.005) sum.down++;
+    else sum.flat++;
+    if (finiteNumber(quote.amount) > 0) sum.normalTrading++;
+    if (quote.changePct <= -5) sum.down5++;
+    if (quote.changePct <= -10) sum.down10++;
+    return sum;
+  }, {up:0,down:0,flat:0,normalTrading:0,down5:0,down10:0,sampleCount:validQuotes.length});
+  const atLimit = (quote, limit, direction) => limit > 0 && Math.abs(quote.price - limit) < 0.005 && direction * (quote.changePct || 0) > 4.5;
+  const byAmount = (a,b) => (b.amount || 0) - (a.amount || 0);
+  const upStocks = validQuotes.filter(quote => atLimit(quote,quote.upperLimit,1)).sort(byAmount);
+  const downStocks = validQuotes.filter(quote => atLimit(quote,quote.lowerLimit,-1)).sort(byAmount);
+  const byMarket = {};
+  const marketOf = code => /^(300|301)/.test(code) ? '创业板' : /^688/.test(code) ? '科创板' : /^(8|9|4)/.test(code) ? '北交所' : '主板';
+  for (const quote of validQuotes) {
+    const row = byMarket[marketOf(quote.code)] ||= {sampleCount:0,upCount:0,downCount:0,down5:0,down10:0};
+    row.sampleCount++;
+    if (sessionPhase.continuous && atLimit(quote,quote.upperLimit,1)) row.upCount++;
+    if (sessionPhase.continuous && atLimit(quote,quote.lowerLimit,-1)) row.downCount++;
+    if (quote.changePct <= -5) row.down5++;
+    if (quote.changePct <= -10) row.down10++;
+  }
+  const amounts = validQuotes.map(quote => finiteNumber(quote.amount)).filter(value => value !== null);
+  const coverageRatio = expectedCount > 0 ? validQuotes.length / expectedCount : 0;
+  const coverage = {validCount:validQuotes.length,invalidDateCount,expectedCount,
+    ratio:Number(coverageRatio.toFixed(4)),status:invalidDateCount || coverageRatio < .9 ? 'partial' : 'fresh'};
+  const auction = sessionPhase.auction;
+  return {tradeDate,quotes:validQuotes,breadth,sessionPhase,coverage,
+    turnover:amounts.length ? amounts.reduce((sum,value) => sum + value,0) : null,
+    activeStocks:[...validQuotes].sort(byAmount).slice(0,8),
+    limits:{date:tradeDate.replaceAll('-',''),upCount:sessionPhase.continuous ? upStocks.length : null,
+      downCount:sessionPhase.continuous ? downStocks.length : null,
+      auctionUpCount:auction ? upStocks.length : null,auctionDownCount:auction ? downStocks.length : null,
+      byMarket,upCodes:sessionPhase.continuous ? upStocks.map(row=>row.code) : [],
+      downCodes:sessionPhase.continuous ? downStocks.map(row=>row.code) : [],
+      ladderStatus:'partial',openedLimitRate:null,observedOpeningCountLowerBound:null,
+      upStocks:(sessionPhase.continuous || auction) ? upStocks.slice(0,8) : [],
+      downStocks:(sessionPhase.continuous || auction) ? downStocks.slice(0,8) : [],observationOnly:true,
+      observationReason:auction ? '当前为集合竞价，触及涨跌停仅作竞价观察，不计入连续交易涨跌停和入场许可。'
+        : '涨停和跌停仅用于情绪与梯队观察；现有快照不含首封时间、炸板次数和连续板数，不生成买入许可。',
+      dataCoverage:{universe:validQuotes.length,scope:'腾讯全市场行情快照',observedAt:new Date(observedAt).toISOString(),...coverage}}
+  };
+}
+
 async function fetchTencentMarketSnapshot() {
   const symbols = allTencentMarketSymbols();
   const batches = [];
@@ -1242,48 +1333,7 @@ async function fetchTencentMarketSnapshot() {
     writeDiskCache('tencent-stock-directory', quotes.map(({ code, name }) => ({ code, name, securityType: 'A股' })));
     marketDirectorySavedAt = Date.now();
   }
-  const breadth = quotes.reduce((sum, quote) => {
-    if ((quote.changePct || 0) > 0.005) sum.up++;
-    else if ((quote.changePct || 0) < -0.005) sum.down++;
-    else sum.flat++;
-    if (quote.amount > 0) sum.normalTrading++;
-    if (quote.changePct <= -5) sum.down5++;
-    if (quote.changePct <= -10) sum.down10++;
-    return sum;
-  }, { up: 0, down: 0, flat: 0,normalTrading:0,down5:0,down10:0,sampleCount:quotes.length });
-  const atLimit = (quote, limit, direction) => limit > 0 && Math.abs(quote.price - limit) < 0.005 && direction * (quote.changePct || 0) > 4.5;
-  const byAmount = (a, b) => (b.amount || 0) - (a.amount || 0);
-  const upStocks = quotes.filter(quote => atLimit(quote, quote.upperLimit, 1)).sort(byAmount);
-  const downStocks = quotes.filter(quote => atLimit(quote, quote.lowerLimit, -1)).sort(byAmount);
-  const byMarket = {};
-  const marketOf = code => /^(300|301)/.test(code) ? '创业板' : /^688/.test(code) ? '科创板' : /^(8|9|4)/.test(code) ? '北交所' : '主板';
-  for (const quote of quotes) {
-    const row = byMarket[marketOf(quote.code)] ||= {sampleCount:0,upCount:0,downCount:0,down5:0,down10:0};
-    row.sampleCount++;
-    if (atLimit(quote,quote.upperLimit,1)) row.upCount++;
-    if (atLimit(quote,quote.lowerLimit,-1)) row.downCount++;
-    if (quote.changePct <= -5) row.down5++;
-    if (quote.changePct <= -10) row.down10++;
-  }
-  return {
-    quotes,
-    breadth,
-    turnover: quotes.reduce((sum, quote) => sum + (quote.amount || 0), 0),
-    activeStocks: [...quotes].sort(byAmount).slice(0, 8),
-    limits: {
-      date: marketDateString(),
-      upCount: upStocks.length,
-      downCount: downStocks.length,
-      byMarket,upCodes:upStocks.map(row=>row.code),downCodes:downStocks.map(row=>row.code),
-      ladderStatus:'partial',openedLimitRate:null,observedOpeningCountLowerBound:null,
-      upStocks: upStocks.slice(0, 8),
-      downStocks: downStocks.slice(0, 8),
-      observationOnly:true,
-      observationReason:'涨停和跌停仅用于情绪与梯队观察；现有快照不含首封时间、炸板次数和连续板数，不生成买入许可。',
-      dataCoverage:{universe:quotes.length, scope:'腾讯全市场行情快照', observedAt:new Date().toISOString()}
-    },
-    errors
-  };
+  return {...summarizeMarketSnapshot(quotes,{expectedCount:quotes.length + errors.length * 800}),errors};
 }
 
 async function fetchTencentMarketSectors(marketQuotes, capitalRows = []) {
@@ -1850,7 +1900,7 @@ function compactRotationSnapshot(row) {
     snapshotId:row.snapshotId,turnover:row.turnover,source:row.source,breadth:row.breadth,
     indices:row.indices,limits:row.limits ? {upCount:row.limits.upCount,downCount:row.limits.downCount,
       scope:row.limits.scope,date:row.limits.date} : null,
-    observationPhase:row.observationPhase,
+    observationPhase:row.observationPhase,sessionPhase:row.sessionPhase,components:row.components || null,
     marketRegime:row.marketRegime ? {label:row.marketRegime.label,up:row.marketRegime.up,down:row.marketRegime.down} : null};
 }
 
@@ -1885,7 +1935,8 @@ function updateMarketRotationHistory(history, overview) {
       byMarket:overview.limits.byMarket,ladderStatus:overview.limits.ladderStatus,
       upCodes:overview.limits.upCodes || (overview.limits.upStocks || []).map(row=>row.code),
       downCodes:overview.limits.downCodes || (overview.limits.downStocks || []).map(row=>row.code)} : null,
-    observationPhase:overview.observationPhase, recommendationCoverage:{modelVersion:overview.recommendationCoverage?.modelVersion},
+    observationPhase:overview.observationPhase,sessionPhase:overview.sessionPhase,
+    recommendationCoverage:{modelVersion:overview.recommendationCoverage?.modelVersion},
     sectors:(overview.sectors || []).map(row => ({name:row.name, code:row.code, rotationScore:row.rotationScore,
       boardType:row.boardType, capitalSource:row.capitalSource,
       capitalTradeDate:row.capitalTradeDate,capitalFetchedAt:row.capitalFetchedAt,capitalObservedAt:row.capitalObservedAt,
@@ -2144,7 +2195,7 @@ function isMarketWideNews(item) {
   const centralBankEntity = title.match(/([\u4e00-\u9fa5]{2,12})(?:央行|中央银行)/)?.[1] || '';
   if (centralBankEntity && !/中国|人民/.test(centralBankEntity)
     && !/A股市场|沪深两市|中国股市|沪指|深证成指/.test(title)) return false;
-  if (/韩国|印度|日本|欧洲|美国|美联储|尼日利亚|英国|英格兰银行|加拿大|澳大利亚|俄罗斯|巴西|土耳其|H股相对A股|相对A股的H股/.test(title)
+  if (/韩国|印度|日本|欧洲|美国|美股|中概股|纳指|道指|标普|美联储|SpaceX|特斯拉|尼日利亚|英国|英格兰银行|加拿大|澳大利亚|俄罗斯|巴西|土耳其|H股相对A股|相对A股的H股/i.test(title)
     && !/A股市场|沪深两市|中国股市|沪指|深证成指/.test(title)) return false;
   const regulation = /证监会|交易所/.test(title) && /规则|制度|新规|政策|资本市场|再融资|融券|印花税/.test(title);
   if (regulation) return true;
@@ -2152,7 +2203,7 @@ function isMarketWideNews(item) {
     && /处罚|罚没|立案|退市|造假|减持|诉讼/.test(title);
   if (companyRisk && !/全市场|市场整体|系统性风险|上市公司整体/.test(title)) return false;
   // Background mentions in company reports do not establish a market-wide subject.
-  return /A股市场|A股三大指数|沪指|上证指数|上证综指|深证成指|创业板指|科创50|北证50|沪深300|三大指数|大盘|沪深两市|全市场|系统性风险|北向资金|中国人民银行|人民银行|央行|财政部|降准|人民币汇率|人民币升值|人民币贬值|社融/i.test(title);
+  return /A股市场|A股三大指数|沪指|上证指数|上证综指|深证成指|创业板指|科创50|北证50|沪深300|三大指数|大盘|沪深两市|全市场|系统性风险|北向资金|中国人民银行|人民银行|央行|财政部|降准|人民币汇率|人民币兑美元中间价|人民币升值|人民币贬值|社融/i.test(title);
 }
 
 function summarizeNews(news, sinceDate = '', options = {}) {
@@ -2294,10 +2345,11 @@ function summarizeNews(news, sinceDate = '', options = {}) {
   };
 }
 
-async function fetchBingNews(keyword, cacheKey = keyword, maxAgeMs = 10 * 60 * 1000, force = false) {
+async function fetchBingNews(keyword, cacheKey = keyword, maxAgeMs = 10 * 60 * 1000, force = false, deadline = Date.now() + 8000) {
   const cached = force ? null : readTimedCache(marketNewsCache, cacheKey, maxAgeMs);
   if (cached) return cached;
-  const rss = await getText(`https://www.bing.com/news/search?q=${encodeURIComponent(keyword)}&format=rss&setlang=zh-CN`, { 'User-Agent': 'Mozilla/5.0' });
+  const rss = await requestText(`https://www.bing.com/news/search?q=${encodeURIComponent(keyword)}&format=rss&setlang=zh-CN`,
+    Math.max(1,deadline-Date.now()),{'User-Agent':'Mozilla/5.0'},'utf8',1,2_000_000,deadline);
   return writeTimedCache(marketNewsCache, cacheKey, parseRssItems(rss));
 }
 
@@ -4528,14 +4580,15 @@ function evaluateRecommendationRisk(item, riskProfile) {
   };
 }
 
-async function fetchEastmoneyNews(keyword, cacheKey = keyword, maxAgeMs = 10 * 60 * 1000, force = false) {
+async function fetchEastmoneyNews(keyword, cacheKey = keyword, maxAgeMs = 10 * 60 * 1000, force = false, deadline = Date.now() + 8000) {
   const cached = force ? null : readTimedCache(marketNewsCache, `eastmoney-${cacheKey}`, maxAgeMs);
   if (cached) return cached;
   const param = {
     uid: '', keyword, type: ['cmsArticleWebOld'], client: 'web', clientType: 'web', clientVersion: 'curr',
     param: { cmsArticleWebOld: { searchScope: 'default', sort: 'default', pageIndex: 1, pageSize: 8, preTag: '', postTag: '' } }
   };
-  const text = await getText(`https://search-api-web.eastmoney.com/search/jsonp?cb=cb&param=${encodeURIComponent(JSON.stringify(param))}`, { Referer: 'https://so.eastmoney.com/' });
+  const text = await requestText(`https://search-api-web.eastmoney.com/search/jsonp?cb=cb&param=${encodeURIComponent(JSON.stringify(param))}`,
+    Math.max(1,deadline-Date.now()),{Referer:'https://so.eastmoney.com/'},'utf8',1,2_000_000,deadline);
   const json = parseJsonpPayload(text);
   const rows = json?.result?.cmsArticleWebOld || json?.Data?.cmsArticleWebOld || [];
   const news = sortNewsNewestFirst(rows.map(row => ({
@@ -4546,15 +4599,54 @@ async function fetchEastmoneyNews(keyword, cacheKey = keyword, maxAgeMs = 10 * 6
   return writeTimedCache(marketNewsCache, `eastmoney-${cacheKey}`, news);
 }
 
-async function fetchSinaMarketNews() {
-  const json = await getJsonWithRetry(`https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2517&num=100&page=1&_=${Date.now()}`, 1);
-  return sortNewsNewestFirst((json?.result?.data || []).map(row => ({
-    title: cleanStockName(row.title),
-    link: row.url || row.wapurl || '',
-    summary: String(row.intro || row.summary || row.wapsummary || '').replace(/<[^>]+>/g, '').slice(0, 180),
-    publishedAt: Number(row.ctime) > 0 ? new Date(Number(row.ctime) * 1000).toISOString() : row.intime || '',
-    source: row.media_name ? `新浪财经·${row.media_name}` : '新浪财经滚动'
-  })).filter(item => item.title && item.link && isMarketWideNews(item))).slice(0, 8);
+function filterSinaMarketNewsPages(pages, {now = Date.now(),limit = 8} = {}) {
+  const date = chinaClockParts(now).date;
+  const maxAgeMs = isTradingDay(date) === true ? 24 * 60 * 60 * 1000 : 72 * 60 * 60 * 1000;
+  const diagnostics = {rawCount:0,parsedCount:0,timeValidCount:0,scopeMatchedCount:0};
+  const seen = new Set();
+  const news = [];
+  for (const row of pages.flat()) {
+    diagnostics.rawCount++;
+    const item = {title:cleanStockName(row.title),link:row.url || row.wapurl || '',
+      summary:String(row.intro || row.summary || row.wapsummary || '').replace(/<[^>]+>/g,'').slice(0,180),
+      publishedAt:Number(row.ctime) > 0 ? new Date(Number(row.ctime) * 1000).toISOString() : row.intime || '',
+      source:row.media_name ? `新浪财经·${row.media_name}` : '新浪财经滚动'};
+    if (!item.title || !item.link) continue;
+    diagnostics.parsedCount++;
+    const published = Date.parse(item.publishedAt);
+    if (!Number.isFinite(published) || published > now + 5 * 60 * 1000 || now - published > maxAgeMs) continue;
+    diagnostics.timeValidCount++;
+    if (!isMarketWideNews(item)) continue;
+    diagnostics.scopeMatchedCount++;
+    const key = `${item.title}|${item.link}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      news.push(item);
+    }
+  }
+  return {news:sortNewsNewestFirst(news).slice(0,limit),diagnostics};
+}
+
+async function fetchSinaMarketNews(limit = 8, deadline = Date.now() + 8000) {
+  const pages = [];
+  let filtered = {news:[],diagnostics:{rawCount:0,parsedCount:0,timeValidCount:0,scopeMatchedCount:0}};
+  for (let page = 1; page <= 3; page++) {
+    if (deadline - Date.now() < 250) break;
+    const url = `https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2517&num=100&page=${page}&_=${Date.now()}`;
+    let json;
+    try {
+      json = JSON.parse(await requestText(url,Math.min(4000,deadline-Date.now()),{},'utf8',1,2_000_000,deadline));
+    } catch (error) {
+      if (page > 1 || deadline - Date.now() < 750 || error.statusCode === 403 || error.statusCode === 429) throw error;
+      json = JSON.parse(await requestText(url,Math.min(3000,deadline-Date.now()),{},'utf8',1,2_000_000,deadline));
+    }
+    const rows = json?.result?.data || [];
+    pages.push(rows);
+    filtered = filterSinaMarketNewsPages(pages,{limit});
+    if (filtered.news.length >= limit || !rows.length) break;
+  }
+  filtered.news.diagnostics = filtered.diagnostics;
+  return filtered.news;
 }
 
 function parseJin10FlashItems(script, limit = 10) {
@@ -4581,8 +4673,9 @@ function parseJin10FlashItems(script, limit = 10) {
     .map(({ symbols, ...item }) => item);
 }
 
-async function fetchJin10MarketNews(limit = 10) {
-  const script = await getText('https://www.jin10.com/flash_newest.js', { Referer: 'https://www.jin10.com/' });
+async function fetchJin10MarketNews(limit = 10, deadline = Date.now() + 8000) {
+  const script = await requestText('https://www.jin10.com/flash_newest.js',Math.max(1,deadline-Date.now()),
+    {Referer:'https://www.jin10.com/'},'utf8',1,2_000_000,deadline);
   return parseJin10FlashItems(script, limit);
 }
 
@@ -4593,16 +4686,48 @@ function classifyMarketNewsIssues(newsResult) {
     : { errors: issues, warnings: [] };
 }
 
+function updateNewsSourceCooldown(previous = {}, error = null, now = Date.now()) {
+  if (!error) return {failures:0,statusCode:null,nextRetryAt:0,lastSuccessAt:now};
+  const failures = Math.min(3,(Number(previous.failures) || 0) + 1);
+  const statusCode = Number(error.statusCode) || null;
+  const backoff = [60_000,120_000,300_000][failures - 1];
+  return {failures,statusCode,nextRetryAt:now + Math.max(backoff,Number(error.retryAfterMs) || 0),
+    lastFailureAt:now,lastError:String(error.message || error).slice(0,240)};
+}
+
+function newsSourceCanRun(state = {}, force = false, now = Date.now()) {
+  if (!state.nextRetryAt || state.nextRetryAt <= now) return true;
+  return Boolean(force && Number(state.statusCode) !== 429);
+}
+
 async function fetchMarketNews(force = false) {
+  const deadline = Date.now() + 12_000;
   const maxAgeMs = 2 * 60 * 1000;
   const combinedKey = 'market-overview-live-news';
   const cached = force ? null : readTimedCache(marketNewsCache, combinedKey, maxAgeMs);
   if (cached) return { ...cached, cached: true };
-  const previous = marketNewsCache.get(combinedKey)?.value;
+  const diskCached = readDiskCache('market-news', 7 * 24 * 60 * 60 * 1000);
+  if (!force && diskCached?.news?.length && Date.now() - Date.parse(diskCached.fetchedAt || '') < maxAgeMs) {
+    return writeTimedCache(marketNewsCache,combinedKey,{...diskCached,cached:true});
+  }
+  const previous = marketNewsCache.get(combinedKey)?.value || diskCached;
+  const sourceState = readDiskCache('market-news-source-state',7 * 24 * 60 * 60 * 1000) || {};
+  const runSource = async (name,task) => {
+    if (!newsSourceCanRun(sourceState[name],force)) return {skipped:true,error:new Error(`${name}仍在失败冷却期`)};
+    try {
+      const value = await task();
+      sourceState[name] = updateNewsSourceCooldown(sourceState[name]);
+      return {value};
+    } catch (error) {
+      sourceState[name] = updateNewsSourceCooldown(sourceState[name],error);
+      return {error};
+    }
+  };
   const keyword = 'A股 大盘 板块 资金 今日 最新消息';
   const errors = [];
   const collected = [];
   const sources = [];
+  const diagnostics = {};
   const addSource = (news, source) => {
     news = news.filter(isMarketWideNews);
     if (!news.length) return false;
@@ -4610,18 +4735,17 @@ async function fetchMarketNews(force = false) {
     sources.push(source);
     return true;
   };
-  try {
-    const news = await fetchJin10MarketNews();
-    if (!addSource(news, '金十数据快讯')) errors.push('金十数据快讯搜索为空');
-  } catch (err) {
-    errors.push(`金十数据快讯失败：${err.message || err}`);
-  }
-  try {
-    const news = await fetchSinaMarketNews();
-    if (!addSource(news, '新浪财经滚动')) errors.push('新浪财经滚动资讯搜索为空');
-  } catch (err) {
-    errors.push(`新浪财经滚动资讯失败：${err.message || err}`);
-  }
+  const [jin10,sina] = await Promise.all([
+    runSource('金十数据快讯',()=>fetchJin10MarketNews(12,deadline)),runSource('新浪财经滚动',()=>fetchSinaMarketNews(12,deadline))
+  ]);
+  if (jin10.value) {
+    if (!addSource(jin10.value,'金十数据快讯')) errors.push('金十数据快讯搜索为空');
+  } else errors.push(`金十数据快讯失败：${jin10.error?.message || '未知错误'}`);
+  if (sina.value) {
+    diagnostics.sina = sina.value.diagnostics || null;
+    if (!addSource(sina.value,'新浪财经滚动')) errors.push(`新浪财经滚动资讯筛选为空${diagnostics.sina ? `（原始${diagnostics.sina.rawCount}，时间有效${diagnostics.sina.timeValidCount}，大盘匹配${diagnostics.sina.scopeMatchedCount}）` : ''}`);
+  } else errors.push(`新浪财经滚动资讯失败：${sina.error?.message || '未知错误'}`);
+  await writeDiskCache('market-news-source-state',sourceState);
   if (collected.length) {
     const seen = new Set();
     const news = sortNewsNewestFirst(collected).filter(item => {
@@ -4630,70 +4754,43 @@ async function fetchMarketNews(force = false) {
       seen.add(key);
       return true;
     }).slice(0, 12);
-    return writeTimedCache(marketNewsCache, combinedKey, { news, source: sources.join(' + '), fetchedAt: new Date().toISOString(), stale: false, errors });
+    const value = {news,source:sources.join(' + '),fetchedAt:new Date().toISOString(),stale:false,errors,diagnostics};
+    writeTimedCache(marketNewsCache,combinedKey,value);
+    await writeDiskCache('market-news',value);
+    return value;
   }
-  try {
-    const news = (await fetchEastmoneyNews(keyword, 'market-overview-news', maxAgeMs, force)).filter(isMarketWideNews);
-    if (news.length) return writeTimedCache(marketNewsCache, combinedKey, { news, source: '东方财富资讯', fetchedAt: new Date().toISOString(), stale: false, errors });
-    errors.push('东方财富资讯搜索为空');
-  } catch (err) {
-    errors.push(`东方财富资讯失败：${err.message || err}`);
-  }
-  try {
-    const news = (await fetchBingNews(keyword, 'market-overview-news-bing', maxAgeMs, force)).filter(isMarketWideNews);
-    if (news.length) return writeTimedCache(marketNewsCache, combinedKey, { news, source: 'Bing新闻', fetchedAt: new Date().toISOString(), stale: false, errors });
-    errors.push('Bing新闻搜索为空');
-  } catch (err) {
-    errors.push(`Bing资讯失败：${err.message || err}`);
+  const fallback = await Promise.all([
+    runSource('东方财富资讯',()=>fetchEastmoneyNews(keyword,'market-overview-news',maxAgeMs,force,deadline)),
+    runSource('Bing新闻',()=>fetchBingNews(keyword,'market-overview-news-bing',maxAgeMs,force,deadline))
+  ]);
+  const fallbackNames = ['东方财富资讯','Bing新闻'];
+  fallback.forEach((result,index) => {
+    if (result.value) {
+      if (!addSource(result.value,fallbackNames[index])) errors.push(`${fallbackNames[index]}搜索为空`);
+    } else errors.push(`${fallbackNames[index]}失败：${result.error?.message || '未知错误'}`);
+  });
+  await writeDiskCache('market-news-source-state',sourceState);
+  if (collected.length) {
+    const seen = new Set();
+    const news = sortNewsNewestFirst(collected).filter(item => {
+      const key = `${item.title}|${item.link || ''}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }).slice(0,12);
+    const value = {news,source:sources.join(' + '),fetchedAt:new Date().toISOString(),stale:false,errors,diagnostics};
+    writeTimedCache(marketNewsCache,combinedKey,value);
+    await writeDiskCache('market-news',value);
+    return value;
   }
   if (previous?.news?.length) return { ...previous, cached: true, stale: true, errors };
   throw new Error(errors.join('；') || '市场资讯接口未返回数据');
 }
 
 async function fetchLiveNews({ force = false, limit = 24 } = {}) {
-  const maxAgeMs = 2 * 60 * 1000;
   const safeLimit = Math.max(1, Math.min(48, Number(limit) || 24));
-  const cacheKey = `live-news-${safeLimit}`;
-  const cached = force ? null : readTimedCache(marketNewsCache, cacheKey, maxAgeMs);
-  if (cached) return { ...cached, cached: true };
-  const previous = marketNewsCache.get(cacheKey)?.value;
-  const keyword = 'A股 大盘 板块 资金 今日 最新消息';
-  const errors = [];
-  const collected = [];
-  const sources = [];
-  const addSource = (news, source) => {
-    if (!news?.length) return false;
-    collected.push(...news);
-    sources.push(source);
-    return true;
-  };
-  try {
-    if (!addSource(await fetchJin10MarketNews(safeLimit), '金十数据快讯')) errors.push('金十数据快讯搜索为空');
-  } catch (err) {
-    errors.push(`金十数据快讯失败：${err.message || err}`);
-  }
-  try {
-    if (!addSource(await fetchSinaMarketNews(), '新浪财经滚动') && !collected.length) errors.push('新浪财经滚动资讯搜索为空');
-  } catch (err) {
-    if (!collected.length) errors.push(`新浪财经滚动资讯失败：${err.message || err}`);
-  }
-  if (collected.length < safeLimit) {
-    try {
-      if (!addSource(await fetchBingNews(keyword, 'live-news-bing', maxAgeMs, force), 'Bing新闻') && !collected.length) errors.push('Bing新闻搜索为空');
-    } catch (err) {
-      if (!collected.length) errors.push(`Bing资讯失败：${err.message || err}`);
-    }
-  }
-  const seen = new Set();
-  const news = sortNewsNewestFirst(collected).filter(item => {
-    const key = `${item.title}|${item.link || ''}`;
-    if (!item.title || seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  }).slice(0, safeLimit);
-  if (news.length) return writeTimedCache(marketNewsCache, cacheKey, { news, source: sources.join(' + '), fetchedAt: new Date().toISOString(), stale: false, errors });
-  if (previous?.news?.length) return { ...previous, cached: true, stale: true, errors };
-  throw new Error(errors.join('；') || '实时新闻接口未返回数据');
+  const result = await fetchMarketNews(force);
+  return {...result,news:(result.news || []).slice(0,safeLimit)};
 }
 
 function scoreConsolidationCandidate(item) {
@@ -5386,7 +5483,48 @@ function marketAnalysis(result) {
     return groups;
   }, {})).map(([signal, names]) => `${signal}：${names.slice(0, 3).join('、')}`).join('；');
   const momentumNames = (result.momentumRecommendations || []).slice(0, 4).map(item => item.name).join('、');
-  return `市场状态${sentiment}${up || down ? `，上涨${up}家、下跌${down}家` : ''}。${regimeEvidence}${leaders ? `轮动靠前：${leaders}。` : ''}${funds ? `主力资金靠前：${funds}。` : ''}涨停${result.limits?.upCount ?? 0}只、跌停${result.limits?.downCount ?? 0}只。${overseas}${news}${signalGroups ? `稳健轮动候选——${signalGroups}；` : '当前未筛出满足条件的稳健候选。'}${momentumNames ? `强势追踪候选：${momentumNames}，仅等待回踩确认，不追涨停或爆量加速。` : '当前没有通过真实板块资金确认的强势追踪候选。'}`;
+  const limitText = result.sessionPhase?.auction
+    ? `竞价触及涨停${result.limits?.auctionUpCount ?? 0}只、竞价触及跌停${result.limits?.auctionDownCount ?? 0}只，不计连续交易确认。`
+    : `涨停${result.limits?.upCount ?? 0}只、跌停${result.limits?.downCount ?? 0}只。`;
+  return `市场状态${sentiment}${up || down ? `，上涨${up}家、下跌${down}家` : ''}。${regimeEvidence}${leaders ? `轮动靠前：${leaders}。` : ''}${funds ? `主力资金靠前：${funds}。` : ''}${limitText}${overseas}${news}${signalGroups ? `稳健轮动候选——${signalGroups}；` : '当前未筛出满足条件的稳健候选。'}${momentumNames ? `强势追踪候选：${momentumNames}，仅等待回踩确认，不追涨停或爆量加速。` : '当前没有通过真实板块资金确认的强势追踪候选。'}`;
+}
+
+function buildMarketComponents(result, {expectedMarketCount = null} = {}) {
+  const fetchedAt = result.fetchedAt || new Date().toISOString();
+  const base = (status, source, extra = {}) => ({status,source:source || '',sourceObservedAt:extra.sourceObservedAt || null,
+    fetchedAt,tradeDate:result.tradeDate || '',reason:extra.reason || '',sampleCount:extra.sampleCount ?? null,
+    expectedCount:extra.expectedCount ?? null});
+  const indexCount = result.indices?.length || 0;
+  const breadthCount = result.breadth?.sampleCount ?? 0;
+  const newsItems = result.newsContext?.items || [];
+  const newsFailure = result.newsStatus?.reason || [...(result.errors || []),...(result.warnings || [])]
+    .find(error => /消息|资讯|新闻/.test(error)) || '';
+  const limitsUnavailable = result.sessionPhase && !result.sessionPhase.continuous && result.sessionPhase.phase !== 'closed';
+  const historical = Boolean(result.sessionPhase?.historical);
+  const sectorStatus = result.sectorCapital?.stale ? 'stale'
+    : result.sectorCapital?.direct ? 'fresh' : result.sectors?.length ? 'partial' : 'unavailable';
+  return {
+    indices:base(indexCount >= 3 ? historical ? 'stale' : 'fresh' : indexCount ? 'partial' : 'unavailable','腾讯指数',
+      {sampleCount:indexCount,expectedCount:3,sourceObservedAt:latestQuoteObservedAt(result.indices || []),reason:historical ? '上一交易日收盘参考' : indexCount < 3 ? `指数${indexCount}/3项可用` : ''}),
+    breadth:base(breadthCount ? historical ? 'stale' : result.snapshotCoverage?.status || 'fresh' : 'unavailable','腾讯全市场行情',
+      {sampleCount:breadthCount,expectedCount:expectedMarketCount ?? result.snapshotCoverage?.expectedCount,sourceObservedAt:result.quoteObservedAt,
+        reason:historical ? '上一交易日收盘参考' : result.snapshotCoverage?.status === 'partial' ? '行情批次或交易日期覆盖不完整' : ''}),
+    turnover:base(finiteNumber(result.turnover) !== null ? historical ? 'stale' : 'fresh' : 'unavailable','腾讯全市场行情',
+      {sourceObservedAt:result.quoteObservedAt,reason:historical ? '上一交易日成交额参考' : finiteNumber(result.turnover) === null ? '全市场成交额缺失' : ''}),
+    limits:base(limitsUnavailable ? 'not-applicable' : result.limits ? historical ? 'stale' : 'fresh' : 'unavailable','腾讯全市场行情',
+      {sourceObservedAt:result.quoteObservedAt,reason:historical ? '上一交易日涨跌停参考' : limitsUnavailable ? result.limits?.observationReason : ''}),
+    sectorCapital:base(sectorStatus,result.sectorCapital?.source || (result.sectors?.length ? '量价估算' : ''),
+      {sourceObservedAt:result.sectorCapital?.fetchedAt,reason:result.sectorCapital?.stale ? '真实板块资金缓存已过期，仅作历史参考'
+        : result.sectorCapital?.direct ? '' : result.sectors?.length ? '未取得真实板块资金，使用量价估算' : '板块资金不可用'}),
+    news:base(newsItems.length ? result.newsStatus?.stale ? 'stale' : 'fresh' : newsFailure ? 'unavailable' : 'empty',
+      result.newsStatus?.source || result.newsContext?.source || '',{sourceObservedAt:result.newsStatus?.fetchedAt,
+        sampleCount:newsItems.length,reason:newsFailure || (!newsItems.length ? '请求成功但没有匹配的大盘消息' : '')}),
+    recommendations:base(result.recommendationsComputed ? result.recommendations?.length ? 'fresh' : 'empty'
+      : result.recommendationCoverage?.cachedFallback ? 'stale' : result.recommendations?.length ? 'partial' : 'unavailable','本地策略模型',
+      {sampleCount:result.recommendations?.length || 0,reason:result.recommendationFallback || ''}),
+    overseas:base(result.overseas?.available ? result.overseas?.stale ? 'stale' : 'fresh' : 'unavailable',result.overseas?.source || '',
+      {reason:result.overseas?.available ? '' : '海外市场数据不可用'})
+  };
 }
 
 async function fetchMarketOverview(force = false, favoriteOutcomes = [], onProgress = () => {}) {
@@ -5439,8 +5577,10 @@ async function fetchMarketOverview(force = false, favoriteOutcomes = [], onProgr
     result.breadth = snapshotResult.value.breadth;
     result.limits = snapshotResult.value.limits;
     result.activeStocks = snapshotResult.value.activeStocks;
-    result.tradeDate = snapshotResult.value.quotes.map(row=>row.tradeDate).filter(Boolean).sort().at(-1) || '';
+    result.tradeDate = snapshotResult.value.tradeDate || snapshotResult.value.quotes.map(row=>row.tradeDate).filter(Boolean).sort().at(-1) || '';
     result.turnover = snapshotResult.value.turnover;
+    result.snapshotCoverage = snapshotResult.value.coverage;
+    result.sessionPhase = snapshotResult.value.sessionPhase;
     result.errors.push(...snapshotResult.value.errors.map(error => `全市场行情部分失败：${error}`));
     const newsPromise = fetchMarketNews(force);
     const marketNewsContextPromise = newsPromise.then(value => summarizeNews(value.news, '', { ...value, scope:'market', lifecycleKey:'market' })).catch(() => summarizeNews([]));
@@ -5473,6 +5613,7 @@ async function fetchMarketOverview(force = false, favoriteOutcomes = [], onProgr
     result.sectors = annotateSectorRotation(result.sectors, marketOverviewCache?.value || previousOverview, result.tradeDate, regimeBaseline);
     const sourceObservedAt = latestQuoteObservedAt(outcomeQuotes);
     result.observationPhase = resolveObservationPhase(result.tradeDate, Date.parse(result.fetchedAt), {sourceObservedAt});
+    result.sessionPhase ||= resolveMarketSessionPhase(result.tradeDate,Date.parse(result.fetchedAt),{sourceObservedAt});
     result.snapshotId = marketSnapshotId({tradeDate:result.tradeDate, observedAt:Date.parse(result.fetchedAt),
       universe:outcomeQuotes.length, source:'tencent-market', contentSignature:marketQuoteContentSignature(outcomeQuotes)});
     result.quoteObservedAt = sourceObservedAt;
@@ -5480,6 +5621,10 @@ async function fetchMarketOverview(force = false, favoriteOutcomes = [], onProgr
       ? marketOverviewCache?.value || previousOverview : null;
     result.marketRegime = confirmMarketRecovery(classifyMarketRegime(result, priorIntraday || regimeBaseline, regimeBaseline),
       marketOverviewCache?.value || previousOverview, result.snapshotId, sourceObservedAt);
+    if (!result.sessionPhase.continuous && result.sessionPhase.phase !== 'closed') {
+      result.marketRegime = {...result.marketRegime,allowNewEntry:false,riskLevel:'session-observation',
+        evidence:[...(result.marketRegime.evidence || []),`${result.sessionPhase.label}仅观察，不产生新的入场许可`]};
+    }
     result.marketRegime.shadowPath = marketPathEvidence(result,rotationHistory.find(row=>row.tradeDate === result.tradeDate),
       regimeBaseline,outcomeQuotes);
     const latestThemeDay = rotationHistory.filter(row => row.tradeDate < result.tradeDate
@@ -5535,11 +5680,17 @@ async function fetchMarketOverview(force = false, favoriteOutcomes = [], onProgr
     else result.errors.push(`技术形态候选分析失败：${recommendationsResult.reason?.message || recommendationsResult.reason}`);
     if (newsResult.status === 'fulfilled') {
       result.newsContext = summarizeNews(newsResult.value.news, '', { ...newsResult.value, scope:'market', lifecycleKey:'market' });
+      result.newsStatus = {source:newsResult.value.source,fetchedAt:newsResult.value.fetchedAt,
+        stale:Boolean(newsResult.value.stale),cached:Boolean(newsResult.value.cached),reason:''};
       const newsIssues = classifyMarketNewsIssues(newsResult.value);
       result.errors.push(...newsIssues.errors);
       result.warnings.push(...newsIssues.warnings);
     }
-    else result.errors.push(`大盘消息获取失败：${newsResult.reason?.message || newsResult.reason}`);
+    else {
+      const reason = `大盘消息获取失败：${newsResult.reason?.message || newsResult.reason}`;
+      result.newsStatus = {source:'',fetchedAt:null,stale:false,cached:false,reason};
+      result.errors.push(reason);
+    }
   } else {
     result.errors.push(`全市场行情失败：${snapshotResult.reason?.message || snapshotResult.reason}`);
   }
@@ -5573,7 +5724,12 @@ async function fetchMarketOverview(force = false, favoriteOutcomes = [], onProgr
   result.recommendationCoverage ||= { scanned: snapshotResult.value?.quotes?.length || 0, prefiltered: 0, analyzed: 0, industries: 0, directoryAvailable: false };
   result.newsContext ||= summarizeNews([]);
   result.limits ||= { date: '', upCount: 0, downCount: 0, upStocks: [], downStocks: [] };
-  result.turnover ||= result.indices.slice(0, 2).reduce((sum, item) => sum + (item.amount || 0), 0);
+  if (finiteNumber(result.turnover) === null) {
+    const indexAmounts = result.indices.slice(0,2).map(item => finiteNumber(item.amount));
+    result.turnover = indexAmounts.length === 2 && indexAmounts.every(value => value !== null)
+      ? indexAmounts.reduce((sum,value) => sum + value,0) : null;
+  }
+  result.components = buildMarketComponents(result,{expectedMarketCount:result.snapshotCoverage?.expectedCount});
   result.analysis = marketAnalysis(result);
   result.source = ['腾讯指数', result.overseas.available ? result.overseas.source : '', snapshotResult.status === 'fulfilled' ? '腾讯全市场行情' : '', result.sectorCapital?.source || (result.sectors.length ? '全市场细分行业轮动估算' : '')].filter(Boolean).join(' + ');
   result.elapsedMs = Date.now() - startedAt;
@@ -5583,8 +5739,14 @@ async function fetchMarketOverview(force = false, favoriteOutcomes = [], onProgr
         ...previousOverview,
         cached: true,
         cachedFallback: true,
-        warnings: [...new Set([...(previousOverview.warnings || []), ...(result.warnings || [])])],
-        errors: [...new Set([...(previousOverview.errors || []), ...result.errors, '本轮大盘接口均不可用，已显示最近一次成功数据'])]
+        refreshFailed:true,
+        refreshComponents:result.components,
+        warnings:[...new Set(result.warnings || [])],
+        errors:[...new Set([...result.errors,'本轮大盘接口均不可用，已显示最近一次成功数据'])],
+        components:Object.fromEntries(Object.entries(previousOverview.components || {}).map(([key,value]) => [key,{
+          ...value,status:['empty','unavailable','not-applicable'].includes(value?.status) ? value.status : 'stale',
+          reason:`本轮刷新失败，显示${value?.sourceObservedAt || value?.fetchedAt || '最近一次'}历史数据`
+        }]))
       };
       fallback.recommendations = (fallback.recommendations || [])
         .map(item => ({ ...deactivateCachedRecommendation(item), industry: resolveRecommendationIndustry(item) }))
@@ -8812,6 +8974,7 @@ ipcMain.handle('fetch-market-overview', async (_event, input) => {
       if (_event?.sender && !_event.sender.isDestroyed()) _event.sender.send('market-overview-progress', progress);
     });
     const completedAt = new Date().toISOString();
+    result.requestId ||= crypto.randomUUID();
     result.inputCutoffAt ||= result.fetchedAt || completedAt;
     result.computedAt ||= completedAt;
     result.publishedAt = completedAt;
@@ -8821,7 +8984,7 @@ ipcMain.handle('fetch-market-overview', async (_event, input) => {
     synchronizeSavedEntryPermissions(result);
     if (result.recommendationsComputed) appendRecommendationLedger(result);
     appendLogLine({ type:'info', message:'大盘筛选诊断', action:'market_screening_diagnostics', detail:{ elapsedMs:result.elapsedMs, coverage:result.recommendationCoverage } });
-    appendLogLine({ type: result.errors.length ? 'warn' : 'success', message: '大盘实时分析完成', action: 'market_overview', detail: { indices: result.indices.length, sectors: result.sectors.length, sectorLeaders:result.sectors.slice(0, 8).map(item => ({name:item.name, changePct:item.changePct, upRatio:item.upRatio, rotationScore:item.rotationScore, rotationState:item.rotationState, mainNetInflow:item.mainNetInflow, mainNetPct:item.mainNetPct, capitalRank:item.capitalRank, capitalEstimated:item.capitalEstimated, capitalSource:item.capitalSource})), stableRecommendations: result.recommendations?.length || 0, momentumRecommendations:result.momentumRecommendations?.length || 0, rotationCandidates:result.recommendationCoverage?.rotationCandidates || 0, recommendationOutcomeSamples: result.recommendationCoverage?.outcomeFeedback?.sampleSize || 0, stockFundFlowDirect:result.recommendationCoverage?.fundFlowDirect || 0, stockFundFlowEstimated:result.recommendationCoverage?.fundFlowEstimated || 0, directSectorCapital:result.recommendationCoverage?.directSectorCapital || 0, sectorCapital:result.sectorCapital || null, overseas:result.overseas, news: result.newsContext?.items?.length || 0, turnover: result.turnover, limits: result.limits, source: result.source, warnings: result.warnings || [], errors: result.errors } });
+    appendLogLine({ type: result.errors.length ? 'warn' : 'success', message: '大盘实时分析完成', action: 'market_overview', detail: { requestId:result.requestId,elapsedMs:result.elapsedMs,sessionPhase:result.sessionPhase,components:result.components,indices:result.indices.length,sectors:result.sectors.length,stableRecommendations:result.recommendations?.length || 0,momentumRecommendations:result.momentumRecommendations?.length || 0,rotationCandidates:result.recommendationCoverage?.rotationCandidates || 0,recommendationOutcomeSamples:result.recommendationCoverage?.outcomeFeedback?.sampleSize || 0,stockFundFlowDirect:result.recommendationCoverage?.fundFlowDirect || 0,stockFundFlowEstimated:result.recommendationCoverage?.fundFlowEstimated || 0,directSectorCapital:result.recommendationCoverage?.directSectorCapital || 0,news:result.newsContext?.items?.length || 0,turnover:result.turnover,limits:{date:result.limits?.date,upCount:result.limits?.upCount,downCount:result.limits?.downCount,auctionUpCount:result.limits?.auctionUpCount,auctionDownCount:result.limits?.auctionDownCount,coverage:result.limits?.dataCoverage},source:result.source,warnings:result.warnings || [],errors:result.errors } });
     return result;
   } catch (err) {
     appendLogLine({ type: 'error', message: '大盘实时分析失败', action: 'market_overview_failed', stack: err.stack || String(err) });
@@ -9288,7 +9451,8 @@ async function buildDailyReportInput(tradeDate, {force = false, manual = false} 
   if (tradeDate < today) warnings.push('历史补报只使用已保存推荐、历史日线和当前仍可核验的收藏事件，不重建盘中消息或资金');
   const market = overview ? {
     breadth:overview.breadth || {}, turnover:overview.turnover, indices:overview.indices || [], limits:overview.limits || {},
-    regime:overview.marketRegime || null, overseas:overview.overseas || null,
+    regime:overview.marketRegime || null, overseas:overview.overseas || null,sessionPhase:overview.sessionPhase || null,
+    components:overview.components || {},
     path:compactReportMarketPath(overview.marketPath),
     planFunnel:overview.recommendationCoverage?.planFunnel || null,
     warnings:[...(overview.warnings || []), ...(overview.errors || []), ...warnings]
@@ -9297,7 +9461,8 @@ async function buildDailyReportInput(tradeDate, {force = false, manual = false} 
       up:latest.coverage.marketRegime.up, down:latest.coverage.marketRegime.down, flat:latest.coverage.marketRegime.flat
     } : {}),
     turnover:savedMarket?.turnover ?? latest?.coverage?.marketRegime?.turnover ?? null,
-    indices:savedMarket?.indices || [],limits:savedMarket?.limits || {},
+    indices:savedMarket?.indices || [],limits:savedMarket?.limits || {},sessionPhase:savedMarket?.sessionPhase || null,
+    components:savedMarket?.components || {},
     path:savedMarket ? compactReportMarketPath(savedMarket) : null,
     regime:latest?.coverage?.marketRegime || null,
     warnings
@@ -9675,6 +9840,9 @@ module.exports = {
   tencentQuoteObservedAt,
   marketQuoteContentSignature,
   resolveObservationPhase,
+  resolveMarketSessionPhase,
+  summarizeMarketSnapshot,
+  buildMarketComponents,
   crossSectionPercentile,
   buildAiEvidencePrompt,
   validateAiExplanation,
@@ -9779,6 +9947,9 @@ module.exports = {
   aggregateHistoryPeriod,
   parseReductionPlanWindow,
   parseJin10FlashItems,
+  filterSinaMarketNewsPages,
+  updateNewsSourceCooldown,
+  newsSourceCanRun,
   classifyMarketNewsIssues,
   fetchLiveNews,
   settleWithConcurrency

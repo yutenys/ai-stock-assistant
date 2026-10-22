@@ -48,6 +48,12 @@ const {
   tencentQuoteObservedAt,
   marketQuoteContentSignature,
   resolveObservationPhase,
+  resolveMarketSessionPhase,
+  summarizeMarketSnapshot,
+  buildMarketComponents,
+  filterSinaMarketNewsPages,
+  updateNewsSourceCooldown,
+  newsSourceCanRun,
   crossSectionPercentile,
   buildAiEvidencePrompt,
   validateAiExplanation,
@@ -162,6 +168,90 @@ test('统一时点区分盘中、收盘和旧交易日', () => {
   const snapshot=marketSnapshotId({tradeDate:'2026-09-14',observedAt:intraday,universe:5900,source:'test'});
   assert.match(snapshot, /^2026-09-14-/);
   assert.notEqual(snapshot, marketSnapshotId({tradeDate:'2026-09-14',observedAt:intraday+1,universe:5900,source:'test'}));
+});
+
+test('大盘细分交易阶段覆盖竞价、连续交易、午休、收盘和休市', () => {
+  const phase = time => resolveMarketSessionPhase('2026-10-22', Date.parse(`2026-10-22T${time}+08:00`));
+  assert.equal(phase('09:14:00').phase, 'preopen');
+  assert.equal(phase('09:16:00').phase, 'opening-auction');
+  assert.equal(phase('09:25:00').phase, 'opening-wait');
+  assert.equal(phase('09:29:00').phase, 'opening-wait');
+  assert.equal(phase('09:30:00').phase, 'morning');
+  assert.equal(phase('11:30:00').phase, 'lunch');
+  assert.equal(phase('12:00:00').phase, 'lunch');
+  assert.equal(phase('13:00:00').phase, 'afternoon');
+  assert.equal(phase('14:58:00').phase, 'closing-auction');
+  assert.equal(phase('15:00:00').phase, 'close-pending');
+  assert.equal(resolveMarketSessionPhase('2026-10-22', Date.parse('2026-10-22T15:10:00+08:00'), {
+    sourceObservedAt:Date.parse('2026-10-22T15:01:00+08:00')
+  }).phase, 'closed');
+  assert.equal(resolveMarketSessionPhase('2026-10-24', Date.parse('2026-10-24T10:00:00+08:00')).phase, 'holiday');
+  const previous=resolveMarketSessionPhase('2026-10-21',Date.parse('2026-10-22T09:00:00+08:00'));
+  assert.equal(previous.phase,'closed');
+  assert.equal(previous.historical,true);
+});
+
+test('集合竞价涨跌停与连续交易隔离且合法零成交额不会变成缺失', () => {
+  const quotes = [
+    {code:'600001',name:'竞价涨停',price:11,prevClose:10,changePct:10,upperLimit:11,lowerLimit:9,amount:0,tradeDate:'2026-10-22',quoteObservedAt:'2026-10-22T01:16:00.000Z'},
+    {code:'600002',name:'竞价跌停',price:9,prevClose:10,changePct:-10,upperLimit:11,lowerLimit:9,amount:0,tradeDate:'2026-10-22',quoteObservedAt:'2026-10-22T01:16:00.000Z'}
+  ];
+  const auction = summarizeMarketSnapshot(quotes, {observedAt:Date.parse('2026-10-22T09:16:00+08:00'), expectedCount:2});
+  assert.equal(auction.sessionPhase.phase, 'opening-auction');
+  assert.equal(auction.turnover, 0);
+  assert.equal(auction.limits.upCount, null);
+  assert.equal(auction.limits.downCount, null);
+  assert.equal(auction.limits.auctionUpCount, 1);
+  assert.equal(auction.limits.auctionDownCount, 1);
+
+  const mixed = summarizeMarketSnapshot([...quotes, {...quotes[0],code:'600003',tradeDate:'2026-10-21'}], {
+    observedAt:Date.parse('2026-10-22T10:00:00+08:00'), expectedCount:3
+  });
+  assert.equal(mixed.coverage.validCount, 2);
+  assert.equal(mixed.coverage.invalidDateCount, 1);
+  assert.equal(mixed.coverage.status, 'partial');
+});
+
+test('组件状态把新闻故障与核心行情故障分开', () => {
+  const result = {
+    fetchedAt:'2026-10-22T02:00:00.000Z', tradeDate:'2026-10-22',
+    indices:[{code:'000001'},{code:'399001'},{code:'399006'}],
+    breadth:{up:3000,down:2000,flat:100,sampleCount:5100}, turnover:0,
+    limits:{upCount:20,downCount:3}, sectors:[{name:'农业'}],
+    sectorCapital:{source:'缓存',stale:true,fetchedAt:'2026-10-22T00:47:00.000Z'},
+    newsContext:{items:[]}, recommendations:[], overseas:{available:true,source:'腾讯'},
+    errors:[], warnings:['大盘消息获取失败：连接重置']
+  };
+  const components = buildMarketComponents(result, {expectedMarketCount:5100});
+  assert.equal(components.indices.status, 'fresh');
+  assert.equal(components.breadth.status, 'fresh');
+  assert.equal(components.turnover.status, 'fresh');
+  assert.equal(components.news.status, 'unavailable');
+  assert.equal(components.sectorCapital.status, 'stale');
+});
+
+test('新浪分页过滤保留宏观消息、记录诊断并排除公司新闻', () => {
+  const page1 = [{title:'某公司获得大额订单',url:'https://example.com/company',ctime:1792640000}];
+  const page2 = [{title:'人民币兑美元中间价上调，A股市场风险偏好改善',url:'https://example.com/macro',ctime:1792640100}];
+  const result = filterSinaMarketNewsPages([page1,page2], {now:Date.parse('2026-10-22T12:00:00+08:00'),limit:8});
+  assert.equal(result.news.length, 1);
+  assert.match(result.news[0].title, /人民币兑美元中间价/);
+  assert.equal(result.diagnostics.rawCount, 2);
+  assert.equal(result.diagnostics.scopeMatchedCount, 1);
+  assert.equal(isMarketWideNews({title:'美股三大指数集体收涨，特斯拉上涨'}),false);
+});
+
+test('新闻来源失败按1/2/5分钟跨刷新退避且429不能被手动刷新绕过', () => {
+  const now=Date.parse('2026-10-22T10:00:00+08:00');
+  const first=updateNewsSourceCooldown({},new Error('ECONNRESET'),now);
+  assert.equal(first.failures,1);
+  assert.equal(first.nextRetryAt,now+60_000);
+  assert.equal(newsSourceCanRun(first,false,now+30_000),false);
+  assert.equal(newsSourceCanRun(first,true,now+30_000),true);
+  const limited=updateNewsSourceCooldown(first,Object.assign(new Error('HTTP 429'),{statusCode:429,retryAfterMs:180_000}),now);
+  assert.equal(limited.nextRetryAt,now+180_000);
+  assert.equal(newsSourceCanRun(limited,true,now+60_000),false);
+  assert.equal(updateNewsSourceCooldown(limited,null,now).failures,0);
 });
 
 test('横截面百分位按平均秩处理并拒绝不足样本', () => {
@@ -823,6 +913,21 @@ test('行情响应中途断开能结束请求并进入失败路径', async () =>
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
   try { await assert.rejects(requestText(`http://127.0.0.1:${server.address().port}`,500),/断开|aborted|socket/i); }
   finally { await new Promise(resolve=>server.close(resolve)); }
+});
+
+test('持续滴流响应也受绝对请求时限约束', async () => {
+  const http=require('node:http');
+  const server=http.createServer((_req,res)=>{
+    res.writeHead(200);
+    const timer=setInterval(()=>res.write('x'),20);
+    res.on('close',()=>clearInterval(timer));
+  });
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  const started=Date.now();
+  try {
+    await assert.rejects(requestText(`http://127.0.0.1:${server.address().port}`,120),/请求超时/);
+    assert.ok(Date.now()-started < 500);
+  } finally { await new Promise(resolve=>server.close(resolve)); }
 });
 
 test('成功筛空不能恢复旧推荐，接口失败回退不保留入场许可', () => {

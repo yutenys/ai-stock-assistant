@@ -146,6 +146,31 @@ test('大盘并发刷新共享正在执行的请求，完成后可重新刷新',
   await next;
 });
 
+test('大盘刷新通知区分核心行情与市场消息状态',()=>{
+  const context=harness(['marketRefreshNotice']);
+  const newsOnly=context.marketRefreshNotice({components:{
+    indices:{status:'fresh'},breadth:{status:'fresh'},turnover:{status:'fresh'},news:{status:'unavailable'}
+  }});
+  assert.equal(newsOnly.type,'info');
+  assert.match(newsOnly.message,/大盘行情已更新/);
+  assert.match(newsOnly.message,/市场消息暂不可用/);
+
+  const coreFailure=context.marketRefreshNotice({components:{
+    indices:{status:'unavailable'},breadth:{status:'unavailable'},turnover:{status:'unavailable'},news:{status:'fresh'}
+  }});
+  assert.equal(coreFailure.type,'warn');
+  assert.match(coreFailure.message,/核心行情更新失败/);
+});
+
+test('大盘自动刷新按交易阶段降频',()=>{
+  const context=harness(['marketRefreshIntervalMs']);
+  assert.equal(context.marketRefreshIntervalMs({phase:'morning'}),60_000);
+  assert.equal(context.marketRefreshIntervalMs({phase:'opening-auction'}),60_000);
+  assert.equal(context.marketRefreshIntervalMs({phase:'lunch'}),5*60_000);
+  assert.equal(context.marketRefreshIntervalMs({phase:'closed'}),15*60_000);
+  assert.equal(context.marketRefreshIntervalMs({phase:'holiday'}),30*60_000);
+});
+
 test('模拟交易拒绝未知方向和超范围数量，失败不修改持仓',()=>{
   const context=harness(['executeSimulatedTrade'],{
     portfolio:[],simulatedTrades:[],findStockByCode:()=>({code:'600001',name:'测试',price:10}),

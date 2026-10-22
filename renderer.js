@@ -28,6 +28,7 @@ let logs = [];
 let currentViewSource = 'empty';
 let marketOverviewRefreshing = false;
 let marketOverviewPending = null;
+let marketOverviewTimer = null;
 let latestMarketRecommendations = [];
 let latestMarketWatchRecommendations = [];
 let latestMarketMomentumRecommendations = [];
@@ -395,7 +396,7 @@ function renderMarketOverview(result){
   }
   $('marketAnalysis').textContent = result.analysis || '市场分析暂不可用。';
   $('marketUpdated').textContent = result.fetchedAt
-    ? `${result.observationPhase?.label || '时点待确认'} · ${new Date(result.fetchedAt).toLocaleTimeString('zh-CN', {hour12:false})} · 自动刷新60秒`
+    ? `${result.sessionPhase?.label || result.observationPhase?.label || '时点待确认'} · ${new Date(result.fetchedAt).toLocaleTimeString('zh-CN', {hour12:false})} · 下次自动刷新约${Math.round(marketRefreshIntervalMs(result.sessionPhase)/60000)}分钟`
     : '等待更新';
   $('marketIndices').innerHTML = (result.indices || []).map(index => `<div class="market-index">
     <div><b>${escapeHtml(index.name)}</b><span> ${escapeHtml(index.code)}</span></div>
@@ -421,7 +422,8 @@ function renderMarketOverview(result){
   const limits = result.limits || {};
   const upStocks = (limits.upStocks || []).slice(0, 6).map(item => `${item.name}${item.industry ? `(${item.industry})` : ''}`).join('、');
   const downStocks = (limits.downStocks || []).slice(0, 4).map(item => item.name).join('、');
-  $('marketLimits').innerHTML = `<div class="market-limit-summary"><span class="up">涨停 ${limits.upCount ?? '--'}</span><span class="down">跌停 ${limits.downCount ?? '--'}</span></div>
+  const auctionLimits = limits.auctionUpCount != null || limits.auctionDownCount != null;
+  $('marketLimits').innerHTML = `<div class="market-limit-summary"><span class="up">${auctionLimits ? '竞价触及涨停' : '涨停'} ${auctionLimits ? limits.auctionUpCount : limits.upCount ?? '--'}</span><span class="down">${auctionLimits ? '竞价触及跌停' : '跌停'} ${auctionLimits ? limits.auctionDownCount : limits.downCount ?? '--'}</span></div>
     ${upStocks ? `<div class="market-stocks"><b>涨停代表：</b>${escapeHtml(upStocks)}</div>` : ''}
     ${downStocks ? `<div class="market-stocks"><b>跌停代表：</b>${escapeHtml(downStocks)}</div>` : ''}
     ${limits.observationReason ? `<div class="market-stocks"><small>${escapeHtml(limits.observationReason)}</small></div>` : ''}`;
@@ -542,7 +544,8 @@ function renderMarketOverview(result){
   setMarketRecommendationTrack(activeMarketRecommendationTrack);
   const marketNews = result.newsContext?.items || [];
   const decisionNews = result.newsContext?.decisionItems || [];
-  $('marketNews').innerHTML = `<div class="market-stocks">${escapeHtml(result.newsContext?.summary || '消息面暂不可用')}</div>${decisionNews.length ? `<div class="market-coverage">影响本轮判断：${escapeHtml(decisionNews.map(item => `${item.title}（${item.weightedScore > 0 ? '+' : ''}${item.weightedScore}）`).join('；'))}</div>` : ''}${marketNews.slice(0, 5).map(item => `<a class="market-news-row" href="#" data-market-news-link="${escapeHtml(safeHttpUrl(item.link))}">${escapeHtml(item.title)}<span>${escapeHtml(item.source || '')} · ${escapeHtml(item.publishedAt || '')}</span></a>`).join('')}`;
+  const newsReason = result.components?.news?.reason;
+  $('marketNews').innerHTML = `<div class="market-stocks">${escapeHtml(newsReason || result.newsContext?.summary || '消息面暂不可用')}</div>${decisionNews.length ? `<div class="market-coverage">影响本轮判断：${escapeHtml(decisionNews.map(item => `${item.title}（${item.weightedScore > 0 ? '+' : ''}${item.weightedScore}）`).join('；'))}</div>` : ''}${marketNews.slice(0, 5).map(item => `<a class="market-news-row" href="#" data-market-news-link="${escapeHtml(safeHttpUrl(item.link))}">${escapeHtml(item.title)}<span>${escapeHtml(item.source || '')} · ${escapeHtml(item.publishedAt || '')}</span></a>`).join('')}`;
   document.querySelectorAll('[data-market-recommendation]').forEach(button => button.onclick = () => {
     const item = [...recommendations, ...momentumRecommendations].find(candidate => candidate.code === button.dataset.marketRecommendation);
     if(!item) return;
@@ -575,6 +578,38 @@ function loadMarketOverview(force=false, silent=false){
   return marketOverviewPending;
 }
 
+function marketRefreshNotice(result={}){
+  if(result.refreshFailed) return {message:'大盘核心行情更新失败，已保留最近一次可用画面',type:'warn'};
+  const components=result.components || {};
+  const core=[components.indices,components.breadth,components.turnover].filter(Boolean);
+  const coreFailed=core.length ? core.every(item=>['unavailable','empty'].includes(item.status)) : (result.errors || []).some(error=>/指数行情失败|全市场行情失败/.test(error));
+  if(coreFailed) return {message:'大盘核心行情更新失败，已保留最近一次可用画面',type:'warn'};
+  const notices=[core.length && core.every(item=>item.status === 'stale') ? '大盘行情显示上一交易日收盘参考' : '大盘行情已更新'];
+  if(components.news?.status === 'unavailable') notices.push('市场消息暂不可用');
+  else if(components.news?.status === 'stale') notices.push('市场消息显示历史参考');
+  if(components.sectorCapital?.status === 'stale') notices.push('板块资金显示历史参考');
+  else if(components.sectorCapital?.status === 'unavailable') notices.push('板块资金暂不可用');
+  const degraded=notices.length > 1 || Object.values(components).some(item=>['partial','stale','unavailable'].includes(item?.status));
+  return {message:notices.join('；'),type:degraded ? 'info' : 'success'};
+}
+
+function marketRefreshIntervalMs(sessionPhase={}){
+  if(['morning','afternoon','opening-auction','closing-auction','opening-wait'].includes(sessionPhase.phase)) return 60_000;
+  if(sessionPhase.phase === 'lunch') return 5 * 60_000;
+  if(['closed','close-pending'].includes(sessionPhase.phase)) return 15 * 60_000;
+  return 30 * 60_000;
+}
+
+function scheduleMarketOverviewRefresh(){
+  clearTimeout(marketOverviewTimer);
+  const interval=marketRefreshIntervalMs(latestMarketOverview?.sessionPhase);
+  marketOverviewTimer=setTimeout(async()=>{
+    await loadMarketOverview();
+    scheduleMarketOverviewRefresh();
+  },interval);
+  return interval;
+}
+
 async function performMarketRefresh(force=false, silent=false){
   if(!window.stockApi?.fetchMarketOverview) return latestMarketOverview;
   marketOverviewRefreshing = true;
@@ -597,9 +632,8 @@ async function performMarketRefresh(force=false, silent=false){
     const result = await window.stockApi.fetchMarketOverview({force, favoriteOutcomes:favoriteOutcomeRows()});
     renderMarketOverview(result);
     if(force && !silent) {
-      const errors = result.errors || [];
-      const warnings = result.warnings || [];
-      notify(errors.length ? '大盘核心数据部分更新失败，详情已标注' : warnings.length ? '大盘数据已更新，部分备用来源已切换' : '大盘数据已更新', errors.length ? 'warn' : warnings.length ? 'info' : 'success');
+      const notice=marketRefreshNotice(result);
+      notify(notice.message,notice.type);
     }
     return result;
   }catch(err){
@@ -3684,5 +3718,4 @@ window.stockApi?.onDailyReportProgress?.(progress => {
   }else if(progress?.state === 'failed') notify(`${progress.message || '收盘报告生成失败'}：${progress.error || ''}`, 'error');
 });
 window.stockApi?.getFullMarketResearchStatus?.().then(renderFullMarketResearchStatus).catch(() => {});
-loadMarketOverview();
-setInterval(() => loadMarketOverview(), 60 * 1000);
+loadMarketOverview().finally(scheduleMarketOverviewRefresh);

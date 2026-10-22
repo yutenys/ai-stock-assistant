@@ -39,6 +39,18 @@ test('实际大盘路径对象和影子决策能渲染，缺失锚点不补造',
   assert.doesNotMatch(html,/14:30/);
 });
 
+test('收盘报告保留组件级数据质量和来源时间',()=>{
+  const components={indices:{status:'fresh',source:'腾讯指数',sourceObservedAt:'2026-10-22T07:00:00.000Z'},
+    news:{status:'unavailable',source:'',reason:'公开消息源连接失败'}};
+  const report=buildDailyReport({tradeDate:'2026-10-22',market:{components}});
+  assert.equal(report.status,'partial');
+  assert.equal(report.dataQuality.components.news.status,'unavailable');
+  const html=renderDailyReportHtml(report);
+  assert.match(html,/数据质量/);
+  assert.match(html,/公开消息源连接失败/);
+  assert.match(html,/2026-10-22T07:00:00.000Z/);
+});
+
 test('收盘报告对无可行买点只列观察条件，不伪装次日触发',()=>{
   const report=buildDailyReport({tradeDate:'2026-10-09',stable:[{code:'600001',entryPermission:'watch',
     tradePlan:{feasibility:{status:'empty',reason:'确认价高于最高入场价'},confirmationPrice:11,
