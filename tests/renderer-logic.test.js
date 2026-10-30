@@ -160,6 +160,16 @@ test('大盘刷新通知区分核心行情与市场消息状态',()=>{
   }});
   assert.equal(coreFailure.type,'warn');
   assert.match(coreFailure.message,/核心行情更新失败/);
+
+  const partial=context.marketRefreshNotice({components:{
+    indices:{status:'partial',sampleCount:2,expectedCount:3},
+    breadth:{status:'unavailable'},turnover:{status:'unavailable'},news:{status:'fresh'}
+  }});
+  assert.equal(partial.type,'warn');
+  assert.match(partial.message,/部分更新/);
+  assert.match(partial.message,/指数2\/3/);
+  assert.match(partial.message,/全市场行情暂不可用/);
+  assert.doesNotMatch(partial.message,/行情已更新/);
 });
 
 test('大盘自动刷新按交易阶段降频',()=>{
@@ -268,15 +278,49 @@ test('个股分析过期缓存重新获取，强制刷新等待旧请求后发�
   assert.equal(context.detailHistoryPending.size,0);
 });
 
+test('当天未完成K线在图表说明中显示最新价格，不称收盘价',()=>{
+  const context=harness(['chartChangePct','chartMetaText'],{yuan:value=>`¥${value}`,formatPct:value=>`${value?.toFixed(2)}%`});
+  const meta=context.chartMetaText({source:'腾讯不复权日K',rows:[
+    {time:'2026-10-21',close:10},{time:'2026-10-22',close:10.2,isFinal:false}
+  ]},'day',null);
+  assert.match(meta,/最新 ¥10\.2 · 涨跌 2\.00%/);
+  assert.match(meta,/当期未完成/);
+  assert.doesNotMatch(meta,/收盘/);
+});
+
 test('持仓风险按原失效条件判断，不用今日推荐缺席推导卖出',()=>{
   const context=harness(['portfolioMetrics','portfolioRiskAssessment'],{yuan:value=>`¥${value}`});
   const position={quantity:100,costPrice:10,lastPrice:8.5,realizedPnl:0};
-  const breached=context.portfolioRiskAssessment(position,{}, {analysis:{tradeDate:'2026-09-11',tradePlan:{invalidationPrice:9}}});
+  const breached=context.portfolioRiskAssessment(position,{quoteObservedAt:'2026-09-11T07:00:00.000Z'}, {analysis:{tradeDate:'2026-09-11',tradePlan:{invalidationPrice:9}}});
   assert.equal(breached.label,'策略失效');
   position.lastPrice=9.5;
-  const unknown=context.portfolioRiskAssessment(position,{},null);
+  const unknown=context.portfolioRiskAssessment(position,{quoteObservedAt:'2026-09-11T07:00:00.000Z'},null);
   assert.equal(unknown.label,'待分析');
   assert.match(unknown.summary,/不能用推荐缺席/);
+});
+
+test('缺少现价不按成本伪造平盘，旧分析不能判断最新持仓',()=>{
+  const context=harness(['portfolioStock','portfolioMetrics','portfolioRiskAssessment'],{yuan:value=>`¥${value}`,stocks:[],labels:[]});
+  const missing={quantity:100,costPrice:10,lastPrice:0};
+  assert.equal(context.portfolioMetrics(missing).floatingPnl,null);
+  assert.equal(context.portfolioRiskAssessment(missing,{},null).label,'行情待刷新');
+  assert.equal(context.portfolioStock({code:'600001',name:'测试',...missing}).price,null);
+  assert.equal(context.portfolioRiskAssessment({quantity:100,costPrice:10,lastPrice:8.5},{},
+    {analysis:{tradeDate:'2026-10-28',tradePlan:{invalidationPrice:9}}}).label,'行情时点待核验');
+  const stale={quantity:100,costPrice:10,lastPrice:8.5};
+  const risk=context.portfolioRiskAssessment(stale,{quoteObservedAt:'2026-10-28T07:00:00.000Z'},
+    {analysis:{tradeDate:'2026-10-27',tradePlan:{invalidationPrice:9}}});
+  assert.equal(risk.label,'分析待刷新');
+});
+
+test('行业集中度跳过缺价持仓',()=>{
+  const context=harness(['portfolioMetrics','portfolioIndustryConcentration']);
+  const groups=context.portfolioIndustryConcentration([
+    {sector:'半导体',quantity:100,costPrice:10,lastPrice:0},
+    {sector:'通信',quantity:100,costPrice:10,lastPrice:12}
+  ]);
+  assert.deepEqual(Array.from(groups,row=>row.industry),['通信']);
+  assert.equal(groups[0].weight,1);
 });
 
 test('推荐卡片优先使用统一评分快照并明确周期待确认',()=>{

@@ -9,7 +9,8 @@ const {
   FundFlowRequestCoordinator,
   assessFundFlowCoverage,
   normalizeFundFlowRecord,
-  parseKnownJsonp
+  parseKnownJsonp,
+  parseYyqyxFundFlowTable
 } = require('../lib/fund-flow-history');
 
 function record(overrides = {}) {
@@ -40,6 +41,21 @@ test('资金记录按显式来源契约转换单位，零值与负值均保留',
     code:'600001', tradeDate:'2026-10-09', mainNetAmount:1, provider:'fixture',
     definitionId:'fixture-main-v1', phase:'historical-final', origin:'historical-api'
   }, {}), /amountUnit/);
+});
+
+test('公开网页逐日资金只解析匹配股票的表格，并保留取整单位', () => {
+  const html = `<link rel="canonical" href="https://www.yyqyx.com/s/603980.SH">
+    <h2 id="sec18">吉华集团近期主力资金流向</h2><table>
+    <thead><tr><th>日期</th><th>主力净额</th></tr></thead><tbody>
+    <tr><td>2026-10-21</td><td class="down">-1.45 亿元</td></tr>
+    <tr><td>2026-10-20</td><td class="up">+2,021 万元</td></tr>
+    </tbody></table>`;
+  assert.deepEqual(parseYyqyxFundFlowTable(html, '603980').map(row => [row.date, row.mainNetInflow]), [
+    ['2026-10-20', 20210000], ['2026-10-21', -145000000]
+  ]);
+  assert.throws(() => parseYyqyxFundFlowTable(html, '002708'), /代码不匹配/);
+  assert.throws(() => parseYyqyxFundFlowTable(html.replace('+2,021 万元', '未知'), '603980'), /金额格式无效/);
+  assert.throws(() => parseYyqyxFundFlowTable(html.replace('2026-10-20', '2026-10-21'), '603980'), /日期无效或重复/);
 });
 
 test('完整性只由同一来源同一口径的最终逐日记录满足', () => {

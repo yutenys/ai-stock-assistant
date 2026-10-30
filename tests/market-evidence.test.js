@@ -21,6 +21,16 @@ test('breadth coverage changes are unknown, not falsely calculated deceleration'
   assert.equal(value.coverageComparable,false);
 });
 
+test('repeated post-close breadth is not a new market trend observation',()=>{
+  const close={tradeDate:'2026-10-28',snapshotId:'close',quoteObservedAt:'2026-10-28T07:00:00Z',
+    fetchedAt:'2026-10-28T07:01:00Z',observationPhase:{phase:'closed'},breadth:{up:4156,down:1238,sampleCount:5927}};
+  const repeated={...close,snapshotId:'close-again',quoteObservedAt:'2026-10-28T08:00:00Z',fetchedAt:'2026-10-28T08:01:00Z'};
+  assert.equal(api.classifyMarketRegime(repeated,close).upRatioDelta,null);
+  const continuous={...close,snapshotId:'14:30',quoteObservedAt:'2026-10-28T06:30:00Z',
+    observationPhase:{phase:'intraday'},breadth:{up:4500,down:900,sampleCount:5927}};
+  assert(api.classifyMarketRegime(repeated,continuous).upRatioDelta < 0);
+});
+
 test('trimming intraday samples preserves earlier peak and available anchors',()=>{
   const early={tradeDate:'2026-10-09',snapshotId:'early',fetchedAt:'2026-10-09T01:45:00Z',
     quoteObservedAt:'2026-10-09T01:45:00Z',breadth:{up:4500,down:500},turnover:1,observationPhase:{phase:'intraday'}};

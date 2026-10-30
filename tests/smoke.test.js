@@ -51,6 +51,7 @@ const {
   resolveMarketSessionPhase,
   summarizeMarketSnapshot,
   buildMarketComponents,
+  marketAnalysis,
   filterSinaMarketNewsPages,
   updateNewsSourceCooldown,
   newsSourceCanRun,
@@ -110,6 +111,7 @@ const {
   buildFutureRiskProfile,
   summarizeFundFlowRows,
   applyExpectedFundFlowCoverage,
+  fundFlowArchiveRecords,
   estimateFundFlowFromHistory,
   fundFlowPeriodEvidence,
   outcomeStatsAdjustment,
@@ -204,6 +206,14 @@ test('集合竞价涨跌停与连续交易隔离且合法零成交额不会变�
   assert.equal(auction.limits.auctionUpCount, 1);
   assert.equal(auction.limits.auctionDownCount, 1);
 
+  const closed = summarizeMarketSnapshot(quotes.map(quote => ({...quote,
+    quoteObservedAt:'2026-10-22T07:00:00.000Z'})), {
+    observedAt:Date.parse('2026-10-22T15:10:00+08:00'),expectedCount:2
+  });
+  assert.equal(closed.sessionPhase.phase,'closed');
+  assert.equal(closed.limits.upCount,1);
+  assert.equal(closed.limits.downCount,1);
+
   const mixed = summarizeMarketSnapshot([...quotes, {...quotes[0],code:'600003',tradeDate:'2026-10-21'}], {
     observedAt:Date.parse('2026-10-22T10:00:00+08:00'), expectedCount:3
   });
@@ -228,6 +238,48 @@ test('组件状态把新闻故障与核心行情故障分开', () => {
   assert.equal(components.turnover.status, 'fresh');
   assert.equal(components.news.status, 'unavailable');
   assert.equal(components.sectorCapital.status, 'stale');
+});
+
+test('组件时间不早于本轮开始，新闻来源时间取实际发布时间', () => {
+  const start=new Date(Date.now()-10_000).toISOString();
+  const newsFetched=new Date(Date.now()-5_000).toISOString();
+  const published=new Date(Date.now()-60_000).toISOString();
+  const components=buildMarketComponents({fetchedAt:start,tradeDate:'2026-10-22',
+    indicesFetchedAt:newsFetched,snapshotFetchedAt:newsFetched,
+    indices:[{code:'000001'},{code:'399001'},{code:'399006'}],
+    breadth:{up:1,down:0,sampleCount:1},turnover:0,limits:{upCount:0,downCount:0},
+    newsContext:{items:[{title:'大盘消息',publishedAt:published}],latestPublishedAt:published},
+    newsStatus:{source:'新浪',fetchedAt:newsFetched},
+    sectorCapital:{direct:true,source:'板块资金',fetchedAt:newsFetched}
+  });
+  assert.equal(components.news.fetchedAt,newsFetched);
+  assert.equal(components.news.sourceObservedAt,published);
+  assert.equal(components.sectorCapital.fetchedAt,newsFetched);
+  assert.equal(components.indices.fetchedAt,newsFetched);
+  assert.equal(components.breadth.fetchedAt,newsFetched);
+});
+
+test('快照缺失时成交额和涨跌停不能由指数金额或零值冒充', () => {
+  const components=buildMarketComponents({fetchedAt:new Date().toISOString(),
+    indices:[{code:'000001',amount:2e11},{code:'399001',amount:3e11}],
+    breadth:null,turnover:null,limits:null,newsContext:{items:[]}});
+  assert.equal(components.breadth.status,'unavailable');
+  assert.equal(components.turnover.status,'unavailable');
+  assert.equal(components.limits.status,'unavailable');
+  assert.equal(components.turnover.fetchedAt,null);
+  assert.match(marketAnalysis({indices:[],sectors:[],recommendations:[],limits:null}),/涨跌停数据待核验/);
+  assert.doesNotMatch(marketAnalysis({indices:[],sectors:[],recommendations:[],limits:null}),/涨停0只/);
+});
+
+test('全市场行情部分覆盖时成交额与涨跌停同步标为部分数据', () => {
+  const components=buildMarketComponents({fetchedAt:new Date().toISOString(),tradeDate:'2026-10-22',
+    breadth:{sampleCount:100},turnover:12e9,limits:{upCount:2,downCount:1},
+    snapshotCoverage:{status:'partial',expectedCount:200},newsContext:{items:[]}});
+  assert.equal(components.breadth.status,'partial');
+  assert.equal(components.turnover.status,'partial');
+  assert.equal(components.limits.status,'partial');
+  assert.match(marketAnalysis({indices:[],sectors:[],recommendations:[],limits:{upCount:2,downCount:1},
+    snapshotCoverage:{status:'partial'}}),/行情覆盖不完整/);
 });
 
 test('新浪分页过滤保留宏观消息、记录诊断并排除公司新闻', () => {
@@ -385,6 +437,7 @@ test('局部主线匹配所有所属板块，缺失或陈旧资金不能放行',
   assert.equal(evaluate([industry,{...theme,capitalStale:true}]).entryAssessment.allowed,false);
   assert.equal(evaluate([industry,{...theme,participation:{capitalConcentrated:true}}]).entryAssessment.allowed,false);
   assert.equal(evaluate([industry,{...theme,rotationIntraday:{retreating:true}}]).entryAssessment.allowed,false);
+  assert.equal(evaluate([industry,{...theme,businessRelation:'member-only'}]).entryAssessment.allowed,false);
 });
 
 test('主线名单不受展示六项限制且集中拉动不确认扩散', () => {
@@ -496,6 +549,25 @@ test('逐日资金必须覆盖价格日历窗口才允许连续资金判断', ()
   assert.equal(shortResult.coverageStatus,'partial');
   assert.equal(shortResult.coverage.insufficientHistory,true);
   assert.match(shortResult.fallbackReason,/样本仅2\/10日/);
+});
+
+test('公开网页当日资金不能按最终历史归档，来源和取整标记须保留', () => {
+  const today = chinaClockParts().date;
+  const previous = new Date(Date.parse(`${today}T00:00:00Z`) - 86400000).toISOString().slice(0, 10);
+  const records = fundFlowArchiveRecords('603980', {
+    rows:[{date:previous,mainNetInflow:10000},{date:today,mainNetInflow:20000}],
+    evidenceUrl:'https://www.yyqyx.com/s/603980.SH', qualityFlags:['rounded-public-page']
+  }, 'yyqyx-public-page', 'yyqyx-visible-main-rounded-v1', 'historical-page');
+  assert.equal(records[0].phase, 'historical-final');
+  assert.equal(records[1].phase, 'final-unverified');
+  assert.equal(records[1].origin, 'historical-page');
+  assert.equal(records[1].evidenceLocator, 'https://www.yyqyx.com/s/603980.SH');
+  assert.ok(records[1].qualityFlags.includes('rounded-public-page'));
+  const coverage = applyExpectedFundFlowCoverage('603980', {available:true,rows:records.map(row => ({date:row.tradeDate,
+    mainNetInflow:row.mainNetAmount})),archiveRecords:records}, [previous,today], today);
+  assert.equal(coverage.complete, false);
+  assert.deepEqual(coverage.coverage.missingDates, [today]);
+  assert.match(fundFlowPeriodEvidence(coverage), /不用于连续流入判断/);
 });
 
 test('数据中心区分无记录与业务错误，查询失败不能当作无风险',()=>{
@@ -825,10 +897,25 @@ test('板块成员预算按金额质量关注10比6比4分配且总量不增加'
 
 test('融资融券和财报筛选集合不冒充产业资金轮动', () => {
   const make=(code,name,net)=>({code,name,boardType:'concept',changePct:2,mainNetInflow:net,mainNetPct:5,mainNet5:net*3,mainNet10:net*5,memberCodes:['600001']});
-  const rows=[make('BK0001','融资融券',9e10),make('BK0002','2026中报预增',8e10),make('BK0003','猪肉概念',2e9)];
+  const rows=[make('BK0001','融资融券',9e10),make('BK0002','2026中报预增',8e10),
+    make('BK0004','基金增仓',7e10),make('BK0005','科技风格',6e10),
+    make('BK0006','百元股',5e10),make('BK0003','猪肉概念',2e9)];
   assert.deepEqual(selectSectorMemberBoards(rows,3).map(row=>row.name),['猪肉概念']);
   const merged=mergeSectorCapitalRows({sectors:[]},rows);
   assert.deepEqual(merged.fundSectors.map(row=>row.name),['猪肉概念']);
+});
+
+test('个股实际行业优先于泛概念资金榜', () => {
+  const {resolveStockRotationProfiles}=require('../main.js');
+  const sectors=[
+    {name:'基金增仓',boardType:'concept',memberCodes:['603298'],rotationScore:99},
+    {name:'5G概念',boardType:'concept',memberCodes:['603298'],rotationScore:90},
+    {name:'工程机械',boardType:'industry',memberCodes:['603298'],rotationScore:45}
+  ];
+  const profiles=resolveStockRotationProfiles({code:'603298',industry:'工程机械'},sectors);
+  assert.deepEqual(profiles.map(row=>row.name),['工程机械','5G概念']);
+  assert.deepEqual(profiles.map(row=>row.businessRelation),['confirmed-industry','member-only']);
+  assert.equal(profiles[0].businessRelationEvidence.source,'个股实际行业');
 });
 
 test('真实多日汇总覆盖资金代理但不编造每日流入天数和买卖分项', () => {
@@ -1117,6 +1204,7 @@ test('资讯时间数值、未来日期、转载去重和否定利好处理一�
   assert.equal(one.latestAgeHours,1);
   assert.equal(summarizeNews([{...row,publishedAt:'2027-01-01'}],'',{now}).signal,'中性');
   assert.equal(summarizeNews([{...row,publishedAt:''}],'',{now}).signal,'中性');
+  assert.equal(summarizeNews([{...row,link:''}],'',{now}).rawScore,0);
   assert.equal(summarizeNews([{...row,title:'测试公司否认回购计划'}],'',{now}).signal,'中性');
   assert.equal(summarizeNews([{...row,title:'测试公司澄清传闻；收到立案调查及处罚'}],'',{now}).signal,'偏谨慎');
 });
@@ -1128,7 +1216,7 @@ test('板块主力资金缓存可覆盖周末和盘中接口临时断线', () =>
 test('实时消息按发布时间、相关性和风险强度加权', () => {
   const now = '2026-08-16T12:00:00Z';
   const positive = summarizeNews([
-    { title:'贵州茅台业绩预增并发布回购计划', summary:'盈利增长', publishedAt:'2026-08-16T08:00:00Z', source:'测试源' }
+    { title:'贵州茅台业绩预增并发布回购计划', summary:'盈利增长', publishedAt:'2026-08-16T08:00:00Z', source:'测试源', link:'https://example.com/maotai' }
   ], '', { subject:'贵州茅台', code:'600519', now, fetchedAt:now });
   assert.equal(positive.signal, '偏积极');
   assert.equal(positive.freshness, '实时资讯');
@@ -1302,6 +1390,10 @@ test('概念板块成员映射到个股并参与轮动判断', () => {
   assert.equal(profiles[0].name, '猪肉概念');
   assert.equal(profiles[0].mainNetInflow, 1555330704);
   assert.equal(profiles[0].capitalEstimated, false);
+  assert.equal(profiles[0].businessRelation, 'member-only');
+  const confirmed = resolveStockRotationProfiles({code:'000876',industry:'饲料',
+    companyProfile:{profile:{mainBusiness:'生猪养殖及猪肉概念相关业务'}}}, sectors.sectors);
+  assert.equal(confirmed[0].businessRelation, 'confirmed-business');
 });
 
 test('轮动主线候选获得预留名额且负资金板块不被提升', () => {
@@ -1773,11 +1865,42 @@ test('旧推荐模型缓存不能复用为双轨推荐结果', () => {
     ...currentCache,
     recommendationCoverage:{...currentCache.recommendationCoverage,directSectorCapital:120}
   }, {feedbackSignature:'same', hasDirectSectorCapital:true, now}), true);
+  const withRegime={...currentCache,recommendationCoverage:{...currentCache.recommendationCoverage,marketRegimeSignature:'broad-advance|recovering|false|1|closed|电子'}};
+  assert.equal(canReuseMarketRecommendations(withRegime,{feedbackSignature:'same',marketRegimeSignature:'broad-advance|normal|true|2|closed|电子',now}),false);
+});
+
+test('恢复待确认与弱市分开，越过阻力不写尚未突破', () => {
+  const recovering = assessMarketEnvironment({marketRegime:{key:'broad-advance',label:'放量普涨扩散',riskOn:true,riskOff:false,allowNewEntry:false}});
+  assert.equal(recovering.weak,false);
+  assert.equal(recovering.entryRestricted,true);
+  assert.equal(assessMarketEnvironment({marketRegime:{label:'风险集中释放',riskOff:true,allowNewEntry:false}}).weak,true);
+  const entry = assessCurrentEntry({latestPrice:24.89,ma5:24,ma10:25,ma20:24,ma30:22.89,
+    supportPrice:23,resistance:24.65,volumeRatio:1.5,rsi14:50,observationPhase:{phase:'closed'}});
+  assert.match(entry.summary,/已越过突破位/);
+  assert.doesNotMatch(entry.summary,/尚未突破/);
+});
+
+test('恢复中的强市仍禁止新入场而不误写大盘偏弱', () => {
+  const analysis=applyEntryContextAssessment({entryAssessment:{allowed:true,status:'可分批入场',summary:'技术已确认',evidence:[]}},
+    {marketOverview:{marketRegime:{key:'broad-advance',label:'放量普涨扩散',riskOn:true,riskOff:false,allowNewEntry:false},sectors:[]}});
+  assert.equal(analysis.entryAssessment.allowed,false);
+  assert.equal(analysis.entryAssessment.status,'大盘恢复待确认');
+  assert.doesNotMatch(analysis.entryAssessment.summary,/大盘偏弱/);
+});
+
+test('央行中标量不视为公司中标订单', () => {
+  const now='2026-10-28T08:00:00.000Z';
+  const monetary=summarizeNews([{title:'中国人民银行开展逆回购操作，中标量1510亿元',publishedAt:now,link:'https://example.com/a'}], '', {scope:'market',now});
+  assert.equal(monetary.items[0].eventType,'货币政策操作');
+  assert(!monetary.items[0].positiveTerms.includes('中标'));
+  const company=summarizeNews([{title:'测试公司中标重大项目',publishedAt:now,link:'https://example.com/b'}], '', {subject:'测试公司',now});
+  assert(company.items[0].positiveTerms.includes('中标'));
 });
 
 test('command input uses a focus-hidden recommendation prompt', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
   const css = fs.readFileSync(path.join(__dirname, '..', 'styles.css'), 'utf8');
+  assert.match(html, /id="marketTurnover">--<\/b><span>全市场成交额/);
   assert.match(html, /<textarea[^>]*id="commandInput"[^>]*placeholder="输入你想要搜索的相关内容，会给你生成对应内容的股票推荐"[^>]*><\/textarea>/);
   assert.match(css, /\.command-row textarea:focus::placeholder\{color:transparent\}/);
 });
@@ -2022,6 +2145,55 @@ test('日线可聚合为周K和月K备用数据', () => {
   });
 });
 
+test('前复权K线滞后时改用含当天数据的不复权同源K线', async () => {
+  const vm = require('node:vm');
+  const source = fs.readFileSync(path.join(__dirname,'../main.js'),'utf8');
+  const start = source.indexOf('async function fetchStockChart(');
+  const end = source.indexOf('\nfunction parseRssItems(', start);
+  const dates = ['2026-10-08','2026-10-09','2026-10-12','2026-10-13','2026-10-14',
+    '2026-10-15','2026-10-16','2026-10-19','2026-10-20','2026-10-21'];
+  const kline = date => [date,'10','10','10.2','9.8','100'];
+  const quote = {tradeDate:'2026-10-22',price:10.5,open:10,high:10.6,low:9.9,volume:120};
+  const context = vm.createContext({stockChartCache:new Map(),readTimedCache:()=>null,writeTimedCache:(_cache,_key,value)=>value,
+    chinaClockParts:()=>({date:'2026-10-22',hour:13,minute:20}),isTradingDay:()=>true,
+    marketPrefixOf:()=> 'sh',fetchTencentQuotes:async()=>[quote],
+    getJsonWithRetry:async url => ({data:{sh600001:url.includes('/fqkline/')
+      ? {qfqday:dates.map(kline)} : {day:[...dates.map(kline),kline('2026-10-22')]}}}),
+    normalizeHistoryRows:rows=>rows.map(row=>({date:row[0],open:+row[1],close:+row[2],high:+row[3],low:+row[4],volume:+row[5]})),
+    fetchSinaHistory:async()=>{throw new Error('不应调用新浪');},
+    resolveObservationPhase:()=>({phase:'intraday'})});
+  vm.runInContext(source.slice(start,end),context);
+  const result = await context.fetchStockChart({code:'600001',period:'day'});
+  assert.equal(result.source,'腾讯不复权日K');
+  assert.equal(result.rows.at(-1).time,'2026-10-22');
+  assert.equal(result.rows.at(-1).isFinal,false);
+  assert.equal(result.stale,false);
+});
+
+test('备用历史K线失败时不把未复权报价拼入前复权序列', async () => {
+  const vm = require('node:vm');
+  const source = fs.readFileSync(path.join(__dirname,'../main.js'),'utf8');
+  const start = source.indexOf('async function fetchStockChart(');
+  const end = source.indexOf('\nfunction parseRssItems(', start);
+  const dates = ['2026-10-08','2026-10-09','2026-10-12','2026-10-13','2026-10-14',
+    '2026-10-15','2026-10-16','2026-10-19','2026-10-20','2026-10-21'];
+  const context = vm.createContext({stockChartCache:new Map(),readTimedCache:()=>null,writeTimedCache:(_cache,_key,value)=>value,
+    chinaClockParts:()=>({date:'2026-10-22',hour:13,minute:20}),isTradingDay:()=>true,
+    marketPrefixOf:()=> 'sh',fetchTencentQuotes:async()=>[{tradeDate:'2026-10-22',price:10.5}],
+    getJsonWithRetry:async url => {
+      if (url.includes('/kline/kline')) throw new Error('备用接口失败');
+      return {data:{sh600001:{qfqday:dates.map(date=>[date,'10','10','10.2','9.8','100'])}}};
+    },
+    normalizeHistoryRows:rows=>rows.map(row=>({date:row[0],open:+row[1],close:+row[2],high:+row[3],low:+row[4],volume:+row[5]})),
+    fetchSinaHistory:async()=>{throw new Error('新浪接口失败');},
+    resolveObservationPhase:()=>({phase:'intraday'})});
+  vm.runInContext(source.slice(start,end),context);
+  const result = await context.fetchStockChart({code:'600001',period:'day'});
+  assert.equal(result.rows.at(-1).time,'2026-10-21');
+  assert.equal(result.source,'腾讯前复权日K');
+  assert.equal(result.stale,true);
+});
+
 test('交易计划失效价始终低于低吸区下沿', () => {
   const plan = buildTradePlan({
     latestPrice:10, supportPrice:8, resistance:11, rangeHigh:12, recent10Low:9,
@@ -2118,6 +2290,7 @@ test('大盘缓存只保留可复用板块证据，历史路径保留跨日题�
 test('个股走势返回分时五日60分钟及日周月周期', { timeout: 60000 }, async () => {
   const handler = handlers.get('fetch-stock-chart');
   assert.equal(typeof handler, 'function');
+  const quote = (await handlers.get('fetch-a-share-quotes')(null, ['600519'])).quotes[0];
   for (const period of ['minute', 'five-day', 'hour60', 'day', 'week', 'month']) {
     const result = await handler(null, { code: '600519', period });
     assert.equal(result.period, period);
@@ -2127,6 +2300,10 @@ test('个股走势返回分时五日60分钟及日周月周期', { timeout: 6000
     if (period === 'hour60') {
       assert.ok(result.rows.every(row=>row.volumeUnit === 'share' && row.adjustment === 'raw'));
       assert.equal(result.structure?.algorithmVersion,'range-retest-60m-v1');
+    }
+    if (['day','week','month'].includes(period) && quote?.tradeDate === chinaClockParts().date && !result.stale) {
+      assert.equal(result.rows.at(-1).time, quote.tradeDate, `${period} 缺少当天行情`);
+      assert.match(result.source, /腾讯前复权|腾讯不复权|新浪不复权/);
     }
   }
 });
@@ -2150,8 +2327,13 @@ test('大盘分析返回指数、轮动、资金和涨跌停结构', { timeout: 
   assert.ok(result.breadth.up + result.breadth.down + result.breadth.flat > 4500);
   assert.ok(result.sectors.length >= 8);
   assert.ok(result.fundSectors.length >= 8);
-  assert.equal(typeof result.limits.upCount, 'number');
-  assert.equal(typeof result.limits.downCount, 'number');
+  if (result.sessionPhase?.continuous || result.sessionPhase?.phase === 'closed') {
+    assert.equal(typeof result.limits.upCount, 'number');
+    assert.equal(typeof result.limits.downCount, 'number');
+  } else {
+    assert.equal(result.limits.upCount,null);
+    assert.equal(result.limits.downCount,null);
+  }
   assert.match(result.limits.date, /^\d{8}$/);
   assert.equal(result.limits.observationOnly, true);
   assert.match(result.limits.observationReason, /不生成买入许可/);

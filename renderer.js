@@ -584,13 +584,19 @@ function marketRefreshNotice(result={}){
   const core=[components.indices,components.breadth,components.turnover].filter(Boolean);
   const coreFailed=core.length ? core.every(item=>['unavailable','empty'].includes(item.status)) : (result.errors || []).some(error=>/指数行情失败|全市场行情失败/.test(error));
   if(coreFailed) return {message:'大盘核心行情更新失败，已保留最近一次可用画面',type:'warn'};
-  const notices=[core.length && core.every(item=>item.status === 'stale') ? '大盘行情显示上一交易日收盘参考' : '大盘行情已更新'];
+  const corePartial=core.some(item=>['partial','unavailable','empty'].includes(item.status));
+  const notices=[corePartial ? '大盘行情部分更新' : core.length && core.every(item=>item.status === 'stale') ? '大盘行情显示上一交易日收盘参考' : '大盘行情已更新'];
+  if(components.indices?.status === 'partial') notices.push(`指数${components.indices.sampleCount ?? '?'}/${components.indices.expectedCount ?? 3}项更新`);
+  else if(components.indices?.status === 'unavailable') notices.push('指数行情暂不可用');
+  if(components.breadth?.status === 'partial') notices.push('全市场行情覆盖不完整');
+  else if(components.breadth?.status === 'unavailable') notices.push('全市场行情暂不可用');
+  if(components.turnover?.status === 'unavailable') notices.push('成交额暂不可用');
   if(components.news?.status === 'unavailable') notices.push('市场消息暂不可用');
   else if(components.news?.status === 'stale') notices.push('市场消息显示历史参考');
   if(components.sectorCapital?.status === 'stale') notices.push('板块资金显示历史参考');
   else if(components.sectorCapital?.status === 'unavailable') notices.push('板块资金暂不可用');
   const degraded=notices.length > 1 || Object.values(components).some(item=>['partial','stale','unavailable'].includes(item?.status));
-  return {message:notices.join('；'),type:degraded ? 'info' : 'success'};
+  return {message:notices.join('；'),type:corePartial ? 'warn' : degraded ? 'info' : 'success'};
 }
 
 function marketRefreshIntervalMs(sessionPhase={}){
@@ -886,8 +892,9 @@ function portfolioStock(position){
     type: known.type || '模拟持仓',
     status: known.status || '待分析',
     focus: known.focus || '持仓跟踪',
-    price: Number(position.lastPrice) || Number(known.price) || Number(position.costPrice) || null,
+    price: Number(position.lastPrice) || Number(known.price) || null,
     changePct: position.changePct ?? known.changePct,
+    quoteObservedAt: position.stock?.quoteObservedAt || position.quoteObservedAt || known.quoteObservedAt || '',
     source: position.source || known.source
   };
 }
@@ -895,21 +902,26 @@ function portfolioStock(position){
 function portfolioMetrics(position){
   const quantity = Math.max(0, Number(position?.quantity) || 0);
   const costPrice = Math.max(0, Number(position?.costPrice) || 0);
-  const currentPrice = Math.max(0, Number(position?.lastPrice) || costPrice);
+  const currentPrice = Number(position?.lastPrice) > 0 ? Number(position.lastPrice) : null;
   const realizedPnl = Number(position?.realizedPnl) || 0;
   const costValue = quantity * costPrice;
-  const marketValue = quantity * currentPrice;
-  const floatingPnl = marketValue - costValue;
+  const marketValue = currentPrice === null ? null : quantity * currentPrice;
+  const floatingPnl = marketValue === null ? null : marketValue - costValue;
   return {
     quantity, costPrice, currentPrice, realizedPnl, costValue, marketValue, floatingPnl,
-    floatingPct: costValue ? floatingPnl / costValue * 100 : 0,
-    totalPnl: floatingPnl + realizedPnl
+    floatingPct: costValue && floatingPnl !== null ? floatingPnl / costValue * 100 : null,
+    totalPnl: floatingPnl === null ? null : floatingPnl + realizedPnl
   };
 }
 
 function portfolioRiskAssessment(position, stock, historyResult=null){
   const metrics = portfolioMetrics(position);
   const analysis = historyResult?.analysis || stock?.analysis || {};
+  if(metrics.currentPrice === null) return {level:'unknown',label:'行情待刷新',summary:'当前价格缺失，不能按成本价推算持仓盈亏或判断策略失效。'};
+  const quoteDate = stock?.quoteObservedAt ? String(stock.quoteObservedAt).slice(0,10) : '';
+  if(!quoteDate) return {level:'unknown',label:'行情时点待核验',summary:'现价缺少可信交易日，不能与分析失效价比较。'};
+  if(quoteDate && analysis.tradeDate && quoteDate !== analysis.tradeDate)
+    return {level:'unknown',label:'分析待刷新',summary:`行情为${quoteDate}，分析仍截至${analysis.tradeDate}；不能用旧失效价判断当前风险。`};
   const invalidation = Number(analysis?.tradePlan?.invalidationPrice || stock?.tradePlan?.invalidationPrice);
   const contextRisks = analysis?.entryAssessment?.contextRisks || stock?.entryAssessment?.contextRisks || [];
   if(Number.isFinite(invalidation) && invalidation > 0 && metrics.currentPrice < invalidation){
@@ -1388,11 +1400,12 @@ function researchPortfolioHtml(){
 function renderPortfolioView(){
   const holdings = portfolio.filter(position => Number(position.quantity) > 0);
   const holdingMetrics = holdings.map(position => ({position, stock:portfolioStock(position), metrics:portfolioMetrics(position)}));
+  const missingQuotes = holdingMetrics.filter(item => item.metrics.currentPrice === null).length;
   const costValue = holdingMetrics.reduce((sum, item) => sum + item.metrics.costValue, 0);
-  const marketValue = holdingMetrics.reduce((sum, item) => sum + item.metrics.marketValue, 0);
-  const floatingPnl = holdingMetrics.reduce((sum, item) => sum + item.metrics.floatingPnl, 0);
+  const marketValue = missingQuotes === holdings.length && holdings.length ? null : holdingMetrics.reduce((sum, item) => sum + (item.metrics.marketValue || 0), 0);
+  const floatingPnl = marketValue === null ? null : holdingMetrics.reduce((sum, item) => sum + (item.metrics.floatingPnl || 0), 0);
   const realizedPnl = portfolio.reduce((sum, position) => sum + (Number(position.realizedPnl) || 0), 0);
-  const totalPnl = floatingPnl + realizedPnl;
+  const totalPnl = floatingPnl === null ? null : floatingPnl + realizedPnl;
   const concentration = portfolioIndustryConcentration(holdings);
   const allSelected = holdings.length > 0 && holdings.every(position => selected.has(position.code));
   const rows = holdingMetrics.map(({position, stock, metrics}) => {
@@ -1409,10 +1422,11 @@ function renderPortfolioView(){
   return `<section class="portfolio-view">
     <div class="portfolio-head"><div><h2>模拟持仓</h2><p>行情刷新后，持仓市值和浮动盈亏会按最新价格更新</p></div><div class="portfolio-head-actions"><button class="small" data-portfolio-refresh>刷新</button><span>${holdings.length} 只持仓</span></div></div>
     <div class="portfolio-summary">
-      <div><span>持仓成本</span><b>${money(costValue)}</b></div><div><span>当前市值</span><b>${money(marketValue)}</b></div>
-      <div><span>持仓盈亏</span><b class="${pctClass(floatingPnl)}">${money(floatingPnl)}</b></div><div><span>已实现收益</span><b class="${pctClass(realizedPnl)}">${money(realizedPnl)}</b></div>
-      <div><span>累计收益</span><b class="${pctClass(totalPnl)}">${money(totalPnl)}</b></div>
+      <div><span>持仓成本</span><b>${money(costValue)}</b></div><div><span>${missingQuotes ? '已估值市值' : '当前市值'}</span><b>${money(marketValue)}</b></div>
+      <div><span>${missingQuotes ? '已估值盈亏' : '持仓盈亏'}</span><b class="${pctClass(floatingPnl)}">${money(floatingPnl)}</b></div><div><span>已实现收益</span><b class="${pctClass(realizedPnl)}">${money(realizedPnl)}</b></div>
+      <div><span>${missingQuotes ? '已知累计收益' : '累计收益'}</span><b class="${pctClass(totalPnl)}">${money(totalPnl)}</b></div>
     </div>
+    ${missingQuotes ? `<p>缺少 ${missingQuotes} 只持仓的有效现价；合计仅含已估值持仓，不代表完整账户盈亏。</p>` : ''}
     ${concentration.length ? `<div class="portfolio-concentration"><b>模拟持仓行业集中度</b>${concentration.slice(0,5).map(item => `<span>${escapeHtml(item.industry)} ${(item.weight * 100).toFixed(1)}%</span>`).join('')}</div>` : ''}
     ${rows ? `<div class="portfolio-batch-toolbar"><button class="small" data-portfolio-toggle>${allSelected ? '取消全选' : '全选'}</button><span>已选 ${holdings.filter(position => selected.has(position.code)).length} 只</span><label>每只买入金额<input data-portfolio-buy-amount type="number" min="100" step="100" value="10000" /></label><button class="sim-buy" data-portfolio-batch="buy">批量买入</button><label>卖出比例<select data-portfolio-sell-ratio><option value="0.25">1/4</option><option value="0.3333333333">1/3</option><option value="0.5">1/2</option><option value="1" selected>全部</option></select></label><button class="sim-sell" data-portfolio-batch="sell">批量卖出</button></div><div class="table-wrap"><table class="portfolio-table"><thead><tr><th>选</th><th>股票</th><th>持仓数量</th><th>现价 / 成本</th><th>市值</th><th>持仓盈亏</th><th>已实现</th><th>累计收益</th><th>持仓风险</th></tr></thead><tbody>${rows}</tbody></table></div>` : '<div class="portfolio-empty">暂无模拟持仓，可在个股详情中设置价格和金额后模拟买入。</div>'}
     <div class="portfolio-trades"><h3>最近模拟成交</h3>${trades ? `<div class="table-wrap"><table><thead><tr><th>时间</th><th>股票</th><th>方向</th><th>数量</th><th>价格</th><th>金额</th><th>实现收益</th></tr></thead><tbody>${trades}</tbody></table></div>` : '<div class="portfolio-empty">暂无模拟成交记录</div>'}</div>
@@ -1590,7 +1604,8 @@ function renderDailyReportView(){
   const qualityHtml = report.strategyExperiments?.qualityManifest
     ? `<section class="report-section"><h3>每周质量影子实验</h3><p>Q1 买点排序、Q2 连续交易路径与板块联合降级、Q3 新入场与持仓退出分离；冻结版本 ${escapeHtml(report.strategyExperiments.qualityManifest.version)}，最早观察 ${escapeHtml(report.strategyExperiments.qualityManifest.firstTradeDate)}。${qualityReplayActive ? '独立同资金基线已接入。' : '尚未到前向回放起点。'}未成熟样本和证据未知不计成交，也不自动切换正式策略。</p><div class="table-wrap report-table-wrap"><table class="report-table"><thead><tr><th>实验</th><th>通过</th><th>拒绝</th><th>未知</th></tr></thead><tbody>${qualityShadowRows}</tbody></table></div></section>` : '';
   const funnel = report.market?.planFunnel;
-  const funnelHtml = funnel ? `<section class="report-section"><h3>推荐计划漏斗</h3><p>展示计划 ${escapeHtml(funnel.discovered)}，数据可用 ${escapeHtml(funnel.dataAvailable ?? '--')}，结构成立 ${escapeHtml(funnel.structureEstablished ?? '--')}，价格可行 ${escapeHtml(funnel.priceFeasible)}，风险通过 ${escapeHtml(funnel.riskPassed ?? '--')}，等待触发 ${escapeHtml(funnel.armed)}，历史触发 ${escapeHtml(funnel.triggered)}，当前许可 ${escapeHtml(funnel.currentlyAllowed)}；核验成交以账户事实为准。未通过原因：${detail(funnel.reasons)}。</p></section>` : '';
+  const publishedFunnel = report.market?.publishedPlanFunnel;
+  const funnelHtml = publishedFunnel || funnel ? `<section class="report-section"><h3>推荐计划漏斗</h3>${publishedFunnel ? `<p><b>全天已发布：</b>批次 ${escapeHtml(publishedFunnel.publishedBatches)}，信号 ${escapeHtml(publishedFunnel.publishedSignals)}，生命周期 ${escapeHtml(publishedFunnel.episodes)}，冻结计划 ${escapeHtml(publishedFunnel.frozenPlans)}，价格可行 ${escapeHtml(publishedFunnel.priceFeasible)}，发布许可 ${escapeHtml(publishedFunnel.publishedAllowed)}，核验触发 ${escapeHtml(publishedFunnel.verifiedTriggers)}，核验成交 ${escapeHtml(publishedFunnel.verifiedFills)}。原因：${detail(publishedFunnel.reasons)}。</p>` : '<p>全天已发布决策漏斗缺失。</p>'}${funnel ? `<p><b>最终快照：</b>展示计划 ${escapeHtml(funnel.discovered)}，数据可用 ${escapeHtml(funnel.dataAvailable ?? '--')}，结构成立 ${escapeHtml(funnel.structureEstablished ?? '--')}，价格可行 ${escapeHtml(funnel.priceFeasible)}，风险通过 ${escapeHtml(funnel.riskPassed ?? '--')}，等待触发 ${escapeHtml(funnel.armed)}，当前许可 ${escapeHtml(funnel.currentlyAllowed)}。原因：${detail(funnel.reasons)}。</p>` : '<p>最终快照计划漏斗缺失。</p>'}</section>` : '';
   const forward = review.forwardValidation;
   const forwardHtml = forward ? `<p>前瞻验证：冻结后 ${forward.tradingDays}/${forward.requiredTradingDays} 个交易日；A ${forward.routes?.A?.mature || 0}/30，B ${forward.routes?.B?.mature || 0}/30 个成熟可成交episode。${escapeHtml(forward.reason)}；不会自动调权。</p>` : '';
   const performance = report.recommendations?.performance || {};
@@ -2448,6 +2463,7 @@ async function loadLatestDetailQuote(s){
       recordQuoteMessages(result);
       if(!result.quotes.length) throw new Error(result.errors.join('；') || '未获取到最新行情');
       applyQuoteData(result.quotes);
+      for(const period of ['minute','five-day','hour60','day','week','month']) detailChartCache.delete(`${s.code}-${period}`);
       const updated = findStockByCode(s.code);
       renderFundFlow(updated);
       const values = {
@@ -2921,11 +2937,12 @@ function drawStockChart(canvas, inputRows, period, referencePrice=null, structur
 
 function chartMetaText(result, period, referencePrice){
   const latestIndex = result.rows.length - 1;
-  const closeSummary = period === 'minute' ? '' : ` · 收盘 ${yuan(Number(result.rows[latestIndex]?.close))} · 涨跌 ${formatPct(chartChangePct(result.rows, latestIndex, period, referencePrice))}`;
+  const priceLabel = result.rows[latestIndex]?.isFinal === false ? '最新' : '收盘';
+  const closeSummary = period === 'minute' ? '' : ` · ${priceLabel} ${yuan(Number(result.rows[latestIndex]?.close))} · 涨跌 ${formatPct(chartChangePct(result.rows, latestIndex, period, referencePrice))}`;
   const averages = ['day','week','month'].includes(period) ? ' · 均线 MA5 / MA10 / MA20 / MA30 / MA60' : '';
   const structure = period === 'hour60' ? ` · 结构 ${result.structure?.state || '待核验'}` : '';
-  const partial = period === 'hour60' && result.rows[latestIndex]?.isFinal === false ? ' · 末根未完成' : '';
-  const stale = result.stale ? ' · 旧缓存，不能确认新买点' : '';
+  const partial = result.rows[latestIndex]?.isFinal === false ? ' · 当期未完成' : '';
+  const stale = result.stale ? ' · 数据非最新，不能确认新买点' : '';
   return `${result.source || '行情接口'} · ${result.rows.length} 个数据点${averages}${closeSummary}${structure}${partial}${stale}`;
 }
 
@@ -2939,8 +2956,11 @@ async function loadStockChart(s, period = 'day', force=false){
   if(legend) legend.innerHTML = chartLegendHtml(period);
   if(!canvas || !meta || !window.stockApi?.fetchStockChart) return;
   const cacheKey = `${s.code}-${period}`;
-  if(!force && detailChartCache.has(cacheKey)){
-    const result = detailChartCache.get(cacheKey);
+  const cachedChart = detailChartCache.get(cacheKey);
+  const cachedDate = String(cachedChart?.rows?.at(-1)?.time || '').slice(0, 10);
+  if(!force && cachedChart && Date.now() - Date.parse(cachedChart.fetchedAt || '') < 60 * 1000
+    && (!['day','week','month'].includes(period) || !s.tradeDate || cachedDate >= s.tradeDate)){
+    const result = cachedChart;
     const referencePrice = result.previousClose ?? s.prevClose;
     drawStockChart(canvas, result.rows, period, referencePrice, result.structure);
     meta.textContent = chartMetaText(result,period,referencePrice);
@@ -2957,7 +2977,7 @@ async function loadStockChart(s, period = 'day', force=false){
     try{
       let result = null;
       result = await window.stockApi.fetchStockChart({code:s.code, period, force});
-      detailChartCache.set(cacheKey, result);
+      detailChartCache.set(cacheKey, {...result, fetchedAt:result.fetchedAt || new Date().toISOString()});
       if(activeChartPeriod.get(s.code) !== period || !canvas.isConnected) return result;
       const referencePrice = result.previousClose ?? s.prevClose;
       drawStockChart(canvas, result.rows, period, referencePrice, result.structure);
@@ -3077,7 +3097,7 @@ async function refreshStockDetail(s){
     void Promise.allSettled([
       loadStockFundFlow(updated, false),
       loadCompanyProfile(updated, false),
-      loadStockChart(updated, period, false),
+      loadStockChart(updated, period, true),
       loadStockNews(updated, false),
       latestMarketOverview || loadMarketOverview(false, true)
     ]);
@@ -3100,6 +3120,7 @@ function portfolioIndustryConcentration(positions){
   let total = 0;
   for(const position of positions || []){
     const value = portfolioMetrics(position).marketValue;
+    if(value === null) continue;
     const industry = position?.sector || position?.stock?.sector || '行业待确认';
     total += value;
     groups.set(industry, (groups.get(industry) || 0) + value);

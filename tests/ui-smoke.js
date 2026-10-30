@@ -1084,7 +1084,7 @@ app.whenReady().then(async () => {
     && state.detailRefreshState.requestCounts.after.fundFlow === state.detailRefreshState.requestCounts.before.fundFlow
     && state.detailRefreshState.requestCounts.after.profile === state.detailRefreshState.requestCounts.before.profile
     && state.detailRefreshState.requestCounts.after.news === state.detailRefreshState.requestCounts.before.news
-    && state.detailRefreshState.requestCounts.after.chart === state.detailRefreshState.requestCounts.before.chart;
+    && state.detailRefreshState.requestCounts.after.chart === state.detailRefreshState.requestCounts.before.chart + 1;
   const detailClickQuoteUsable = state.detailClickQuoteState.before.includes('¥9.99')
     && state.detailClickQuoteState.before.includes('今 -9.99%')
     && state.detailClickQuoteState.after.includes('¥11.08')

@@ -54,12 +54,15 @@ test('收盘报告保留组件级数据质量和来源时间',()=>{
 test('收盘报告对无可行买点只列观察条件，不伪装次日触发',()=>{
   const report=buildDailyReport({tradeDate:'2026-10-09',stable:[{code:'600001',entryPermission:'watch',
     tradePlan:{feasibility:{status:'empty',reason:'确认价高于最高入场价'},confirmationPrice:11,
-      maxEntryPrice:10}}],market:{planFunnel:{discovered:1,dataAvailable:1,structureEstablished:1,
+      maxEntryPrice:10}}],market:{publishedPlanFunnel:{publishedBatches:3,publishedSignals:8,episodes:5,
+        frozenPlans:4,priceFeasible:2,publishedAllowed:1,verifiedTriggers:1,verifiedFills:0,reasons:{'未形成核验入场触发':4}},
+      planFunnel:{discovered:1,dataAvailable:1,structureEstablished:1,
         priceFeasible:0,riskPassed:0,armed:0,
         triggered:0,currentlyAllowed:0,reasons:{'确认价高于最高入场价':1}}}});
   assert.match(report.nextDayConditions[0].trigger,/当前无合格买点/);
   const html=renderDailyReportHtml(report);
   assert.match(html,/推荐计划漏斗/);
+  assert.match(html,/全天发布批次 3，快照信号 8，合并生命周期 5/);
   assert.match(html,/数据可用 1，结构成立 1，价格可行 0，风险通过 0/);
 });
 

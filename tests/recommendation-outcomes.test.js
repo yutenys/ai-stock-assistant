@@ -76,6 +76,33 @@ test('压缩账本后B观察与触发以及A不同setup仍分组评价', async (
   assert.equal(compact.entries[3].recommendations[0].setupType, '回踩低吸');
   const review = evaluatePublishedEpisodes(compact.entries,new Map(),{asOfDate:'2026-09-10',horizons:[1]});
   assert.deepEqual(review.episodes.map(row => row.evaluationGroup).sort(), ['A:回踩低吸','A:突破确认','B:观察','B:触发']);
+  assert.equal(review.decisionFunnel.scope,'当日全部已发布批次');
+  assert.equal(review.decisionFunnel.publishedBatches,4);
+  assert.equal(review.decisionFunnel.publishedSignals,4);
+  assert.equal(review.decisionFunnel.episodes,4);
+  assert.equal(review.decisionFunnel.publishedAllowed,1);
+  assert.equal(review.decisionFunnel.verifiedTriggers,0);
+  assert.equal(review.decisionFunnel.verifiedFills,0);
+});
+
+test('全天决策漏斗按计划生命周期去重并区分许可、核验触发与成交',()=>{
+  const first=batch('first','2026-09-10','s1');
+  first.recommendations[0]={...first.recommendations[0],planId:'p1',planRevision:1,entryPermission:'watch',
+    tradePlan:{feasibility:{status:'feasible'},maxEntryPrice:10.5,invalidationPrice:9,targetPrice:13}};
+  const second={...batch('second','2026-09-10','s2'),publishedAt:'2026-09-10T15:10:00+08:00',
+    inputCutoffAt:'2026-09-10T15:09:00+08:00'};
+  second.recommendations[0]={...second.recommendations[0],planId:'p1',planRevision:1,entryPermission:'allowed',
+    tradePlan:first.recommendations[0].tradePlan,triggeredAt:'2026-09-10T15:08:00+08:00',
+    decisionEvent:{id:'p1:allowed',type:'entry-allowed',planId:'p1',revision:1,verified:true,source:'fixture',
+      occurredAt:'2026-09-10T15:08:00+08:00',referencePrice:10.1}};
+  const review=evaluatePublishedEpisodes([first,second],new Map(),{asOfDate:'2026-09-10',horizons:[1]});
+  assert.equal(review.decisionFunnel.episodes,1);
+  assert.equal(review.decisionFunnel.frozenPlans,1);
+  assert.equal(review.decisionFunnel.priceFeasible,1);
+  assert.equal(review.decisionFunnel.observed,1);
+  assert.equal(review.decisionFunnel.publishedAllowed,1);
+  assert.equal(review.decisionFunnel.verifiedTriggers,1);
+  assert.equal(review.decisionFunnel.verifiedFills,0);
 });
 
 test('停牌、开盘涨停和缺限价证据保留为不同状态', () => {

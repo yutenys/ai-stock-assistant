@@ -55,6 +55,14 @@ test('每周质量实验冻结后才采样，缺连续交易路径不能据集�
     shadowPath:{peakBreadthDropPp:30}}})[1].status,'unknown');
   assert.equal(api.evaluateWeeklyQualityShadow(item,{...context,marketRegime:{...context.marketRegime,
     shadowPath:{...context.marketRegime.shadowPath,continuousPeakBreadthDropPp:10}}})[1].status,'fail');
+  const riskOff=api.evaluateWeeklyQualityShadow(item,{...context,marketRegime:{tradeDate:'2026-09-14',
+    observedAt:at('2026-09-14'),key:'risk-release',riskOff:true}});
+  assert.equal(riskOff[1].status,'fail');
+  assert.deepEqual(riskOff[1].reasons,['market-risk-off']);
+  const unverifiedTheme=api.evaluateWeeklyQualityShadow({...item,momentumDecision:{...item.momentumDecision,
+    profile:{businessRelation:'member-only'}}},context);
+  assert.equal(unverifiedTheme[0].status,'fail');
+  assert.deepEqual(unverifiedTheme[0].reasons,['business-theme-unverified']);
   assert.deepEqual(api.evaluateWeeklyQualityShadow(item,{...context,tradeDate:'2026-09-10'}).map(row=>row.status),
     ['unknown','unknown','unknown']);
 });
