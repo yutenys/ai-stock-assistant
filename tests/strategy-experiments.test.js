@@ -42,15 +42,25 @@ test('每周质量实验冻结后才采样，缺连续交易路径不能据集�
   const quality=api.createWeeklyQualityManifest({frozenAt:'2026-09-10T10:00:00+08:00',modelVersion:'v26'});
   assert.equal(quality.firstTradeDate,'2026-09-11');
   assert.equal(quality.promotionAllowed,false);
-  const item={modelVersion:'v26',track:'B',planState:{feasibility:{status:'feasible'}},
-    momentumDecision:{firstPullback:true,noChase:false}};
+  const item={modelVersion:'v26',track:'B',price:10,planState:{feasibility:{status:'feasible'},tradePlan:{maxEntryPrice:11}},
+    momentumDecision:{firstPullback:true,noChase:false,profile:{businessRelation:'confirmed-industry',
+      businessRelationEvidence:{source:'行业资料',url:'https://example.com/industry',excerpt:'工程机械',observedAt:at('2026-09-14')}}}};
   const context={manifest:quality,tradeDate:'2026-09-14',cutoffAt:at('2026-09-14'),
     marketRegime:{tradeDate:'2026-09-14',observedAt:at('2026-09-14'),
       shadowPath:{peakBreadthDropPp:30,continuousPeakBreadthDropPp:2,
         priorLimitUpPremium:{coverage:1,averageChangePct:-2}}},
     sector:{tradeDate:'2026-09-14',observedAt:at('2026-09-14'),rotationIntraday:{retreating:true}}};
   const decisions=api.evaluateWeeklyQualityShadow(item,context);
-  assert.deepEqual(decisions.map(row=>row.status),['pass','pass','pass']);
+  assert.deepEqual(decisions.map(row=>row.status),['pass','pass','pass','pass','unknown','fail']);
+  assert.equal(api.evaluateWeeklyQualityShadow({...item,price:12},context)[3].status,'fail');
+  assert.equal(api.evaluateWeeklyQualityShadow({...item,momentumDecision:{...item.momentumDecision,
+    profile:{...item.momentumDecision.profile,businessRelationEvidence:{source:'行业资料',url:'https://example.com/industry',excerpt:'工程机械',observedAt:at('2026-09-15')}}}},context)[0].status,'unknown');
+  assert.equal(api.evaluateWeeklyQualityShadow({...item,momentumDecision:{...item.momentumDecision,
+    profile:{...item.momentumDecision.profile,businessRelationEvidence:{source:'行业资料',excerpt:'工程机械',observedAt:at('2026-09-14')}}}},context)[0].status,'unknown');
+  assert.equal(api.evaluateWeeklyQualityShadow(item,{...context,sector:{...context.sector,
+    mainNetInflow:6e8,mainNet3:-3e8,mainNet5:-5e8,windowContract:{comparable:true},capitalEstimated:false,capitalStale:false}})[4].status,'fail');
+  assert.equal(api.evaluateWeeklyQualityShadow(item,{...context,sector:{...context.sector,
+    mainNet3:3e8,mainNet5:5e8,windowContract:{comparable:true},capitalEstimated:false,capitalStale:false}})[4].status,'pass');
   assert.equal(api.evaluateWeeklyQualityShadow(item,{...context,marketRegime:{...context.marketRegime,
     shadowPath:{peakBreadthDropPp:30}}})[1].status,'unknown');
   assert.equal(api.evaluateWeeklyQualityShadow(item,{...context,marketRegime:{...context.marketRegime,
@@ -61,21 +71,25 @@ test('每周质量实验冻结后才采样，缺连续交易路径不能据集�
   assert.deepEqual(riskOff[1].reasons,['market-risk-off']);
   const unverifiedTheme=api.evaluateWeeklyQualityShadow({...item,momentumDecision:{...item.momentumDecision,
     profile:{businessRelation:'member-only'}}},context);
-  assert.equal(unverifiedTheme[0].status,'fail');
+  assert.equal(unverifiedTheme[0].status,'unknown');
   assert.deepEqual(unverifiedTheme[0].reasons,['business-theme-unverified']);
+  assert.equal(api.evaluateWeeklyQualityShadow({...item,momentumDecision:{firstPullback:true,noChase:false}},context)[0].status,'unknown');
   assert.deepEqual(api.evaluateWeeklyQualityShadow(item,{...context,tradeDate:'2026-09-10'}).map(row=>row.status),
-    ['unknown','unknown','unknown']);
+    ['unknown','unknown','unknown','unknown','unknown','unknown']);
 });
 
 test('每周质量回放有独立基线且未达到前瞻样本时保持 pending',()=>{
   const quality=api.createWeeklyQualityManifest({frozenAt:'2026-09-10T10:00:00+08:00',modelVersion:'v26'});
   const item=signal();
-  item.shadowExperiments=['Q1','Q2','Q3'].map(id=>({id,version:quality.version,status:'pass',reasons:['fixture']}));
+  item.shadowExperiments=['Q1','Q2','Q3','S1','S2','S3'].map(id=>({id,version:quality.version,status:'pass',reasons:['fixture']}));
   const output=replay([item],[bar('2026-09-15'),bar('2026-09-16')],{qualityManifest:quality});
   assert.deepEqual(output.variants.filter(row=>row.id.startsWith('Q')).map(row=>row.baselineId),
     ['qualityBaseline','qualityBaseline','qualityBaseline']);
   assert.equal(output.variants.find(row=>row.id==='Q1').validation.B.status,'pending');
   assert.equal(output.variants.find(row=>row.id==='Q1').promotionAllowed,false);
+  assert.deepEqual(output.variants.filter(row=>row.id.startsWith('S')).map(row=>row.baselineId),
+    ['qualityBaseline','qualityBaseline','qualityBaseline']);
+  assert.equal(output.variants.find(row=>row.id==='S2').validation.B.status,'pending');
 });
 
 test('manifest is deeply frozen, deterministic and rejects implicit transaction assumptions', () => {

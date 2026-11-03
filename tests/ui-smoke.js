@@ -1,6 +1,8 @@
 const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
 const os = require('os');
+const fs = require('fs');
+const {renderDailyReportHtml} = require('../lib/daily-report');
 
 process.on('unhandledRejection', error => {
   console.error(error?.stack || error);
@@ -307,6 +309,19 @@ app.whenReady().then(async () => {
     throw new Error(`UI脚本 ${String(code).trim().slice(0, 100)}: ${error.message || error}`);
   });
   await win.loadFile(path.join(__dirname, '..', 'index.html'));
+  const browserReportFile=path.join(app.getPath('userData'),'report-browser-smoke.html');
+  fs.mkdirSync(path.dirname(browserReportFile),{recursive:true});
+  fs.writeFileSync(browserReportFile,renderDailyReportHtml(dailyReport),'utf8');
+  const reportWindow=new BrowserWindow({show:false});
+  const reportLoadErrors=[];
+  reportWindow.webContents.on('did-fail-load',(_event,_code,description)=>reportLoadErrors.push(description));
+  await reportWindow.loadFile(browserReportFile);
+  const browserReportUsable=await reportWindow.webContents.executeJavaScript(`({
+    title:document.title,review:!!document.getElementById('page-review'),
+    plan:!!document.getElementById('next-day-plan'),terms:!!document.getElementById('report-terms'),
+    hasRecommendation:document.body.innerText.includes('方案A测试')
+  })`);
+  reportWindow.destroy();
   await win.webContents.executeJavaScript(`localStorage.clear(); location.reload()`);
   await new Promise(resolve => setTimeout(resolve, 50));
   await win.webContents.executeJavaScript(`document.getElementById('startFullMarketResearch').click()`);
@@ -1299,8 +1314,8 @@ app.whenReady().then(async () => {
     && state.reportState.browserOpenCount === 2
     && state.reportState.browserRequests[1]?.revision === 0
     && state.reportState.generateCount === 1;
-  if (state.title !== '股票观察助手' || state.heading !== state.title || !state.hasApi || !state.stockContainer || state.statusFixed !== 'fixed' || state.focusAfterAdd !== 'searchInput' || state.focusAfterDelete !== 'searchInput' || !inputsUsable || !desktopLayoutUsable || !backToTopUsable || !multiLabelUsable || !detailUsable || !detailClickQuoteUsable || !marketUsable || !liveNewsUsable || !chartUsable || !simulationUsable || !labelModalUsable || !labelSortUsable || !labelRenameUsable || !favoriteChangeUsable || !labelListUsable || !reportUsable || !state.fullMarketTaskState.status.includes('ERR_WORKER_OUT_OF_MEMORY') || state.fullMarketTaskState.button !== '恢复任务' || !state.fullMarketTaskState.commandUsable || errors.length) {
-    console.error(JSON.stringify({ state, checks: { inputsUsable, desktopLayoutUsable, backToTopUsable, multiLabelUsable, detailUsable, detailClickQuoteUsable, marketUsable, liveNewsUsable, chartUsable, simulationUsable, labelModalUsable, labelSortUsable, labelRenameUsable, favoriteChangeUsable, labelListUsable, reportUsable }, errors }, null, 2));
+  if (state.title !== '股票观察助手' || state.heading !== state.title || !state.hasApi || !state.stockContainer || state.statusFixed !== 'fixed' || state.focusAfterAdd !== 'searchInput' || state.focusAfterDelete !== 'searchInput' || !inputsUsable || !desktopLayoutUsable || !backToTopUsable || !multiLabelUsable || !detailUsable || !detailClickQuoteUsable || !marketUsable || !liveNewsUsable || !chartUsable || !simulationUsable || !labelModalUsable || !labelSortUsable || !labelRenameUsable || !favoriteChangeUsable || !labelListUsable || !reportUsable || !browserReportUsable.title.includes('全局收盘报告') || !browserReportUsable.review || !browserReportUsable.plan || !browserReportUsable.terms || !browserReportUsable.hasRecommendation || reportLoadErrors.length || !state.fullMarketTaskState.status.includes('ERR_WORKER_OUT_OF_MEMORY') || state.fullMarketTaskState.button !== '恢复任务' || !state.fullMarketTaskState.commandUsable || errors.length) {
+    console.error(JSON.stringify({ state, checks: { inputsUsable, desktopLayoutUsable, backToTopUsable, multiLabelUsable, detailUsable, detailClickQuoteUsable, marketUsable, liveNewsUsable, chartUsable, simulationUsable, labelModalUsable, labelSortUsable, labelRenameUsable, favoriteChangeUsable, labelListUsable, reportUsable, browserReportUsable, reportLoadErrors }, errors }, null, 2));
     app.exit(1);
     return;
   }

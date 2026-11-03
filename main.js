@@ -30,7 +30,8 @@ const {createStrategyExperimentManifest,createWeeklyQualityManifest,evaluateWeek
 const {evaluatePublishedEpisodes,mergeSavedReportCloses,assessForwardValidation} = require('./lib/recommendation-outcomes');
 const {executionWindow, nextTradingDay, isTradingDay} = require('./lib/trade-time');
 const {buildDailyReport, classifyRecommendationRole, selectPublishedBatchStatus} = require('./lib/daily-report');
-const {DailyReportStore, readLedgerEntriesForDate, readLedgerEntriesOffThread, reportDatesToGenerate, validDate} = require('./lib/report-service');
+const {DailyReportStore, readLedgerEntriesForDate, readLedgerEntriesOffThread, readCachedPublishedLedger,
+  reportDatesToGenerate, validDate} = require('./lib/report-service');
 const {
   buildFactorSnapshot,
   detectBreakoutContext,
@@ -1886,9 +1887,7 @@ function resolveStockRotationProfiles(stock, sectors) {
   const code = String(stock?.code || '').slice(-6);
   const industry = normalizeSectorCapitalName(resolveRecommendationIndustry(stock));
   const profile = stock?.companyProfile?.profile || stock?.companyProfile || stock?.profile || {};
-  const businessEvidence = [profile.business,profile.mainBusiness,profile.products,profile.summary,
-    profile.description,profile.companySummary,...(Array.isArray(profile.tags) ? profile.tags : []),
-    ...(Array.isArray(stock?.tags) ? stock.tags : [])].filter(Boolean).join(' ');
+  const fields = ['business','mainBusiness','products'];
   return (sectors || []).filter(sector => {
     if (!isSectorRotationTheme(sector)) return false;
     const members = sector.memberCodes || [];
@@ -1898,13 +1897,22 @@ function resolveStockRotationProfiles(stock, sectors) {
   }).map(sector => {
     const sectorName = normalizeSectorCapitalName(sector.name);
     const actualIndustry = sectorName === industry && industry && industry !== '行业待确认';
-    const confirmedBusiness = !actualIndustry && sectorName.length >= 2 && businessEvidence.includes(sectorName);
+    const escapedName = sectorName.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+    const negated = new RegExp(`(?:不涉及|未涉及|不属于|非主营|不经营|不从事|尚未开展|计划进入|拟开展|客户涉及|无)${escapedName}`);
+    const matchingField = fields.find(field => typeof profile[field] === 'string'
+      && profile[field].includes(sectorName) && !negated.test(profile[field])
+      && /^https:\/\//.test(profile.fieldEvidence?.[field]?.url || '')
+      && Number.isFinite(Date.parse(profile.fieldEvidence[field].observedAt)));
+    const evidence = actualIndustry ? profile.fieldEvidence?.industry : profile.fieldEvidence?.[matchingField];
+    const businessText = matchingField ? profile[matchingField] : '';
+    const mentionAt = businessText.indexOf(sectorName);
+    const confirmedBusiness = !actualIndustry && sectorName.length >= 2 && Boolean(matchingField);
     const businessRelation = actualIndustry ? 'confirmed-industry'
       : confirmedBusiness ? 'confirmed-business' : 'member-only';
-    const observedAt = stock?.companyProfile?.fetchedAt || profile.fetchedAt || stock?.profileObservedAt || '';
-    return {...sector,businessRelation,businessRelationEvidence:businessRelation === 'member-only' ? null : {
-      source:actualIndustry ? '个股实际行业' : profile.source || stock?.companyProfile?.source || '公司资料',
-      excerpt:actualIndustry ? industry : sectorName,observedAt}};
+    return {...sector,businessRelation,businessRelationEvidence:businessRelation === 'member-only' || !evidence ? null : {
+      source:evidence.source,url:evidence.url,excerpt:actualIndustry ? industry
+        : businessText.slice(Math.max(0,mentionAt-80),mentionAt+sectorName.length+120),
+      observedAt:evidence.observedAt}};
   }).sort((a, b) => Number(b.businessRelation === 'confirmed-industry')
     - Number(a.businessRelation === 'confirmed-industry')
     || Number(b.businessRelation === 'confirmed-business') - Number(a.businessRelation === 'confirmed-business')
@@ -2773,7 +2781,7 @@ async function attachEntryPlanLifecycle(result) {
         tradeDate:result.tradeDate,cutoffAt:decisionAt,
         entryPermission:formalPermission,entryAssessment:{allowed:item.entryAssessment?.allowed},planState,
         decisionEvent:planState.decisionEvent,themes:resolveStockRotationProfiles(item,result.sectors).map(row=>row.name),
-        shadowExperiments:planned.shadowExperiments.filter(row=>['H5','H6','H7','Q1','Q2','Q3'].includes(row.id)),
+        shadowExperiments:planned.shadowExperiments.filter(row=>['H5','H6','H7','Q1','Q2','Q3','S1','S2','S3'].includes(row.id)),
         intradayPlanState:planned.intradayPlanState ? {
           planId:planned.intradayPlanState.planId,state:planned.intradayPlanState.state,
           currentPermission:planned.intradayPlanState.currentPermission,
@@ -2807,7 +2815,7 @@ function experimentManifestFile() {
 }
 
 function qualityExperimentManifestFile() {
-  return path.join(dataRootPath(),'data','strategy-experiments','close-quality-20261030-shadow-v1.json');
+  return path.join(dataRootPath(),'data','strategy-experiments','close-quality-20261103-shadow-v5.json');
 }
 
 function saveExperimentManifest(manifest) {
@@ -2902,6 +2910,8 @@ function buildRecommendationLedgerEntry(result) {
     costAssumptions:tradePlan?.transactionCostPct == null ? null : {entryBps:Number(tradePlan.transactionCostPct)*50,exitBps:Number(tradePlan.transactionCostPct)*50,estimated:true},
     shadowExperiments:item.shadowExperiments || [],
     shadowDecisionInput:item.shadowDecisionInput || null,
+    businessRelation:item.momentumDecision?.profile?.businessRelation || null,
+    businessRelationEvidence:item.momentumDecision?.profile?.businessRelationEvidence || null,
     invalidation:tradePlan?.invalidation || item.entryAssessment?.risk || '',
     setupType:tradePlan?.setupType || '',
     triggerPrice:tradePlan?.confirmationPrice ?? null,
@@ -7046,10 +7056,11 @@ function dataCenterRows(json) {
 async function fetchDataCenterCompanyRows(reportName, code) {
   const params = new URLSearchParams({reportName,columns:'ALL',filter:`(SECUCODE="${emF10Code(code).slice(2)}.${emF10Code(code).slice(0,2)}")`,
     pageSize:'100',pageNumber:'1',...(reportName === 'RPT_F10_FN_MAINOP' ? {sortColumns:'REPORT_DATE',sortTypes:'-1'} : {})});
-  const json = await getJsonWithRetry(`https://datacenter-web.eastmoney.com/api/data/v1/get?${params}`,1);
+  const url = `https://datacenter-web.eastmoney.com/api/data/v1/get?${params}`;
+  const json = await getJsonWithRetry(url,1);
   const rows = dataCenterRows(json);
   if (!rows.length) throw new Error('公司资料为空');
-  return rows;
+  return {rows,url};
 }
 
 async function fetchCompanyProfile({ code, name, sector, force = false }) {
@@ -7058,6 +7069,11 @@ async function fetchCompanyProfile({ code, name, sector, force = false }) {
   if (cached) return { ...cached, cached: true };
   const previous = readDiskCache(`company-profile-${cacheKey}`,180 * 24 * 60 * 60 * 1000);
   const errors = [];
+  const checkedAt = new Date().toISOString();
+  const fieldEvidence = {};
+  const stamp = (field,url,source,knownFromSource) => {
+    if (knownFromSource && profile[field] && !fieldEvidence[field]) fieldEvidence[field] = {url,source,observedAt:checkedAt};
+  };
   const profile = {
     code,
     name: cleanStockName(name),
@@ -7072,12 +7088,15 @@ async function fetchCompanyProfile({ code, name, sector, force = false }) {
     fetchDataCenterCompanyRows('RPT_F10_BASIC_ORGINFO',code), fetchDataCenterCompanyRows('RPT_F10_FN_MAINOP',code)
   ]);
   if (dataCenter[0].status === 'fulfilled') {
-    Object.assign(profile,mapDataCenterCompanyProfile(dataCenter[0].value[0]));
+    const mapped = mapDataCenterCompanyProfile(dataCenter[0].value.rows[0]);
+    Object.assign(profile,mapped);
     profile.source = '东方财富数据中心公司资料';
+    for (const field of ['industry','business','summary']) stamp(field,dataCenter[0].value.url,profile.source,Boolean(mapped[field]));
   } else errors.push(`数据中心公司资料：${dataCenter[0].reason?.message || dataCenter[0].reason}`);
   if (dataCenter[1].status === 'fulfilled') {
-    profile.products = formatBusinessProducts(dataCenter[1].value);
+    profile.products = formatBusinessProducts(dataCenter[1].value.rows);
     profile.source = [profile.source,'东方财富数据中心主营构成'].filter(Boolean).join(' + ');
+    stamp('products',dataCenter[1].value.url,'东方财富数据中心主营构成',Boolean(profile.products));
   } else errors.push(`数据中心主营构成：${dataCenter[1].reason?.message || dataCenter[1].reason}`);
   const requests = await settleWithConcurrency([
     () => fetchStockBoards(code),
@@ -7097,9 +7116,13 @@ async function fetchCompanyProfile({ code, name, sector, force = false }) {
     if (requests[1].status === 'rejected') throw requests[1].reason;
     const survey = requests[1].value;
     const data = survey?.jbzl || survey?.data?.jbzl || survey?.CompanySurvey || {};
+    const before = {...profile};
     profile.industry ||= cleanStockName(data.SSHY || data.INDUSTRY || data.HY || data.BK || '');
     profile.business ||= plainText(data.JYFW || data.MAINBUSIN || data.ZYFW || '');
     profile.summary ||= plainText(data.GSJJ || data.COMPANY_PROFILE || data.INTRODUCTION || '');
+    for (const field of ['industry','business','summary']) stamp(field,
+      `https://emweb.securities.eastmoney.com/PC_HSF10/CompanySurvey/PageAjax?code=${encodeURIComponent(emF10Code(code))}`,
+      '东方财富F10公司概况',!before[field]);
     if (survey) profile.source = [profile.source, '东方财富F10'].filter(Boolean).join(' + ');
   } catch (err) {
     errors.push(`公司概况失败：${err.message || err}`);
@@ -7107,9 +7130,13 @@ async function fetchCompanyProfile({ code, name, sector, force = false }) {
   try {
     if (requests[2].status === 'rejected') throw requests[2].reason;
     const required = requests[2].value;
+    const before = {...profile};
     profile.industry ||= findPointText(required, ['所属板块']) || findTextByKeys(required, ['SSBK', 'INDUSTRY', 'BK']);
     profile.business ||= findPointText(required, ['经营范围']) || findTextByKeys(required, ['JYFW', 'BUSINESS_SCOPE']);
     profile.summary ||= findPointText(required, ['主营业务']) || findPointText(required, ['核心题材']) || findTextByKeys(required, ['GSJJ', 'MAIN_BUSINESS', 'INTRODUCTION']);
+    for (const field of ['industry','business','summary']) stamp(field,
+      `https://emweb.securities.eastmoney.com/PC_HSF10/OperationsRequired/PageAjax?code=${encodeURIComponent(emF10Code(code))}`,
+      '东方财富F10操盘必读',!before[field]);
     if (required && (profile.business || profile.summary)) profile.source = [profile.source, '东方财富F10操盘必读'].filter(Boolean).join(' + ');
   } catch (err) {
     errors.push(`操盘必读失败：${err.message || err}`);
@@ -7119,7 +7146,10 @@ async function fetchCompanyProfile({ code, name, sector, force = false }) {
     const business = requests[3].value;
     const rows = business?.zygcfx || business?.data?.zygcfx || business?.zygcfxList || [];
     const productRows = Array.isArray(rows) ? rows : [];
+    const hadProducts = Boolean(profile.products);
     profile.products ||= formatBusinessProducts(productRows);
+    stamp('products',`https://emweb.securities.eastmoney.com/PC_HSF10/BusinessAnalysis/PageAjax?code=${encodeURIComponent(emF10Code(code))}`,
+      '东方财富F10经营分析',!hadProducts);
     if (profile.products && !profile.source) profile.source = '东方财富F10';
   } catch (err) {
     errors.push(`经营分析失败：${err.message || err}`);
@@ -7128,15 +7158,17 @@ async function fetchCompanyProfile({ code, name, sector, force = false }) {
   for (const field of ['industry','business','summary','products']) {
     if (!profile[field] && previous?.profile?.[field]) {
       profile[field] = previous.profile[field];
+      if (previous.profile.fieldEvidence?.[field]) fieldEvidence[field] = previous.profile.fieldEvidence[field];
       cachedFields.push(field);
     }
   }
   if (cachedFields.length) profile.source += ` + 公司资料缓存（${previous.fetchedAt}）`;
+  profile.fieldEvidence = fieldEvidence;
   const missingFields = ['industry','business','summary','products'].filter(field=>!profile[field]);
   appendLogLine({type:missingFields.length || cachedFields.length ? 'warn' : 'success',action:'company_data_coverage',message:'公司资料完整性核验',detail:{code,source:profile.source,missingFields,cachedFields,sourceErrors:errors}});
   const result = { profile, errors:missingFields.length || cachedFields.length ? errors : [],
     warnings:missingFields.length || cachedFields.length ? [] : errors, missingFields, cachedFields, stale:cachedFields.length > 0,
-    fetchedAt:cachedFields.length ? previous.fetchedAt : new Date().toISOString(), checkedAt:new Date().toISOString() };
+    fetchedAt:cachedFields.length ? previous.fetchedAt : checkedAt, checkedAt };
   if (!missingFields.length && !cachedFields.length) writeDiskCache(`company-profile-${cacheKey}`,result);
   return writeTimedCache(companyProfileCache, cacheKey, result);
 }
@@ -9065,6 +9097,11 @@ ipcMain.handle('fetch-market-overview', async (_event, input) => {
     result.computedAt ||= completedAt;
     result.publishedAt = completedAt;
     result.quoteObservedAt ||= latestQuoteObservedAt([...quoteCache.values()].filter(quote => quote?.tradeDate === result.tradeDate)) || result.observationPhase?.observedAt || '';
+    const quoteAgeMs = Number.isFinite(Date.parse(result.quoteObservedAt))
+      ? Date.parse(completedAt)-Date.parse(result.quoteObservedAt) : null;
+    if (['morning','afternoon'].includes(result.sessionPhase?.phase) && quoteAgeMs !== null && quoteAgeMs > 120000)
+      appendLogLine({type:'warn',action:'market_quote_stale',message:'盘中大盘行情超过120秒检查点时效',
+        detail:{requestId:result.requestId,quoteObservedAt:result.quoteObservedAt,quoteAgeMs,elapsedMs:result.elapsedMs}});
     await saveEntryPlanStates(result.planUpdates);
     result.experimentManifest = await saveExperimentManifest(result.experimentManifest);
     synchronizeSavedEntryPermissions(result);
@@ -9120,6 +9157,16 @@ function reportJobsFile() {
 function reportCutoffIso(tradeDate) {
   const time = Date.parse(`${tradeDate}T15:30:00+08:00`);
   return Number.isFinite(time) ? new Date(time).toISOString() : '';
+}
+
+function reportNewsBeforeCutoff(items, tradeDate) {
+  const cutoff = Date.parse(reportCutoffIso(tradeDate));
+  return (items || []).filter(item => {
+    const published = Date.parse(item.publishedAt || '');
+    const firstSeen = Date.parse(item.firstSeenAt || item.fetchedAt || '');
+    return Number.isFinite(published) && published <= cutoff
+      && Number.isFinite(firstSeen) && firstSeen <= cutoff;
+  });
 }
 
 function broadcastDailyReportProgress(progress) {
@@ -9211,24 +9258,59 @@ async function storeReportEpisodeChunks(tradeDate, episodes) {
 }
 
 async function localPublishedOutcomes(asOfDate) {
+  const startedAt = Date.now();
+  const stageMs = {};
+  const stage = name => {
+    stageMs[name] = Date.now() - startedAt;
+    if (!isMainThread && parentPort) parentPort.postMessage({phase:'progress',stage:name,elapsedMs:stageMs[name]});
+  };
   const directory = path.join(dataRootPath(), 'data', 'recommendation-ledger', 'daily');
   const names = await fs.promises.readdir(directory).catch(error => error.code === 'ENOENT' ? [] : Promise.reject(error));
   const dates = names.filter(name => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(name) && name.slice(0, 10) <= asOfDate)
     .sort().slice(-100).map(name => name.slice(0, 10));
-  const ledgers = await settleWithConcurrency(dates, 2, date => readLedgerEntriesOffThread(reportLedgerFile(date), date, 120000, true));
-  const entries = ledgers.filter(row => row.status === 'fulfilled').flatMap(row => row.value.entries);
+  const entries = [], seenBatchIds = new Set(), ledgerFailedDates = [];
+  let ledgerCacheHits = 0, duplicateBatches = 0;
+  for (const date of dates) {
+    try {
+      const ledger = await readCachedPublishedLedger(reportLedgerFile(date),date,
+        path.join(dataRootPath(),'data','recommendation-ledger','evaluation-cache'));
+      if (ledger.cacheHit) ledgerCacheHits++;
+      for (const batch of ledger.entries) {
+        if (batch.batchId && seenBatchIds.has(batch.batchId)) { duplicateBatches++; continue; }
+        if (batch.batchId) seenBatchIds.add(batch.batchId);
+        entries.push(batch);
+      }
+    } catch (error) {
+      ledgerFailedDates.push(date);
+      appendLogLine({type:'warn',action:'published_ledger_date_failed',message:'推荐评价账本读取失败',
+        detail:{date,asOfDate},stack:error.stack || String(error)});
+    }
+  }
+  stage('ledgerRead');
+  if (!isMainThread && parentPort) {
+    const decisions = evaluatePublishedEpisodes(entries,new Map(),{asOfDate,horizons:[]});
+    decisions.decisionFunnel.scope = '最近100个账本日期';
+    parentPort.postMessage({phase:'ledger',decisionFunnel:decisions.decisionFunnel,
+      ledgerDates:dates.length,ledgerCacheHits,ledgerFailedDates,duplicateBatches,
+      ledgerErrors:ledgerFailedDates.length});
+  }
   const codes = [...new Set(entries.flatMap(batch => [...(batch.recommendations || []), ...(batch.momentumRecommendations || [])]
     .map(item => String(item.code || '')).filter(code => /^\d{6}$/.test(code))))];
   const store = new StockHistoryStore(path.join(dataRootPath(), 'data', 'market-history'));
   const histories = await settleWithConcurrency(codes, 12, code => store.read(code));
   const byCode = new Map(codes.map((code, index) => [code, histories[index].status === 'fulfilled' ? histories[index].value : null]));
   const historyRefresh = await refreshPublishedHistories(codes,byCode,store,asOfDate);
+  stage('historyRefresh');
   const reportStore = dailyReportStore();
   const reportDates = (await reportStore.list()).filter(row => row.tradeDate <= asOfDate).slice(0, 100);
   const savedReports = await settleWithConcurrency(reportDates, 4, row => reportStore.load(row.tradeDate));
   const {histories:observedHistories,added:savedCloseCount} = mergeSavedReportCloses(byCode,
     savedReports.filter(row => row.status === 'fulfilled').map(row => row.value?.report).filter(Boolean),{asOfDate});
+  stage('savedReports');
   const evaluation = evaluatePublishedEpisodes(entries, observedHistories, {asOfDate});
+  evaluation.duplicateBatches += duplicateBatches;
+  evaluation.decisionFunnel.scope = '最近100个账本日期';
+  stage('episodeEvaluation');
   const forwardValidation = assessForwardValidation(evaluation, {
     freezeDate:RECOMMENDATION_MODEL_VERSION.slice(0,10),modelVersion:RECOMMENDATION_MODEL_VERSION,asOfDate
   });
@@ -9243,10 +9325,13 @@ async function localPublishedOutcomes(asOfDate) {
     catch (error) { shadowReplay = {status:'failed',reason:error.message,shadowOnly:true,promotionAllowed:false}; }
   }
   const episodeChunks = await storeReportEpisodeChunks(asOfDate,evaluation.episodes);
+  stage('detailStorage');
   const verifiedExecutionCount = evaluation.episodes.filter(row => row.execution?.verified === true).length;
-  return {...evaluation,episodes:undefined,episodeChunks,verifiedExecutionCount,forwardValidation,ledgerDates:dates.length, historyCovered:[...byCode.values()].filter(row=>row?.bars?.length).length,
-    historyLatestDate,historyRefresh,savedCloseCount,shadowReplay,ledgerErrors:ledgers.filter(row => row.status === 'rejected').length,
-    dataStatus:historyRefresh.pending || historyRefresh.failed || historyRefresh.partial ? 'partial-history+saved-close-reports' : 'retrospective-updated-history+saved-close-reports'};
+  return {...evaluation,episodes:undefined,episodeChunks,verifiedExecutionCount,forwardValidation,ledgerDates:dates.length,
+    ledgerCacheHits,ledgerFailedDates,historyCovered:[...byCode.values()].filter(row=>row?.bars?.length).length,
+    historyLatestDate,historyRefresh,savedCloseCount,shadowReplay,stageMs,ledgerErrors:ledgerFailedDates.length,
+    dataStatus:ledgerFailedDates.length || historyRefresh.pending || historyRefresh.failed || historyRefresh.partial
+      ? 'partial-history+saved-close-reports' : 'retrospective-updated-history+saved-close-reports'};
 }
 
 async function refreshPublishedHistories(codes,byCode,store,asOfDate) {
@@ -9303,12 +9388,14 @@ function finalQuoteTradingEvidence(bar,quote,tradeDate) {
     tradeRules:{verified:true,tradeDate,source:quote.source,tPlusOne:true,observedAt:quote.quoteObservedAt}};
 }
 
-function publishedOutcomesOffThread(asOfDate) {
+function publishedOutcomesOffThread(asOfDate, fallbackFunnel = null) {
   if (!isMainThread) return localPublishedOutcomes(asOfDate);
   return new Promise((resolve,reject) => {
     const worker = new Worker(__filename,{workerData:{isPackaged:app.isPackaged,dataRoot:dataRootPath(),publishedOutcomes:true,asOfDate}});
     worker.unref();
     let settled = false;
+    let partial = fallbackFunnel ? {decisionFunnel:fallbackFunnel,scope:'report-date-only',ledgerDates:1} : null;
+    const stageMs = {};
     const finish = (error,result) => {
       if (settled) return;
       settled = true;
@@ -9317,10 +9404,31 @@ function publishedOutcomesOffThread(asOfDate) {
       if (error) reject(error);
       else resolve(result);
     };
-    const timer = setTimeout(() => finish(new Error('推荐评价超时')),180000);
-    worker.once('message',message => finish(message.error ? new Error(message.error) : null,message.result));
-    worker.once('error',error => finish(error));
-    worker.once('exit',code => { if (!settled && code !== 0) finish(new Error(`推荐评价线程退出：${code}`)); });
+    const partialFailure = error => partial ? {
+      ...partial,sourceType:'published-ledger',dataStatus:'partial',performanceStatus:'unknown',
+      reason:error.message || String(error)
+    } : null;
+    const timer = setTimeout(() => {
+      const error = new Error('推荐评价超时；决策漏斗已保留');
+      finish(partial ? null : error,partialFailure(error));
+    },180000);
+    worker.on('message',message => {
+      if (message.phase === 'progress') {
+        stageMs[message.stage] = message.elapsedMs;
+        return;
+      }
+      if (message.phase === 'ledger') { partial = {decisionFunnel:message.decisionFunnel,
+        scope:'last-100-ledger-dates',ledgerDates:message.ledgerDates,
+        ledgerCacheHits:message.ledgerCacheHits,ledgerFailedDates:message.ledgerFailedDates,
+        ledgerErrors:message.ledgerErrors,duplicateBatches:message.duplicateBatches,stageMs}; return; }
+      const error = message.error ? new Error(message.error) : null;
+      finish(error && !partial ? error : null,error ? partialFailure(error) : message.result);
+    });
+    worker.once('error',error => finish(partial ? null : error,partialFailure(error)));
+    worker.once('exit',code => { if (!settled && code !== 0) {
+      const error = new Error(`推荐评价线程退出：${code}`);
+      finish(partial ? null : error,partialFailure(error));
+    }});
   });
 }
 
@@ -9362,7 +9470,7 @@ function normalizeLedgerStock(item, batch, checkpoint = '') {
     'entryPermission','planId','planRevision','signalId','planState','plan','tradePlan','triggeredAt',
     'triggerEvent','invalidated','terminal','expiresAt','entryExpiryDate','maxEntryPrice',
     'earliestBuyDate','earliestSellDate','buyCondition','invalidation','dataPrerequisites',
-    'recommendationTier','shadowExperiments','themeRegimes'];
+    'recommendationTier','shadowExperiments','themeRegimes','businessRelation','businessRelationEvidence'];
   return {
     ...Object.fromEntries(keys.filter(key => item[key] !== undefined).map(key => [key,item[key]])),
     triggerEvent:item.triggerEvent || item.decisionEvent,
@@ -9535,8 +9643,17 @@ async function buildDailyReportInput(tradeDate, {force = false, manual = false} 
   if (ledger.incompleteTail) warnings.push('推荐账本尾行未写完，等待下次恢复');
   if (!overview && tradeDate === today) warnings.push('当日大盘快照不可用，报告按已保存记录生成');
   if (tradeDate < today) warnings.push('历史补报只使用已保存推荐、历史日线和当前仍可核验的收藏事件，不重建盘中消息或资金');
+  const marketObservedAt = overview?.quoteObservedAt || savedMarket?.quoteObservedAt || '';
+  const marketTimingNote = Number.isFinite(Date.parse(marketObservedAt))
+    && Date.parse(marketObservedAt) > Date.parse(reportCutoffIso(tradeDate))
+    ? `大盘快照行情时点 ${marketObservedAt} 晚于15:30报告决策截止，仅用于盘后复盘，不回填此前发布决策。` : '';
+  const overviewComputedAt = Date.parse(overview?.computedAt || overview?.fetchedAt || '');
+  const decisionSummaryAllowed = Number.isFinite(overviewComputedAt)
+    && overviewComputedAt <= Date.parse(reportCutoffIso(tradeDate));
   const market = overview ? {
     breadth:overview.breadth || {}, turnover:overview.turnover, indices:overview.indices || [], limits:overview.limits || {},
+    snapshotObservedAt:overview.quoteObservedAt || overview.fetchedAt || '',
+    snapshotFetchedAt:overview.fetchedAt || '',
     regime:overview.marketRegime || null, overseas:overview.overseas || null,sessionPhase:overview.sessionPhase || null,
     components:overview.components || {},
     path:compactReportMarketPath(overview.marketPath),
@@ -9547,17 +9664,37 @@ async function buildDailyReportInput(tradeDate, {force = false, manual = false} 
       up:latest.coverage.marketRegime.up, down:latest.coverage.marketRegime.down, flat:latest.coverage.marketRegime.flat
     } : {}),
     turnover:savedMarket?.turnover ?? latest?.coverage?.marketRegime?.turnover ?? null,
+    snapshotObservedAt:savedMarket?.quoteObservedAt || latest?.quoteObservedAt || '',
+    snapshotFetchedAt:savedMarket?.fetchedAt || '',
     indices:savedMarket?.indices || [],limits:savedMarket?.limits || {},sessionPhase:savedMarket?.sessionPhase || null,
     components:savedMarket?.components || {},
     path:savedMarket ? compactReportMarketPath(savedMarket) : null,
     regime:latest?.coverage?.marketRegime || null,
     warnings
   };
-  const publishedOutcomes = await publishedOutcomesOffThread(tradeDate).catch(error => ({
-    sourceType:'published-ledger', dataStatus:'failed', reason:error.message || String(error)
-  }));
-  market.publishedPlanFunnel = publishedOutcomes.decisionFunnel || null;
-  if (publishedOutcomes.dataStatus === 'failed') warnings.push(`已发布推荐评价失败：${publishedOutcomes.reason}`);
+  const reportDateFunnel = evaluatePublishedEpisodes(ledger.entries,new Map(),
+    {asOfDate:tradeDate,horizons:[]}).decisionFunnel;
+  const publishedOutcomes = await publishedOutcomesOffThread(tradeDate,reportDateFunnel).catch(error => {
+    appendLogLine({type:'warn',action:'published_outcomes_failed',message:'推荐评价失败，保留当日决策漏斗',
+      detail:{tradeDate,batches:ledger.entries.length},stack:error.stack || String(error)});
+    try {
+      const decisions = evaluatePublishedEpisodes(ledger.entries,new Map(),{asOfDate:tradeDate,horizons:[]});
+      return {sourceType:'published-ledger',dataStatus:'partial',scope:'report-date-only',reason:error.message || String(error),
+        decisionFunnel:decisions.decisionFunnel,performanceStatus:'unknown'};
+    } catch (fallbackError) {
+      return {sourceType:'published-ledger',dataStatus:'failed',reason:`${error.message}; 决策漏斗回退失败：${fallbackError.message}`};
+    }
+  });
+  appendLogLine({type:['failed','partial'].includes(publishedOutcomes.dataStatus) ? 'warn' : 'info',
+    action:'published_outcomes_diagnostics',message:'已发布推荐评价阶段统计',detail:{tradeDate,
+      dataStatus:publishedOutcomes.dataStatus,scope:publishedOutcomes.scope,
+      ledgerDates:publishedOutcomes.ledgerDates,ledgerCacheHits:publishedOutcomes.ledgerCacheHits,
+      ledgerFailedDates:publishedOutcomes.ledgerFailedDates,duplicateBatches:publishedOutcomes.duplicateBatches,
+      historyRefresh:publishedOutcomes.historyRefresh,stageMs:publishedOutcomes.stageMs,
+      verifiedExecutionCount:publishedOutcomes.verifiedExecutionCount,reason:publishedOutcomes.reason}});
+  market.publishedPlanFunnel = reportDateFunnel;
+  if (['failed','partial'].includes(publishedOutcomes.dataStatus)) warnings.push(`已发布推荐收益与成交评价未完成：${publishedOutcomes.reason}${publishedOutcomes.scope === 'report-date-only' ? '；当前决策漏斗仅含报告当日账本' : ''}`);
+  if (publishedOutcomes.ledgerFailedDates?.length) warnings.push(`历史评价账本未读完：${publishedOutcomes.ledgerFailedDates.join('、')}；已读取日期的统计仅供部分核验`);
   if (publishedOutcomes.historyRefresh?.pending || publishedOutcomes.historyRefresh?.failed || publishedOutcomes.historyRefresh?.partial)
     warnings.push(`评价日线已更新${publishedOutcomes.historyRefresh.updated}只，旧日线/未最终核验${publishedOutcomes.historyRefresh.partial}只，失败${publishedOutcomes.historyRefresh.failed}只，待续取${publishedOutcomes.historyRefresh.pending}只；未核验项不计成交收益`);
   else if (publishedOutcomes.counts?.observations?.missing)
@@ -9573,7 +9710,9 @@ async function buildDailyReportInput(tradeDate, {force = false, manual = false} 
     parameterVersion:overview?.parameterVersion || latest?.parameterVersion || '',
     dataContractVersion:overview?.dataContractVersion || latest?.dataContractVersion || '',
     planContractVersion:overview?.planContractVersion || latest?.planContractVersion || '',
-    summary:overview?.analysis || `历史补报：读取 ${ledger.entries.length} 个发布批次，缺失数据已单列。`,
+    summary:[decisionSummaryAllowed && overview?.analysis ? overview.analysis
+      : `盘后复盘：读取 ${ledger.entries.length} 个发布批次；晚于决策截止的分析不回填盘中判断，缺失数据已单列。`,
+      marketTimingNote].filter(Boolean).join(' '),
     market,
     publishedOutcomes,
     strategyExperiments:{manifest:overview?.experimentManifest || (await readJsonWithBackup(experimentManifestFile(),null)).value,
@@ -9598,7 +9737,7 @@ async function buildDailyReportInput(tradeDate, {force = false, manual = false} 
       simulatedTrades:state.simulatedTrades || [],
       researchAccount:researchAccount || null
     } : {positions:[], unavailableReason:'历史账户事件不足，未使用当前持仓重建过去仓位'},
-    news:tradeDate === today ? (overview?.newsContext?.items || []).map(item => ({
+    news:tradeDate === today ? reportNewsBeforeCutoff(overview?.newsContext?.items,tradeDate).map(item => ({
       title:item.title, url:item.link || item.url, publishedAt:item.publishedAt, source:item.source
     })) : [],
     warnings,
@@ -9908,6 +10047,7 @@ app.on('window-all-closed', () => {
 });
 
 module.exports = {
+  reportNewsBeforeCutoff,
   dataRootPath,
   dataCenterRows,
   emF10Code,

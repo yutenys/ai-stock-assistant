@@ -27,6 +27,16 @@ test('报告三个视图共用冻结术语并区分本地与外部B2',()=>{
   assert.match(html,/已移除事件 1 条/);
 });
 
+test('评价线程中断时报告不把未知收益和成交显示为零',()=>{
+  const report=buildDailyReport({tradeDate:'2026-11-02',publishedOutcomes:{
+    dataStatus:'partial',scope:'report-date-only',reason:'评价线程退出',
+    decisionFunnel:{publishedSignals:2}}});
+  const html=renderDailyReportHtml(report);
+  assert.match(html,/仅含报告当日发布账本/);
+  assert.match(html,/收益、触发观察及成交统计未知/);
+  assert.doesNotMatch(html,/发布批次 0/);
+});
+
 test('实际大盘路径对象和影子决策能渲染，缺失锚点不补造',()=>{
   const report=buildDailyReport({tradeDate:'2026-10-09',market:{path:{snapshots:[],anchors:{'10:00':{
     fetchedAt:'2026-10-09T10:00:00+08:00',breadth:{up:1000,down:4000},source:'fixture'}}}},
@@ -96,6 +106,7 @@ const {
   DailyReportStore,
   readLedgerEntriesForDate,
   readLedgerEntriesOffThread,
+  readCachedPublishedLedger,
   reportDatesToGenerate
 } = require('../lib/report-service');
 
@@ -525,12 +536,45 @@ test('发布评价在工作线程只返回必要字段，不传输整份行情�
   fs.writeFileSync(file, JSON.stringify({tradeDate:'2026-09-18',batchId:'batch-1',modelVersion:'v1',
     publishedAt:'2026-09-18T15:35:00+08:00',inputCutoffAt:'2026-09-18T15:00:00+08:00',
     recommendations:[{code:'600001',signalId:'signal-1',strategyDecision:{primaryStrategyId:'A'},
-      quote:{price:12,largePayload:'discard'},analysis:{huge:'discard'}}]}) + '\n');
+      businessRelation:'confirmed-business',businessRelationEvidence:{source:'公司资料',url:'https://example.com/company',excerpt:'主营业务',observedAt:'2026-09-18T10:00:00+08:00'},
+      quote:{price:12,largePayload:'discard'},analysis:{huge:'discard'}},
+    {code:'600002',signalId:'scan',fullMarketFactor:{scope:'market'},quote:{price:10}},
+    {code:'600003',signalId:'old',recommendationTier:'历史待筛',quote:{price:10}}]}) + '\n');
   const result = await readLedgerEntriesOffThread(file,'2026-09-18',120000,true);
   assert.equal(result.entries[0].recommendations[0].price,12);
   assert.equal(result.entries[0].recommendations[0].strategyId,'A');
   assert.equal(result.entries[0].recommendations[0].analysis,undefined);
   assert.equal(result.entries[0].recommendations[0].quote,undefined);
+  assert.equal(result.entries[0].recommendations[0].businessRelationEvidence.url,'https://example.com/company');
+  assert.equal(result.entries[0].recommendations.length,3);
+});
+
+test('逐日压缩缓存命中、账本追加失效且损坏缓存回退原账本', async () => {
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'published-ledger-cache-'));
+  const file=path.join(root,'2026-09-18.jsonl'),cacheDir=path.join(root,'cache');
+  const batch=id=>({tradeDate:'2026-09-18',batchId:id,modelVersion:'v1',
+    publishedAt:'2026-09-18T10:00:00+08:00',inputCutoffAt:'2026-09-18T09:59:00+08:00',
+    recommendations:[{code:'600001',signalId:id,price:10,strategyId:'trend'},
+      {code:'600002',signalId:`${id}-scan`,price:10,strategyId:'trend',fullMarketFactor:{scope:'broad'}}]});
+  fs.writeFileSync(file,`${JSON.stringify(batch('first'))}\ninvalid-json\n`,'utf8');
+  const first=await readCachedPublishedLedger(file,'2026-09-18',cacheDir);
+  const second=await readCachedPublishedLedger(file,'2026-09-18',cacheDir);
+  assert.equal(first.cacheHit,false);
+  assert.equal(second.cacheHit,true);
+  assert.equal(second.invalidLines,1);
+  assert.equal(second.entries[0].recommendations.length,1);
+  const firstCache=fs.readdirSync(cacheDir).find(name=>name.endsWith('.gz'));
+  fs.appendFileSync(file,`${JSON.stringify(batch('second'))}\n`,'utf8');
+  const third=await readCachedPublishedLedger(file,'2026-09-18',cacheDir);
+  assert.equal(third.cacheHit,false);
+  assert.equal(third.entries.length,2);
+  const latest=fs.readdirSync(cacheDir).filter(name=>name.endsWith('.gz') && name!==firstCache)
+    .map(name=>path.join(cacheDir,name))[0];
+  assert.ok(latest);
+  fs.writeFileSync(latest,'corrupt','utf8');
+  const recovered=await readCachedPublishedLedger(file,'2026-09-18',cacheDir);
+  assert.equal(recovered.cacheHit,false);
+  assert.equal(recovered.entries.length,2);
 });
 
 test('启动补报仅生成有证据且未生成的最近交易日', () => {

@@ -609,9 +609,9 @@ function marketRefreshIntervalMs(sessionPhase={}){
 function scheduleMarketOverviewRefresh(){
   clearTimeout(marketOverviewTimer);
   const interval=marketRefreshIntervalMs(latestMarketOverview?.sessionPhase);
-  marketOverviewTimer=setTimeout(async()=>{
-    await loadMarketOverview();
+  marketOverviewTimer=setTimeout(()=>{
     scheduleMarketOverviewRefresh();
+    if(!marketOverviewPending) void loadMarketOverview();
   },interval);
   return interval;
 }
@@ -1597,12 +1597,12 @@ function renderDailyReportView(){
     return `<tr><td>${id}</td><td>${decisions.filter(row => row.status === 'pass').length}</td><td>${decisions.filter(row => row.status === 'fail').length}</td><td>${decisions.filter(row => row.status === 'unknown').length}</td></tr>`;
   }).join('');
   const qualityReplayActive = (review.shadowReplay?.variants || []).some(row=>row.id === 'qualityBaseline');
-  const qualityShadowRows = ['Q1','Q2','Q3'].map(id => {
+  const qualityShadowRows = (report.strategyExperiments?.qualityManifest?.experiments || []).map(({id}) => {
     const decisions=(report.strategyExperiments?.decisions || []).filter(row=>row.id === id);
     return `<tr><td>${id}</td><td>${decisions.filter(row=>row.status === 'pass').length}</td><td>${decisions.filter(row=>row.status === 'fail').length}</td><td>${decisions.filter(row=>row.status === 'unknown').length}</td></tr>`;
   }).join('');
   const qualityHtml = report.strategyExperiments?.qualityManifest
-    ? `<section class="report-section"><h3>每周质量影子实验</h3><p>Q1 买点排序、Q2 连续交易路径与板块联合降级、Q3 新入场与持仓退出分离；冻结版本 ${escapeHtml(report.strategyExperiments.qualityManifest.version)}，最早观察 ${escapeHtml(report.strategyExperiments.qualityManifest.firstTradeDate)}。${qualityReplayActive ? '独立同资金基线已接入。' : '尚未到前向回放起点。'}未成熟样本和证据未知不计成交，也不自动切换正式策略。</p><div class="table-wrap report-table-wrap"><table class="report-table"><thead><tr><th>实验</th><th>通过</th><th>拒绝</th><th>未知</th></tr></thead><tbody>${qualityShadowRows}</tbody></table></div></section>` : '';
+    ? `<section class="report-section"><h3>质量影子实验</h3><p>Q1–Q3及S1买点、S2多日资金、S3市场风险独立对照；冻结版本 ${escapeHtml(report.strategyExperiments.qualityManifest.version)}，最早观察 ${escapeHtml(report.strategyExperiments.qualityManifest.firstTradeDate)}。${qualityReplayActive ? '独立同资金基线已接入。' : '尚未到前向回放起点。'}未成熟样本和证据未知不计成交，也不自动切换正式策略。</p><div class="table-wrap report-table-wrap"><table class="report-table"><thead><tr><th>实验</th><th>通过</th><th>拒绝</th><th>未知</th></tr></thead><tbody>${qualityShadowRows}</tbody></table></div></section>` : '';
   const funnel = report.market?.planFunnel;
   const publishedFunnel = report.market?.publishedPlanFunnel;
   const funnelHtml = publishedFunnel || funnel ? `<section class="report-section"><h3>推荐计划漏斗</h3>${publishedFunnel ? `<p><b>全天已发布：</b>批次 ${escapeHtml(publishedFunnel.publishedBatches)}，信号 ${escapeHtml(publishedFunnel.publishedSignals)}，生命周期 ${escapeHtml(publishedFunnel.episodes)}，冻结计划 ${escapeHtml(publishedFunnel.frozenPlans)}，价格可行 ${escapeHtml(publishedFunnel.priceFeasible)}，发布许可 ${escapeHtml(publishedFunnel.publishedAllowed)}，核验触发 ${escapeHtml(publishedFunnel.verifiedTriggers)}，核验成交 ${escapeHtml(publishedFunnel.verifiedFills)}。原因：${detail(publishedFunnel.reasons)}。</p>` : '<p>全天已发布决策漏斗缺失。</p>'}${funnel ? `<p><b>最终快照：</b>展示计划 ${escapeHtml(funnel.discovered)}，数据可用 ${escapeHtml(funnel.dataAvailable ?? '--')}，结构成立 ${escapeHtml(funnel.structureEstablished ?? '--')}，价格可行 ${escapeHtml(funnel.priceFeasible)}，风险通过 ${escapeHtml(funnel.riskPassed ?? '--')}，等待触发 ${escapeHtml(funnel.armed)}，当前许可 ${escapeHtml(funnel.currentlyAllowed)}。原因：${detail(funnel.reasons)}。</p>` : '<p>最终快照计划漏斗缺失。</p>'}</section>` : '';

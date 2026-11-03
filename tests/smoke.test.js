@@ -590,17 +590,20 @@ test('公司接口失联保留已保存资料并标注旧时间，不覆盖成�
     mapDataCenterCompanyProfile,formatBusinessProducts,settleWithConcurrency,
     fetchDataCenterCompanyRows:async report=>{
       if (offline) throw new Error('offline');
-      return report === 'RPT_F10_BASIC_ORGINFO' ? [{EM2016:'中药',MAIN_BUSINESS:'生产中药',ORG_PROFILE:'公司概况'}]
-        : [{REPORT_DATE:'2026-06-30',ITEM_NAME:'中药产品',MAINOP_TYPE:'2',MAIN_BUSINESS_INCOME:1e8}];
+      return {url:`https://example.com/${report}`,rows:report === 'RPT_F10_BASIC_ORGINFO'
+        ? [{EM2016:'中药',MAIN_BUSINESS:'生产中药',ORG_PROFILE:'公司概况'}]
+        : [{REPORT_DATE:'2026-06-30',ITEM_NAME:'中药产品',MAINOP_TYPE:'2',MAIN_BUSINESS_INCOME:1e8}]};
     },fetchStockBoards:async()=>[],getJsonWithRetry:async()=>{throw new Error('offline');},
     findPointText:()=>'',findTextByKeys:()=>'',appendLogLine:value=>logs.push(value)};
   const fetchProfile = vm.runInNewContext(source.slice(start,end)+';fetchCompanyProfile',context);
   const first = await fetchProfile({code:'603567',name:'珍宝岛',force:true});
   assert.equal(first.stale,false);
+  assert.match(first.profile.fieldEvidence.business.url,/RPT_F10_BASIC_ORGINFO/);
   assert.equal(disk,first);
   offline=true;
   const fallback = await fetchProfile({code:'603567',name:'珍宝岛',force:true});
   assert.equal(fallback.profile.business,'生产中药');
+  assert.equal(fallback.profile.fieldEvidence.business.url,first.profile.fieldEvidence.business.url);
   assert.equal(fallback.stale,true);
   assert.equal(fallback.fetchedAt,first.fetchedAt);
   assert.equal(fallback.cachedFields.length,4);
@@ -912,10 +915,11 @@ test('个股实际行业优先于泛概念资金榜', () => {
     {name:'5G概念',boardType:'concept',memberCodes:['603298'],rotationScore:90},
     {name:'工程机械',boardType:'industry',memberCodes:['603298'],rotationScore:45}
   ];
-  const profiles=resolveStockRotationProfiles({code:'603298',industry:'工程机械'},sectors);
+  const profiles=resolveStockRotationProfiles({code:'603298',industry:'工程机械',companyProfile:{profile:{
+    fieldEvidence:{industry:{source:'东方财富公司资料',url:'https://example.com/company',observedAt:'2026-09-08T10:00:00+08:00'}}}}},sectors);
   assert.deepEqual(profiles.map(row=>row.name),['工程机械','5G概念']);
   assert.deepEqual(profiles.map(row=>row.businessRelation),['confirmed-industry','member-only']);
-  assert.equal(profiles[0].businessRelationEvidence.source,'个股实际行业');
+  assert.equal(profiles[0].businessRelationEvidence.source,'东方财富公司资料');
 });
 
 test('真实多日汇总覆盖资金代理但不编造每日流入天数和买卖分项', () => {
@@ -1392,8 +1396,30 @@ test('概念板块成员映射到个股并参与轮动判断', () => {
   assert.equal(profiles[0].capitalEstimated, false);
   assert.equal(profiles[0].businessRelation, 'member-only');
   const confirmed = resolveStockRotationProfiles({code:'000876',industry:'饲料',
-    companyProfile:{profile:{mainBusiness:'生猪养殖及猪肉概念相关业务'}}}, sectors.sectors);
+    companyProfile:{fetchedAt:'2026-09-08T10:00:00+08:00',profile:{source:'公司资料',mainBusiness:'生猪养殖及猪肉概念相关业务',
+      fieldEvidence:{mainBusiness:{source:'公司资料',url:'https://example.com/business',observedAt:'2026-09-08T10:00:00+08:00'}}}}}, sectors.sectors);
   assert.equal(confirmed[0].businessRelation, 'confirmed-business');
+  assert.match(confirmed[0].businessRelationEvidence.url,/business/);
+  const unverified = resolveStockRotationProfiles({code:'000876',industry:'饲料',
+    companyProfile:{profile:{mainBusiness:'猪肉概念相关业务'}}}, sectors.sectors);
+  assert.equal(unverified[0].businessRelation,'member-only');
+  const negated = resolveStockRotationProfiles({code:'000876',industry:'饲料',
+    companyProfile:{fetchedAt:'2026-09-08T10:00:00+08:00',profile:{source:'公司资料',mainBusiness:'不涉及猪肉概念',
+      fieldEvidence:{mainBusiness:{source:'公司资料',url:'https://example.com/business',observedAt:'2026-09-08T10:00:00+08:00'}}}}}, sectors.sectors);
+  assert.equal(negated[0].businessRelation,'member-only');
+});
+
+test('收盘报告新闻不使用盘后发布或盘后首次获知的信息', () => {
+  const {reportNewsBeforeCutoff} = require('../main.js');
+  const date='2026-11-02';
+  const rows=[
+    {title:'盘前',publishedAt:'2026-11-02T09:00:00+08:00',firstSeenAt:'2026-11-02T09:01:00+08:00'},
+    {title:'盘后才发现',publishedAt:'2026-11-02T11:00:00+08:00',firstSeenAt:'2026-11-02T15:45:00+08:00'},
+    {title:'盘后发布',publishedAt:'2026-11-02T15:45:00+08:00'},
+    {title:'首次获知时间未知',publishedAt:'2026-11-02T11:00:00+08:00'},
+    {title:'无发布时间'}
+  ];
+  assert.deepEqual(reportNewsBeforeCutoff(rows,date).map(row=>row.title),['盘前']);
 });
 
 test('轮动主线候选获得预留名额且负资金板块不被提升', () => {
@@ -2895,7 +2921,9 @@ test('推荐账本记录完整候选和三周期快照', () => {
   const entry = buildRecommendationLedgerEntry({
     fetchedAt:'2026-09-11T08:00:00.000Z', computedAt:'2026-09-11T08:00:05.000Z', publishedAt:'2026-09-11T08:00:06.000Z', tradeDate:'2026-09-11',
     recommendations:[{code:'600001',name:'测试股份',industry:'半导体',signal:'突破蓄势',signalScore:78,holdingPeriod:'波段',price:10,changePct:2,quoteObservedAt:'2026-09-11T07:59:58.000Z',source:'腾讯实时行情',analysis:{trendBroken:true}}],
-    momentumRecommendations:[],
+    momentumRecommendations:[{code:'600002',name:'测试业务',price:12,industry:'半导体',
+      momentumDecision:{profile:{businessRelation:'confirmed-business',businessRelationEvidence:{
+        source:'公司资料',url:'https://example.com/company',excerpt:'主营半导体设备',observedAt:'2026-09-11T07:50:00.000Z'}}}}],
     recommendationCoverage:{scanned:5000,analyzed:100,rejectedCandidates:[{code:'600002',reason:'industry-unresolved'}],modelVersion:'test-v1'}
   });
   assert.equal(entry.schemaVersion, 3);
@@ -2909,6 +2937,7 @@ test('推荐账本记录完整候选和三周期快照', () => {
   assert.equal(entry.recommendations[0].primaryRole, '结构失效');
   assert.equal(entry.recommendations[0].quote.observedAt, '2026-09-11T07:59:58.000Z');
   assert.equal(entry.recommendations[0].quote.changePct, 2);
+  assert.equal(entry.momentumRecommendations[0].businessRelationEvidence.url,'https://example.com/company');
   assert.equal(entry.rejectedCandidates[0].reason, 'industry-unresolved');
 });
 

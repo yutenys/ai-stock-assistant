@@ -45,6 +45,17 @@ test('历史回填和附件声称收益不能进入已发布评价', () => {
   assert.equal(result.counts.episodes,0);
 });
 
+test('全市场因子与历史待筛候选不冒充已发布推荐', () => {
+  const row=batch('filtered','2026-09-10');
+  row.recommendations.push({...row.recommendations[0],code:'600002',signalId:'factor',
+    fullMarketFactor:{scope:'market'}});
+  row.recommendations.push({...row.recommendations[0],code:'600003',signalId:'history',
+    recommendationTier:'历史待筛'});
+  const review=evaluatePublishedEpisodes([row],new Map(),{asOfDate:'2026-09-10',horizons:[]});
+  assert.equal(review.counts.publishedSignals,1);
+  assert.equal(review.counts.episodes,1);
+});
+
 test('连续日期同股跨模型版本必须拆成独立episode', () => {
   const first=batch('old','2026-09-10');
   const second={...batch('new','2026-09-11'),modelVersion:'test-v2'};
