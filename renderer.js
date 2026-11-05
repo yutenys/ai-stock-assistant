@@ -14,6 +14,7 @@ let simulatedTrades = [];
 let researchAccount = null;
 let activeDetailCode = null;
 let isRefreshing = false;
+let secondaryRefreshGeneration = 0;
 let labelEditMode = false;
 let labelNameDraft = '';
 let stockLabelEditCode = null;
@@ -914,6 +915,15 @@ function portfolioMetrics(position){
   };
 }
 
+function analysisFreshness(stock, historyResult){
+  if(!historyResult?.analysis) return {status:'missing',reason:'尚无当前策略分析'};
+  const quoteDate = stock?.tradeDate || String(stock?.quoteObservedAt || '').slice(0,10);
+  const analysisDate = historyResult.analysis.tradeDate || historyResult.analysis.latestTradeDate || historyResult.latestTradeDate || '';
+  if(quoteDate && analysisDate && quoteDate !== analysisDate)
+    return {status:'stale',quoteDate,analysisDate,reason:`行情为${quoteDate}，分析仍截至${analysisDate}`};
+  return {status:'current',quoteDate,analysisDate,reason:''};
+}
+
 function portfolioRiskAssessment(position, stock, historyResult=null){
   const metrics = portfolioMetrics(position);
   const analysis = historyResult?.analysis || stock?.analysis || {};
@@ -1602,7 +1612,7 @@ function renderDailyReportView(){
     return `<tr><td>${id}</td><td>${decisions.filter(row=>row.status === 'pass').length}</td><td>${decisions.filter(row=>row.status === 'fail').length}</td><td>${decisions.filter(row=>row.status === 'unknown').length}</td></tr>`;
   }).join('');
   const qualityHtml = report.strategyExperiments?.qualityManifest
-    ? `<section class="report-section"><h3>质量影子实验</h3><p>Q1–Q3及S1买点、S2多日资金、S3市场风险独立对照；冻结版本 ${escapeHtml(report.strategyExperiments.qualityManifest.version)}，最早观察 ${escapeHtml(report.strategyExperiments.qualityManifest.firstTradeDate)}。${qualityReplayActive ? '独立同资金基线已接入。' : '尚未到前向回放起点。'}未成熟样本和证据未知不计成交，也不自动切换正式策略。</p><div class="table-wrap report-table-wrap"><table class="report-table"><thead><tr><th>实验</th><th>通过</th><th>拒绝</th><th>未知</th></tr></thead><tbody>${qualityShadowRows}</tbody></table></div></section>` : '';
+    ? `<section class="report-section"><h3>质量影子实验</h3><p>Q1–Q3及S1买点、S2多日资金、S3市场风险、S4支撑距离与冲高回落独立对照；冻结版本 ${escapeHtml(report.strategyExperiments.qualityManifest.version)}，最早观察 ${escapeHtml(report.strategyExperiments.qualityManifest.firstTradeDate)}。${qualityReplayActive ? '独立同资金基线已接入。' : '尚未到前向回放起点。'}未成熟样本和证据未知不计成交，也不自动切换正式策略。</p><div class="table-wrap report-table-wrap"><table class="report-table"><thead><tr><th>实验</th><th>通过</th><th>拒绝</th><th>未知</th></tr></thead><tbody>${qualityShadowRows}</tbody></table></div></section>` : '';
   const funnel = report.market?.planFunnel;
   const publishedFunnel = report.market?.publishedPlanFunnel;
   const funnelHtml = publishedFunnel || funnel ? `<section class="report-section"><h3>推荐计划漏斗</h3>${publishedFunnel ? `<p><b>全天已发布：</b>批次 ${escapeHtml(publishedFunnel.publishedBatches)}，信号 ${escapeHtml(publishedFunnel.publishedSignals)}，生命周期 ${escapeHtml(publishedFunnel.episodes)}，冻结计划 ${escapeHtml(publishedFunnel.frozenPlans)}，价格可行 ${escapeHtml(publishedFunnel.priceFeasible)}，发布许可 ${escapeHtml(publishedFunnel.publishedAllowed)}，核验触发 ${escapeHtml(publishedFunnel.verifiedTriggers)}，核验成交 ${escapeHtml(publishedFunnel.verifiedFills)}。原因：${detail(publishedFunnel.reasons)}。</p>` : '<p>全天已发布决策漏斗缺失。</p>'}${funnel ? `<p><b>最终快照：</b>展示计划 ${escapeHtml(funnel.discovered)}，数据可用 ${escapeHtml(funnel.dataAvailable ?? '--')}，结构成立 ${escapeHtml(funnel.structureEstablished ?? '--')}，价格可行 ${escapeHtml(funnel.priceFeasible)}，风险通过 ${escapeHtml(funnel.riskPassed ?? '--')}，等待触发 ${escapeHtml(funnel.armed)}，当前许可 ${escapeHtml(funnel.currentlyAllowed)}。原因：${detail(funnel.reasons)}。</p>` : '<p>最终快照计划漏斗缺失。</p>'}</section>` : '';
@@ -1610,7 +1620,7 @@ function renderDailyReportView(){
   const forwardHtml = forward ? `<p>前瞻验证：冻结后 ${forward.tradingDays}/${forward.requiredTradingDays} 个交易日；A ${forward.routes?.A?.mature || 0}/30，B ${forward.routes?.B?.mature || 0}/30 个成熟可成交episode。${escapeHtml(forward.reason)}；不会自动调权。</p>` : '';
   const performance = report.recommendations?.performance || {};
   const checkpointHtml = (report.checkpoints || []).map(item => `<li><b>${escapeHtml(item.label)}</b>：${item.status === 'covered' ? '已覆盖' : item.status === 'stale' ? '最近快照过期' : '缺失'}${item.publishedAt ? ` · ${escapeHtml(item.publishedAt)}` : ''}${item.reason ? ` · ${escapeHtml(item.reason)}` : ''}</li>`).join('') || '<li>没有检查点记录</li>';
-  const performanceHtml = `<div class="report-performance"><p><b>全天首次发布观察：</b>${performance.published?.count || 0}只，平均 <span class="${pctClass(performance.published?.averageReturnPct)}">${reportPct(performance.published?.averageReturnPct)}</span>，中位数 <span class="${pctClass(performance.published?.medianReturnPct)}">${reportPct(performance.published?.medianReturnPct)}</span>；<b>真实触发：</b>${performance.triggered?.count || 0}只。观察表现不等于账户收益。</p><ul>${checkpointHtml}</ul></div>`;
+  const performanceHtml = `<div class="report-performance"><p><b>全天首次发布观察：</b>${performance.published?.count || 0}只，平均 <span class="${pctClass(performance.published?.averageReturnPct)}">${reportPct(performance.published?.averageReturnPct)}</span>，中位数 <span class="${pctClass(performance.published?.medianReturnPct)}">${reportPct(performance.published?.medianReturnPct)}</span>；<b>方案A：</b>${performance.byTrack?.A?.count || 0}只，平均 <span class="${pctClass(performance.byTrack?.A?.averageReturnPct)}">${reportPct(performance.byTrack?.A?.averageReturnPct)}</span>；<b>方案B：</b>${performance.byTrack?.B?.count || 0}只，平均 <span class="${pctClass(performance.byTrack?.B?.averageReturnPct)}">${reportPct(performance.byTrack?.B?.averageReturnPct)}</span>；<b>真实触发：</b>${performance.triggered?.count || 0}只。A/B重叠股票分别进入路线统计，观察表现不等于账户收益。</p><ul>${checkpointHtml}</ul></div>`;
   const termRows = (report.termDefinitions || []).map(row => `<tr><td>${escapeHtml(row.id)}</td><td>${escapeHtml(row.name)}</td><td>${escapeHtml(row.status)}</td><td>${escapeHtml(row.version)}</td><td>${escapeHtml(row.definition)}</td><td>${escapeHtml(row.limit)}</td></tr>`).join('');
   return `<div class="report-view" data-active-page="${reportPage}">
     <div class="report-head"><div><h2>${escapeHtml(report.tradeDate)} 全局收盘报告</h2><p>修订 r${String(report.revision || 0).padStart(3,'0')} · ${report.status === 'complete' ? '数据完整' : report.status === 'preview' ? '盘中预览' : '部分数据缺失'} · ${escapeHtml(report.generatedAt || '')}</p></div>
@@ -2263,6 +2273,12 @@ function renderHistoryAnalysis(s, result){
     box.innerHTML = '<div class="note inline-note">近3个月行情不足，暂不能生成趋势分析。</div>';
     return;
   }
+  const freshness = analysisFreshness(s,result);
+  if(freshness.status === 'stale'){
+    analysisBox.innerHTML = `<b>股票分析：</b>${escapeHtml(freshness.reason)}，旧结论不作为当前入场或风控依据。`;
+    box.innerHTML = `<div class="note inline-note"><b>分析待刷新：</b>${escapeHtml(freshness.reason)}。已保留历史分析记录，重新分析完成前不展示旧价格、旧目标和旧入场结论。</div>`;
+    return;
+  }
   const holdingPeriod = stockHoldingPeriod(s, result);
   const detailTags = document.querySelector(`[data-detail-tags-for="${s.code}"]`);
   const holdingPeriodTag = detailTags?.querySelector('.holding-period-tag');
@@ -2504,7 +2520,8 @@ async function loadLatestDetailQuote(s){
 async function fetchStockAnalysis(s, force=false){
   const cached = detailHistoryCache.get(s.code);
   const cacheTime = Date.parse(cached?.analyzedAt || '');
-  if(!force && cached && cacheTime <= Date.now() && Date.now() - cacheTime < 2 * 60 * 1000) return cached;
+  if(!force && cached && analysisFreshness(s,cached).status === 'current'
+    && cacheTime <= Date.now() && Date.now() - cacheTime < 2 * 60 * 1000) return cached;
   if(!window.stockApi?.fetchStockHistory) return null;
   const pendingKey = s.code;
   if(detailHistoryPending.has(pendingKey)){
@@ -2542,7 +2559,8 @@ async function refreshAnalysisScores(codes){
   const results = await settleWithConcurrency(targets, 3, stock => {
     const cached = detailHistoryCache.get(stock.code);
     const analyzedAt = Date.parse(cached?.analyzedAt || cached?.analysis?.analyzedAt || '');
-    if(cached && Number.isFinite(analyzedAt) && Date.now() - analyzedAt < 5 * 60 * 1000){
+    if(cached && analysisFreshness(stock,cached).status === 'current'
+      && Number.isFinite(analyzedAt) && Date.now() - analyzedAt < 5 * 60 * 1000){
       applyAnalysisClassification(stock.code);
       return cached;
     }
@@ -2562,14 +2580,39 @@ async function refreshActiveFundFlow(codes){
   if(stock) await loadStockFundFlow(stock, true);
 }
 
+function secondaryRefreshPriorityCodes(codes){
+  const allowed = new Set((codes || []).map(code => String(code || '')).filter(Boolean));
+  const ordered = [];
+  const add = value => {
+    const code = String(value?.code || value || '');
+    if(allowed.has(code) && !ordered.includes(code)) ordered.push(code);
+  };
+  add(activeDetailCode);
+  (portfolio || []).filter(item => Number(item.quantity) > 0).forEach(add);
+  (researchAccount?.positions || []).filter(item => Number(item.quantity) > 0).forEach(add);
+  (labels.find(item => item.name === activeLabel)?.stocks || []).forEach(add);
+  (labels || []).flatMap(item => item.stocks || []).forEach(add);
+  (codes || []).forEach(add);
+  return ordered;
+}
+
 function refreshSecondaryData(codes){
-  const activeCodes = activeDetailCode && (codes || []).includes(activeDetailCode) ? [activeDetailCode] : [];
-  if(!activeCodes.length) return;
-  Promise.allSettled([refreshAnalysisScores(activeCodes), refreshActiveFundFlow(activeCodes)])
-    .then(() => {
+  const ordered = secondaryRefreshPriorityCodes(codes);
+  if(!ordered.length) return;
+  const generation = ++secondaryRefreshGeneration;
+  Promise.resolve().then(async() => {
+    for(let offset=0; offset<ordered.length && generation === secondaryRefreshGeneration; offset+=10){
+      const batch = ordered.slice(offset,offset+10);
+      await Promise.allSettled([
+        refreshAnalysisScores(batch),
+        offset === 0 ? refreshActiveFundFlow(batch) : Promise.resolve()
+      ]);
+      if(generation !== secondaryRefreshGeneration) return;
       saveState();
       renderStocks();
-    });
+      if(offset + 10 < ordered.length) await new Promise(resolve => setTimeout(resolve,200));
+    }
+  }).catch(error => addLog('error',`后台分析刷新失败：${error?.message || error}`));
 }
 
 async function loadStockHistory(s, force=false){

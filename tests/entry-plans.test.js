@@ -44,9 +44,17 @@ test('冻结计划价格区间无交集时保持观察，不能进入 armed 或 
 
 test('缺失真实目标不以情景目标放行，回踩确认价不能越过区间上限',()=>{
   const plan=input().analysis.tradePlan;
-  assert.equal(planFeasibility({...plan,targetEvidence:{status:'missing',nearestResistance:13.5}},'回踩低吸').status,'unknown');
-  assert.equal(planFeasibility({...plan,confirmationPrice:11},'回踩低吸').status,'empty');
-  assert.equal(planFeasibility({...plan,targetEvidence:{status:'verified',nearestResistance:10.4}},'回踩低吸').status,'empty');
+  assert.equal(planFeasibility({...plan,targetEvidence:{status:'missing',nearestResistance:13.5}},'回踩低吸').reasonCode,'target-missing');
+  assert.equal(planFeasibility({...plan,confirmationPrice:11},'回踩低吸').reasonCode,'confirmation-above-entry');
+  assert.equal(planFeasibility({...plan,confirmationPrice:10.4},'回踩低吸').reasonCode,'confirmation-above-entry');
+  assert.equal(planFeasibility({...plan,targetEvidence:{status:'verified',nearestResistance:9.4}},'回踩低吸').reasonCode,'target-below-entry');
+});
+
+test('计划可行性分别标记区间为空、止损越界和费后收益风险比不足',()=>{
+  const plan=input().analysis.tradePlan;
+  assert.equal(planFeasibility({...plan,entryLow:10.6,maxEntryPrice:10.5},'回踩低吸').reasonCode,'entry-range-empty');
+  assert.equal(planFeasibility({...plan,stressExitPrice:9.6},'回踩低吸').reasonCode,'stop-above-entry');
+  assert.equal(planFeasibility({...plan,confirmationPrice:9.5,targetEvidence:{status:'verified',nearestResistance:10.8}},'回踩低吸').reasonCode,'reward-risk-insufficient');
 });
 
 test('计划漏斗区分历史触发、当前许可和未核验成交',()=>{

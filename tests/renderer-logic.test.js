@@ -78,6 +78,19 @@ test('全市场后台任务优先处理收藏、持仓和当前推荐且去重',
   assert.deepEqual([...context.fullMarketResearchPriorityCodes()],['600001','600002','600003','600004','600005']);
 });
 
+test('行情刷新后的后台分析按当前详情、持仓、当前标签和其余股票排序',()=>{
+  const context=harness(['secondaryRefreshPriorityCodes'],{
+    activeDetailCode:'600004',activeLabel:'行业A',
+    portfolio:[{code:'600003',quantity:100},{code:'600005',quantity:0}],
+    researchAccount:{positions:[{code:'600002',quantity:100}]},
+    labels:[{name:'行业A',stocks:[{code:'600001'},{code:'600002'}]},
+      {name:'行业B',stocks:[{code:'600006'}]}]
+  });
+  assert.deepEqual([...context.secondaryRefreshPriorityCodes(
+    ['600001','600002','600003','600004','600005','600006','600007']
+  )],['600004','600003','600002','600001','600006','600005','600007']);
+});
+
 test('推荐集中度按完整名单和共同轮动主题统计，不把首屏分散当作风险分散',()=>{
   const context=harness(['recommendationIndustry','recommendationConcentrationText']);
   const items=[{code:'1',industry:'证券',rotationProfiles:[{name:'券商概念'},{name:'券商概念'}]},
@@ -259,7 +272,7 @@ test('取消个股标签勾选后保存移除成员，其他股票不受影响',
 
 test('个股分析过期缓存重新获取，强制刷新等待旧请求后发起新请求',async()=>{
   const pending=[];
-  const context=harness(['fetchStockAnalysis'],{
+  const context=harness(['analysisFreshness','fetchStockAnalysis'],{
     detailHistoryCache:new Map([['600001',{analyzedAt:'2020-01-01',old:true}]]),detailHistoryPending:new Map(),
     favoriteOutcomeRows:()=>[],applyAnalysisClassification(){},
     window:{stockApi:{fetchStockHistory:request=>new Promise(resolve=>pending.push({request,resolve}))}}
@@ -311,6 +324,19 @@ test('缺少现价不按成本伪造平盘，旧分析不能判断最新持仓',
   const risk=context.portfolioRiskAssessment(stale,{quoteObservedAt:'2026-10-28T07:00:00.000Z'},
     {analysis:{tradeDate:'2026-10-27',tradePlan:{invalidationPrice:9}}});
   assert.equal(risk.label,'分析待刷新');
+});
+
+test('行情交易日新于分析时，当前结论立即标记过期',()=>{
+  const context=harness(['analysisFreshness']);
+  const stale=context.analysisFreshness(
+    {tradeDate:'2026-11-04',quoteObservedAt:'2026-11-04T15:00:00+08:00'},
+    {analysis:{tradeDate:'2026-11-03',latestTradeDate:'2026-11-03'},analyzedAt:'2026-11-03T15:10:00+08:00'}
+  );
+  assert.equal(stale.status,'stale');
+  assert.match(stale.reason,/分析仍截至2026-11-03/);
+  assert.equal(context.analysisFreshness({tradeDate:'2026-11-04'},
+    {analysis:{tradeDate:'2026-11-04'}}).status,'current');
+  assert.equal(context.analysisFreshness({tradeDate:'2026-11-04'},null).status,'missing');
 });
 
 test('行业集中度跳过缺价持仓',()=>{

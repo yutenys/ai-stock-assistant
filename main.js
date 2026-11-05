@@ -29,7 +29,7 @@ const {createStrategyExperimentManifest,createWeeklyQualityManifest,evaluateWeek
   evaluateStrategyExperiments,replayStrategyExperiments,buildExperimentReplayInput} = require('./lib/strategy-experiments');
 const {evaluatePublishedEpisodes,mergeSavedReportCloses,assessForwardValidation} = require('./lib/recommendation-outcomes');
 const {executionWindow, nextTradingDay, isTradingDay} = require('./lib/trade-time');
-const {buildDailyReport, classifyRecommendationRole, selectPublishedBatchStatus} = require('./lib/daily-report');
+const {buildDailyReport, classifyRecommendationRole, selectPublishedBatchStatus, reconstructLegacyPortfolio} = require('./lib/daily-report');
 const {DailyReportStore, readLedgerEntriesForDate, readLedgerEntriesOffThread, readCachedPublishedLedger,
   reportDatesToGenerate, validDate} = require('./lib/report-service');
 const {
@@ -1841,7 +1841,8 @@ function mergeSectorCapitalRows(rotation, capitalRows, marketQuotes = [], tradeD
       changePct,
       averageChangePct:finiteNumber(stats.averageChangePct) ?? changePct,
       memberCodes,
-      memberSignature:crypto.createHash('sha256').update([...memberCodes].sort().join(',')).digest('hex').slice(0,20),
+      memberSignature:memberCodes.length
+        ? crypto.createHash('sha256').update([...memberCodes].sort().join(',')).digest('hex').slice(0,20) : null,
       mainNetInflow,
       mainNetPct,
       capitalRank:Number(row.capitalRank) || null,
@@ -2781,7 +2782,7 @@ async function attachEntryPlanLifecycle(result) {
         tradeDate:result.tradeDate,cutoffAt:decisionAt,
         entryPermission:formalPermission,entryAssessment:{allowed:item.entryAssessment?.allowed},planState,
         decisionEvent:planState.decisionEvent,themes:resolveStockRotationProfiles(item,result.sectors).map(row=>row.name),
-        shadowExperiments:planned.shadowExperiments.filter(row=>['H5','H6','H7','Q1','Q2','Q3','S1','S2','S3'].includes(row.id)),
+        shadowExperiments:planned.shadowExperiments.filter(row=>['H5','H6','H7','Q1','Q2','Q3','S1','S2','S3','S4'].includes(row.id)),
         intradayPlanState:planned.intradayPlanState ? {
           planId:planned.intradayPlanState.planId,state:planned.intradayPlanState.state,
           currentPermission:planned.intradayPlanState.currentPermission,
@@ -2815,7 +2816,7 @@ function experimentManifestFile() {
 }
 
 function qualityExperimentManifestFile() {
-  return path.join(dataRootPath(),'data','strategy-experiments','close-quality-20261103-shadow-v5.json');
+  return path.join(dataRootPath(),'data','strategy-experiments','close-quality-20261104-shadow-v6.json');
 }
 
 function saveExperimentManifest(manifest) {
@@ -9701,6 +9702,11 @@ async function buildDailyReportInput(tradeDate, {force = false, manual = false} 
     warnings.push(`推荐后固定窗可观察 ${publishedOutcomes.counts.observations.observed} 个、到期但缺行情 ${publishedOutcomes.counts.observations.missing} 个；本地及已存报告收盘最新 ${publishedOutcomes.historyLatestDate || '未知'}，缺失不计收益`);
   const qualityManifest = overview?.qualityExperimentManifest
     || (await readJsonWithBackup(qualityExperimentManifestFile(),null)).value;
+  const historicalLegacy = tradeDate === today ? null : reconstructLegacyPortfolio(state.simulatedTrades || [],tradeDate);
+  const historicalTrades = tradeDate === today ? [] : (state.simulatedTrades || []).filter(row => {
+    const match=String(row.time || '').match(/^(\d{4})[\/-](\d{1,2})[\/-](\d{1,2})/);
+    return match && `${match[1]}-${match[2].padStart(2,'0')}-${match[3].padStart(2,'0')}` <= tradeDate;
+  });
   return {
     tradeDate,
     generatedAt:new Date().toISOString(),
@@ -9736,7 +9742,11 @@ async function buildDailyReportInput(tradeDate, {force = false, manual = false} 
       positions:[...(state.portfolio || []), ...(researchAccount?.positions || [])],
       simulatedTrades:state.simulatedTrades || [],
       researchAccount:researchAccount || null
-    } : {positions:[], unavailableReason:'历史账户事件不足，未使用当前持仓重建过去仓位'},
+    } : historicalLegacy.eventCount ? {
+      legacy:{positions:historicalLegacy.positions,simulatedTrades:historicalTrades},
+      positions:historicalLegacy.positions,simulatedTrades:historicalTrades,
+      unavailableReason:historicalLegacy.status === 'partial' ? `历史模拟账户仅部分重建：${historicalLegacy.reason}` : ''
+    } : {positions:[], unavailableReason:'报告日前没有可核验模拟成交事件，未使用当前持仓倒填历史账户'},
     news:tradeDate === today ? reportNewsBeforeCutoff(overview?.newsContext?.items,tradeDate).map(item => ({
       title:item.title, url:item.link || item.url, publishedAt:item.publishedAt, source:item.source
     })) : [],

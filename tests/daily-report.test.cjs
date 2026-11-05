@@ -11,8 +11,42 @@ const {
   selectPublishedBatchStatus,
   classifyRecommendationRole,
   buildDailyReport,
-  renderDailyReportHtml
+  renderDailyReportHtml,
+  reconstructLegacyPortfolio
 } = require('../lib/daily-report');
+
+test('历史报告只使用截止报告日的模拟成交重建持仓',()=>{
+  const trades=[
+    {id:'1',time:'2026/11/02 10:00:00',side:'买入',code:'600001',name:'甲',price:10,quantity:200},
+    {id:'2',time:'2026/11/03 10:00:00',side:'卖出',code:'600001',name:'甲',price:11,quantity:100},
+    {id:'3',time:'2026/11/04 10:00:00',side:'买入',code:'600002',name:'乙',price:8,quantity:100}
+  ];
+  const result=reconstructLegacyPortfolio(trades,'2026-11-03');
+  assert.equal(result.status,'complete');
+  assert.deepEqual(result.positions.map(row=>({code:row.code,quantity:row.quantity,costPrice:row.costPrice,realizedPnl:row.realizedPnl})),[
+    {code:'600001',quantity:100,costPrice:10,realizedPnl:100}
+  ]);
+});
+
+test('历史持仓遇到无对应买入的卖出事件保持partial且不伪造持仓',()=>{
+  const result=reconstructLegacyPortfolio([
+    {time:'2026/11/03 10:00:00',side:'卖出',code:'600001',price:11,quantity:100}
+  ],'2026-11-03');
+  assert.equal(result.status,'partial');
+  assert.deepEqual(result.positions,[]);
+  assert.match(result.reason,/卖出数量超过/);
+});
+
+test('历史持仓部分异常时报告仍保留可由成交事件确认的持仓',()=>{
+  const report=buildDailyReport({tradeDate:'2026-11-03',closingQuotes:[
+    {code:'600001',price:11,changePct:1,tradeDate:'2026-11-03',isFinal:true}
+  ],portfolio:{unavailableReason:'部分成交事件异常',legacy:{positions:[
+    {code:'600001',name:'甲',quantity:100,costPrice:10}
+  ]}}});
+  assert.equal(report.portfolio.positions.length,1);
+  assert.equal(report.portfolio.legacy.coveredUnrealizedPnl,100);
+  assert.equal(report.portfolio.unavailableReason,'部分成交事件异常');
+});
 
 test('报告三个视图共用冻结术语并区分本地与外部B2',()=>{
   const report = buildDailyReport({tradeDate:'2026-10-09',removedFavoriteEvents:[{favoriteEventId:'f1',code:'600001',removedAt:'2026-10-09T10:00:00+08:00'}]});
@@ -178,6 +212,26 @@ test('当日报告披露亏损尾部、剔除最大赢家均值和收益集中�
   assert.equal(summary.averageExBestPct,-2);
   assert.equal(summary.topPositiveContributionPct,100);
   assert.match(renderDailyReportHtml(report),/剔除最大赢家 -2\.00%/);
+});
+
+test('报告按A和B路线分别统计表现并继续披露重叠股票',()=>{
+  const report=buildDailyReport({tradeDate:'2026-10-20',stable:[
+    {code:'600001',price:10,publishedAt:'2026-10-20T10:00:00+08:00'},
+    {code:'600002',price:10,publishedAt:'2026-10-20T10:00:00+08:00'}
+  ],momentum:[
+    {code:'600002',price:10,publishedAt:'2026-10-20T10:01:00+08:00'},
+    {code:'600003',price:10,publishedAt:'2026-10-20T10:01:00+08:00'}
+  ],closingQuotes:[
+    {code:'600001',price:11,changePct:10,tradeDate:'2026-10-20',isFinal:true},
+    {code:'600002',price:9,changePct:-10,tradeDate:'2026-10-20',isFinal:true},
+    {code:'600003',price:10.5,changePct:5,tradeDate:'2026-10-20',isFinal:true}
+  ]});
+  assert.equal(report.recommendations.performance.byTrack.A.count,2);
+  assert.equal(report.recommendations.performance.byTrack.A.averageReturnPct,0);
+  assert.equal(report.recommendations.performance.byTrack.B.averageReturnPct,-2.5);
+  assert.equal(report.recommendations.overlapCount,1);
+  assert.match(renderDailyReportHtml(report),/方案A 2只，平均 0\.00%/);
+  assert.match(renderDailyReportHtml(report),/方案B 2只，平均 -2\.50%/);
 });
 
 test('报告保留实现、参数、数据和计划版本', () => {

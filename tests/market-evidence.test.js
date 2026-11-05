@@ -74,6 +74,19 @@ test('capital source or members switching cannot claim a same-day fund retreat',
   }
 });
 
+test('缺少板块成员时不生成空集合稳定签名，也不能确认扩散',()=>{
+  const row=api.mergeSectorCapitalRows({sectors:[]},[{
+    name:'测试行业',boardType:'industry',mainNetInflow:1e9,mainNetPct:3,
+    capitalTradeDate:'2026-10-09',capitalObservedAt:'2026-10-09T10:00:00+08:00',
+    source:'公开资金源',memberCodes:[]
+  }],[],'2026-10-09').sectors[0];
+  assert.equal(row.memberSignature,null);
+  assert.equal(row.participation.coverage,0);
+  const annotated=api.annotateSectorRotation([row],{tradeDate:'2026-10-09',sectors:[row]},'2026-10-09')[0];
+  assert.equal(annotated.shadowRotation.memberComparable,false);
+  assert.equal(annotated.shadowRotation.confirmed,false);
+});
+
 test('retrieving the same provider clock twice does not confirm independent sector inflow',()=>{
   const base={name:'test',mainNetInflow:1e9,capitalSource:'A',boardType:'industry',memberCodes:['600001'],
     capitalTradeDate:'2026-10-09',capitalObservedAt:'2026-10-09T10:00:00+08:00',capitalFetchedAt:'2026-10-09T10:01:00+08:00',

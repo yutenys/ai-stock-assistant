@@ -51,7 +51,7 @@ test('每周质量实验冻结后才采样，缺连续交易路径不能据集�
         priorLimitUpPremium:{coverage:1,averageChangePct:-2}}},
     sector:{tradeDate:'2026-09-14',observedAt:at('2026-09-14'),rotationIntraday:{retreating:true}}};
   const decisions=api.evaluateWeeklyQualityShadow(item,context);
-  assert.deepEqual(decisions.map(row=>row.status),['pass','pass','pass','pass','unknown','fail']);
+  assert.deepEqual(decisions.map(row=>row.status),['pass','pass','pass','pass','unknown','fail','unknown']);
   assert.equal(api.evaluateWeeklyQualityShadow({...item,price:12},context)[3].status,'fail');
   assert.equal(api.evaluateWeeklyQualityShadow({...item,momentumDecision:{...item.momentumDecision,
     profile:{...item.momentumDecision.profile,businessRelationEvidence:{source:'行业资料',url:'https://example.com/industry',excerpt:'工程机械',observedAt:at('2026-09-15')}}}},context)[0].status,'unknown');
@@ -75,21 +75,40 @@ test('每周质量实验冻结后才采样，缺连续交易路径不能据集�
   assert.deepEqual(unverifiedTheme[0].reasons,['business-theme-unverified']);
   assert.equal(api.evaluateWeeklyQualityShadow({...item,momentumDecision:{firstPullback:true,noChase:false}},context)[0].status,'unknown');
   assert.deepEqual(api.evaluateWeeklyQualityShadow(item,{...context,tradeDate:'2026-09-10'}).map(row=>row.status),
-    ['unknown','unknown','unknown','unknown','unknown','unknown']);
+    ['unknown','unknown','unknown','unknown','unknown','unknown','unknown']);
+});
+
+test('S4只过滤B组远离支撑、冲高回落和负资金背离，缺字段保持未知',()=>{
+  const quality=api.createWeeklyQualityManifest({frozenAt:'2026-09-10T10:00:00+08:00',modelVersion:'v26'});
+  const base={modelVersion:'v26',track:'B',price:10,high:10.2,low:9.7,changePct:2,mainNetPct:1,
+    supportPrice:9.4,atr14:.4,planState:{feasibility:{status:'feasible'},tradePlan:{maxEntryPrice:11}},
+    momentumDecision:{firstPullback:true,noChase:false,profile:{businessRelation:'confirmed-industry',
+      businessRelationEvidence:{source:'行业资料',url:'https://example.com/industry',excerpt:'工程机械',observedAt:at('2026-09-14')}}}};
+  const context={manifest:quality,tradeDate:'2026-09-14',cutoffAt:at('2026-09-14'),
+    marketRegime:{tradeDate:'2026-09-14',observedAt:at('2026-09-14'),shadowPath:{continuousPeakBreadthDropPp:1}},
+    sector:{tradeDate:'2026-09-14',observedAt:at('2026-09-14'),rotationIntraday:{retreating:false}}};
+  const s4=row=>api.evaluateWeeklyQualityShadow(row,context).find(item=>item.id==='S4');
+  assert.equal(s4(base).status,'pass');
+  assert.equal(s4({...base,price:11,supportPrice:9,atr14:.5}).status,'fail');
+  assert.equal(s4({...base,price:10,high:11,low:9.5,changePct:5}).status,'fail');
+  assert.equal(s4({...base,changePct:4,mainNetPct:-4}).status,'fail');
+  assert.equal(s4({...base,atr14:null}).status,'unknown');
+  assert.equal(s4({...base,track:'A'}).status,'pass');
 });
 
 test('每周质量回放有独立基线且未达到前瞻样本时保持 pending',()=>{
   const quality=api.createWeeklyQualityManifest({frozenAt:'2026-09-10T10:00:00+08:00',modelVersion:'v26'});
   const item=signal();
-  item.shadowExperiments=['Q1','Q2','Q3','S1','S2','S3'].map(id=>({id,version:quality.version,status:'pass',reasons:['fixture']}));
+  item.shadowExperiments=['Q1','Q2','Q3','S1','S2','S3','S4'].map(id=>({id,version:quality.version,status:'pass',reasons:['fixture']}));
   const output=replay([item],[bar('2026-09-15'),bar('2026-09-16')],{qualityManifest:quality});
   assert.deepEqual(output.variants.filter(row=>row.id.startsWith('Q')).map(row=>row.baselineId),
     ['qualityBaseline','qualityBaseline','qualityBaseline']);
   assert.equal(output.variants.find(row=>row.id==='Q1').validation.B.status,'pending');
   assert.equal(output.variants.find(row=>row.id==='Q1').promotionAllowed,false);
   assert.deepEqual(output.variants.filter(row=>row.id.startsWith('S')).map(row=>row.baselineId),
-    ['qualityBaseline','qualityBaseline','qualityBaseline']);
+    ['qualityBaseline','qualityBaseline','qualityBaseline','qualityBaseline']);
   assert.equal(output.variants.find(row=>row.id==='S2').validation.B.status,'pending');
+  assert.equal(output.variants.find(row=>row.id==='S4').validation.B.status,'pending');
 });
 
 test('manifest is deeply frozen, deterministic and rejects implicit transaction assumptions', () => {
