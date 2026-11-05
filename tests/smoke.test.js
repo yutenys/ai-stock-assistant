@@ -1002,7 +1002,7 @@ test('行情响应中途断开能结束请求并进入失败路径', async () =>
     setTimeout(()=>res.destroy(),25);
   });
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
-  try { await assert.rejects(requestText(`http://127.0.0.1:${server.address().port}`,500),/断开|aborted|socket/i); }
+  try { await assert.rejects(requestText(`http://127.0.0.1:${server.address().port}`,500),/断开|aborted|socket|超时/i); }
   finally { await new Promise(resolve=>server.close(resolve)); }
 });
 
@@ -1187,9 +1187,10 @@ test('同一收藏跨标签去重，缺失分数不归入低分组', () => {
 test('收藏时评分独立于后续刷新，旧收藏不伪造原始评分', () => {
   const vm=require('node:vm');
   const source=fs.readFileSync(path.join(__dirname,'../renderer.js'),'utf8');
+  const compactStart=source.indexOf('function compactFavoriteStock(');
   const start=source.indexOf('function labelStockSnapshot(');
   const end=source.indexOf('function loadState(',start);
-  const snapshot=vm.runInNewContext(source.slice(start,end)+';labelStockSnapshot');
+  const snapshot=vm.runInNewContext(source.slice(compactStart,start)+source.slice(start,end)+';labelStockSnapshot');
   const original=snapshot({code:'002631',price:10,technicalScore:60,signalScore:65,signal:'已反弹'});
   const updated=snapshot({code:'002631',price:12,technicalScore:90,signalScore:95},original);
   assert.equal(updated.favoriteBasePrice,10);

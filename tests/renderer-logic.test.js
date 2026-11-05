@@ -13,7 +13,7 @@ function harness(names, values={}) {
     assert.ok(index>=0,`Missing renderer function ${name}`);
     return source.slice(declarations[index].index,declarations[index+1]?.index ?? source.length);
   }).join('\n');
-  const context=vm.createContext({notify(){},saveState(){},renderStocks(){},addLog(){},
+  const context=vm.createContext({notify(){},saveState(){},renderStocks(){},addLog(){},setTimeout,clearTimeout,
     TradeTime:{...tradeTime,executionWindow:()=>tradeTime.executionWindow('2026-09-15T10:00:00+08:00')},...values});
   vm.runInContext(code,context);
   return context;
@@ -22,12 +22,13 @@ function harness(names, values={}) {
 test('保存成功提示等待磁盘回执，失败时不误报成功',async()=>{
   const notices=[];
   let complete;
-  const context=harness(['saveState'],{
+  const context=harness(['buildPersistedState','enqueueStateSnapshot','saveState'],{
     STORAGE_KEY:'test-state',labels:[],removedFavoriteEvents:[],activeLabel:'',labelSorts:{},portfolio:[],simulatedTrades:[],
-    localStorage:{setItem(){}},addLog(){},notify:(message,type)=>notices.push({message,type}),
+    labelStockSnapshot:value=>value,localStorage:{setItem(){}},addLog(){},notify:(message,type)=>notices.push({message,type}),
     window:{stockApi:{saveUserState:()=>new Promise(resolve=>{complete=resolve;})}}
   });
   const pending=context.saveState({successMessage:'标签保存成功'});
+  await new Promise(resolve=>setImmediate(resolve));
   assert.equal(notices.length,0);
   complete({ok:true,file:'state.json'});
   assert.equal((await pending).ok,true);
@@ -37,6 +38,33 @@ test('保存成功提示等待磁盘回执，失败时不误报成功',async()=>
   assert.equal(failed.ok,false);
   assert.equal(notices.some(item=>item.message==='不应出现'),false);
   assert.match(notices.at(-1).message,/disk full/);
+});
+
+test('浏览器缓存超限时仍继续保存磁盘文件',async()=>{
+  let savedState=null;
+  const context=harness(['buildPersistedState','enqueueStateSnapshot','saveState'],{
+    STORAGE_KEY:'test-state',labels:[],removedFavoriteEvents:[],activeLabel:'',labelSorts:{},portfolio:[],simulatedTrades:[],
+    labelStockSnapshot:value=>value,localStorage:{setItem(){throw new Error('quota exceeded');}},addLog(){},notify(){},
+    window:{stockApi:{saveUserState:async state=>{savedState=state;return {ok:true,file:'state.json'};}}}
+  });
+  const result=await context.saveState({successMessage:'保存成功'});
+  assert.equal(result.ok,true);
+  assert.equal(result.browserSaved,false);
+  assert.equal(savedState.schemaVersion,3);
+});
+
+test('收藏持久化去除大型瞬时分析字段但保留跨标签独立基准',()=>{
+  const context=harness(['compactFavoriteStock','labelStockSnapshot'],{latestMarketOverview:null});
+  const original={code:'600001',name:'甲',price:12,changePct:2,analysis:{huge:'x'.repeat(1000)},
+    rotationProfiles:[{members:Array(100).fill('x')}],favoriteBasePrice:10,favoriteAddedAt:'2026-11-01',
+    favoriteEntrySnapshot:{signal:'待突破'},pinned:true};
+  const saved=context.labelStockSnapshot({...original,price:13},original);
+  assert.equal(saved.analysis,undefined);
+  assert.equal(saved.rotationProfiles,undefined);
+  assert.equal(saved.favoriteBasePrice,10);
+  assert.equal(saved.favoriteAddedAt,'2026-11-01');
+  assert.deepEqual(saved.favoriteEntrySnapshot,{signal:'待突破'});
+  assert.equal(saved.pinned,true);
 });
 
 test('环境观察卡片使用观察评分并展示当前环境限制',()=>{
@@ -106,7 +134,7 @@ test('推荐集中度按完整名单和共同轮动主题统计，不把首屏�
 test('收藏复盘只使用入选快照，旧收藏不能用刷新后的信号补写归因',()=>{
   const stock={code:'600001',price:10,signal:'接近突破',holdingPeriod:'波段',recommendationModelVersion:'v11',recommendationContext:{news:{signal:'中性'}}};
   stock.industry='半导体';
-  const context=harness(['favoriteOutcomeRows','labelStockSnapshot'],{labels:[],latestMarketOverview:{
+  const context=harness(['favoriteOutcomeRows','compactFavoriteStock','labelStockSnapshot'],{labels:[],latestMarketOverview:{
     indices:[{code:'000001',name:'上证指数',price:100}], sectors:[{code:'BK0475',name:'半导体',price:200}]
   }});
   const saved=context.labelStockSnapshot(stock);
@@ -259,7 +287,7 @@ test('旧持仓部分卖出不把剩余老仓重新锁定为当日买入',()=>{
 
 test('取消个股标签勾选后保存移除成员，其他股票不受影响',()=>{
   const stock={code:'600001',name:'测试',price:10};
-  const context=harness(['labelStockSnapshot','saveStockLabels'],{
+  const context=harness(['compactFavoriteStock','labelStockSnapshot','saveStockLabels'],{
     labels:[{name:'甲',stocks:[stock,{code:'600002'}]},{name:'乙',stocks:[]}],activeLabel:'甲',stockLabelEditCode:stock.code,
     findStockByCode:()=>stock,document:{querySelectorAll:()=>[{dataset:{stockLabelName:'乙'}}]},
     $:()=>({value:''}),closeStockLabelPanel(){}
@@ -272,7 +300,7 @@ test('取消个股标签勾选后保存移除成员，其他股票不受影响',
 
 test('个股分析过期缓存重新获取，强制刷新等待旧请求后发起新请求',async()=>{
   const pending=[];
-  const context=harness(['analysisFreshness','fetchStockAnalysis'],{
+  const context=harness(['analysisFreshness','withAnalysisSlot','fetchStockAnalysis'],{
     detailHistoryCache:new Map([['600001',{analyzedAt:'2020-01-01',old:true}]]),detailHistoryPending:new Map(),
     favoriteOutcomeRows:()=>[],applyAnalysisClassification(){},
     window:{stockApi:{fetchStockHistory:request=>new Promise(resolve=>pending.push({request,resolve}))}}
@@ -289,6 +317,36 @@ test('个股分析过期缓存重新获取，强制刷新等待旧请求后发�
   pending[1].resolve({analyzedAt:new Date().toISOString(),value:2});
   assert.equal((await forced).value,2);
   assert.equal(context.detailHistoryPending.size,0);
+});
+
+test('个股分析共享三并发槽位并优先处理高优先级详情任务',async()=>{
+  const context=harness(['withAnalysisSlot']);
+  const started=[];
+  const resolvers=new Map();
+  const task=(name,priority)=>context.withAnalysisSlot(()=>new Promise(resolve=>{
+    started.push(name);
+    resolvers.set(name,resolve);
+  }),priority);
+  const promises=[task('a',0),task('b',0),task('c',0),task('low',1),task('detail',100)];
+  assert.deepEqual(started,['a','b','c']);
+  resolvers.get('a')();
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.deepEqual(started,['a','b','c','detail']);
+  resolvers.get('b')();
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.deepEqual(started,['a','b','c','detail','low']);
+  ['c','detail','low'].forEach(name=>resolvers.get(name)());
+  await Promise.all(promises);
+  assert.equal(context.withAnalysisSlot.active,0);
+});
+
+test('个股分析超时会释放并发槽位并继续后续任务',async()=>{
+  const context=harness(['withAnalysisSlot'],{setTimeout,clearTimeout});
+  context.withAnalysisSlot.timeoutMs=10;
+  await assert.rejects(context.withAnalysisSlot(()=>new Promise(()=>{})),/超时/);
+  const value=await context.withAnalysisSlot(()=>Promise.resolve('next'));
+  assert.equal(value,'next');
+  assert.equal(context.withAnalysisSlot.active,0);
 });
 
 test('当天未完成K线在图表说明中显示最新价格，不称收盘价',()=>{
@@ -313,7 +371,7 @@ test('持仓风险按原失效条件判断，不用今日推荐缺席推导卖�
 });
 
 test('缺少现价不按成本伪造平盘，旧分析不能判断最新持仓',()=>{
-  const context=harness(['portfolioStock','portfolioMetrics','portfolioRiskAssessment'],{yuan:value=>`¥${value}`,stocks:[],labels:[]});
+  const context=harness(['favoriteIndexes','portfolioStock','portfolioMetrics','portfolioRiskAssessment'],{yuan:value=>`¥${value}`,stocks:[],labels:[]});
   const missing={quantity:100,costPrice:10,lastPrice:0};
   assert.equal(context.portfolioMetrics(missing).floatingPnl,null);
   assert.equal(context.portfolioRiskAssessment(missing,{},null).label,'行情待刷新');

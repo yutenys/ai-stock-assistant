@@ -103,9 +103,37 @@ function safeHttpUrl(value){
   }
 }
 
-async function saveState({successMessage = ''} = {}){
-  const state = {schemaVersion:2, updatedAt:new Date().toISOString(), labels, removedFavoriteEvents,
-    activeLabel, labelSorts, portfolio, simulatedTrades};
+function buildPersistedState(revision){
+  return {schemaVersion:3, revision, updatedAt:new Date().toISOString(),
+    labels:labels.map(label=>({...label,stocks:(label.stocks || []).map(stock=>labelStockSnapshot(stock,stock))})),
+    removedFavoriteEvents,activeLabel,labelSorts,portfolio,simulatedTrades};
+}
+
+function enqueueStateSnapshot(state, successMessage='', browserSaved=true){
+  const operation = async() => {
+    try{
+      if(!window.stockApi?.saveUserState) throw new Error('持久化接口不可用');
+      const result = await window.stockApi.saveUserState(state);
+      if(result?.ok !== true) throw new Error(result?.error || '请检查磁盘权限');
+      if(successMessage){
+        addLog('info', `本地数据文件已确认保存（修订 ${state.revision}）`);
+        notify(successMessage, 'success');
+      }
+      return {ok:true, browserSaved, file:result.file || '', revision:state.revision};
+    }catch(err){
+      const fallback = browserSaved ? '本次运行内存和浏览器缓存' : '本次运行内存';
+      notify(`本地数据文件保存失败：${err.message || err}；当前操作仅保留在${fallback}`, 'error');
+      return {ok:false, browserSaved, error:err.message || String(err), revision:state.revision};
+    }
+  };
+  saveState.writeChain = (saveState.writeChain || Promise.resolve()).catch(()=>{}).then(operation);
+  return saveState.writeChain;
+}
+
+function saveState({successMessage = '', immediate = Boolean(successMessage)} = {}){
+  const revision = (saveState.revision || 0) + 1;
+  saveState.revision = revision;
+  const state = buildPersistedState(revision);
   let browserSaved = false;
   try{
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
@@ -113,24 +141,43 @@ async function saveState({successMessage = ''} = {}){
   }catch(err){
     addLog('error', `保存本地数据失败：${err.message || err}`);
   }
-  try{
-    if(!window.stockApi?.saveUserState) throw new Error('持久化接口不可用');
-    const result = await window.stockApi.saveUserState(state);
-    if(result?.ok !== true) throw new Error(result?.error || '请检查磁盘权限');
-    addLog('info', '本地数据文件已确认保存');
-    if(successMessage) notify(successMessage, 'success');
-    return {ok:true, browserSaved, file:result.file || ''};
-  }catch(err){
-    notify(`本地数据文件保存失败：${err.message || err}${browserSaved ? '；当前操作仅保留在浏览器缓存' : ''}`, 'error');
-    return {ok:false, browserSaved, error:err.message || String(err)};
+  if(!immediate){
+    saveState.deferredState = state;
+    saveState.deferredBrowserSaved = browserSaved;
+    clearTimeout(saveState.deferredTimer);
+    return new Promise(resolve => {
+      (saveState.deferredWaiters ||= []).push(resolve);
+      saveState.deferredTimer = setTimeout(async() => {
+        const pendingState = saveState.deferredState;
+        const pendingBrowserSaved = saveState.deferredBrowserSaved;
+        const waiters = saveState.deferredWaiters || [];
+        saveState.deferredState = null;
+        saveState.deferredBrowserSaved = null;
+        saveState.deferredWaiters = [];
+        saveState.deferredTimer = null;
+        const result = await enqueueStateSnapshot(pendingState, '', pendingBrowserSaved);
+        waiters.forEach(waiter=>waiter(result));
+      },300);
+    });
   }
+  const waiters = saveState.deferredWaiters || [];
+  if(saveState.deferredTimer) clearTimeout(saveState.deferredTimer);
+  saveState.deferredTimer = null;
+  saveState.deferredState = null;
+  saveState.deferredBrowserSaved = null;
+  saveState.deferredWaiters = [];
+  const pending = enqueueStateSnapshot(state,successMessage,browserSaved);
+  pending.then(result=>waiters.forEach(waiter=>waiter(result)));
+  return pending;
 }
 
 function favoriteOutcomeRows(){
   const marketOverview = typeof latestMarketOverview === 'undefined' ? null : latestMarketOverview;
+  const cacheKey = `${saveState.revision || 0}|${marketOverview?.fetchedAt || marketOverview?.tradeDate || ''}`;
+  if(favoriteOutcomeRows.cache?.key === cacheKey) return favoriteOutcomeRows.cache.rows;
   const currentIndices = new Map((marketOverview?.indices || []).map(index => [String(index.code || ''), Number(index.price)]));
   const currentSectors = new Map((marketOverview?.sectors || []).map(sector => [String(sector.code || ''), Number(sector.price)]));
-  return labels.flatMap(label => (label.stocks || []).map(stock => {
+  const rows = labels.flatMap(label => (label.stocks || []).map(stock => {
     const benchmarkReturns = (stock.favoriteEntrySnapshot?.benchmarkIndices || []).map(index => {
       const base = Number(index.price);
       const current = currentIndices.get(String(index.code || ''));
@@ -159,10 +206,25 @@ function favoriteOutcomeRows(){
       recommendationContext:stock.favoriteEntrySnapshot?.context || null
     };
   }));
+  favoriteOutcomeRows.cache = {key:cacheKey,rows};
+  return rows;
+}
+
+function compactFavoriteStock(stock={}){
+  const fields = ['code','name','sector','industry','actualIndustry','type','status','focus','reason','news',
+    'price','changePct','change','volume','amount','high','low','open','prevClose','amplitude','turnoverRate','peRatio',
+    'snapshotVolumeRatio','pbRatio','upperLimit','lowerLimit','totalMarketCap','floatMarketCap','mainNetInflow','mainNetPct',
+    'mainInflow','mainOutflow','fundFlowDate','fundFlowObservedAt','fundFlowSource','fundFlowStatus','tradeDate',
+    'quoteObservedAt','source','fetchedAt','stale','technicalScore','score','signalScore','relevanceScore','canslim',
+    'holdingProfile','holdingPeriod','marketSignal','newsLabel','recommendationModelVersion','signalId','planId','analysisId',
+    'favoriteEntrySnapshotRef'];
+  const compact = {};
+  for(const field of fields) if(stock[field] !== undefined) compact[field] = stock[field];
+  return compact;
 }
 
 function labelStockSnapshot(stock, existingStock=null){
-  const {favoriteBasePrice: ignoredBase, favoriteAddedAt: ignoredTime, ...snapshot} = stock;
+  const snapshot = compactFavoriteStock({...existingStock,...stock});
   const existingBase = Number(existingStock?.favoriteBasePrice);
   const currentPrice = Number(stock.price);
   const marketOverview = typeof latestMarketOverview === 'undefined' ? null : latestMarketOverview;
@@ -216,6 +278,7 @@ function recordRemovedFavorite(label, stocks){
 
 function applyPersistedState(state){
   if(!state || typeof state !== 'object') return false;
+    saveState.revision = Math.max(Number(saveState.revision) || 0,Number(state.revision) || 0);
     if(Array.isArray(state.labels)) labels = state.labels;
     if(Array.isArray(state.removedFavoriteEvents)) removedFavoriteEvents = state.removedFavoriteEvents;
     if(state.labelSorts && typeof state.labelSorts === 'object') labelSorts = state.labelSorts;
@@ -232,6 +295,7 @@ function applyPersistedState(state){
         focus: ls.marketSignal && ls.newsLabel ? ls.newsLabel : ls.focus
       })).filter(ls => /^\d{6}$/.test(String(ls.code || '')) && ls.name)
     }));
+    if(typeof favoriteIndexes !== 'undefined') favoriteIndexes.cache = null;
     if(!labels.some(label => label.name === activeLabel)) activeLabel = labels[0]?.name || '';
     return true;
 }
@@ -781,6 +845,8 @@ async function hydrateUserState(){
     if(fileUpdated >= browserUpdated && applyPersistedState(result.value)){
       localStorage.setItem(STORAGE_KEY, JSON.stringify(result.value));
       renderStocks();
+      if(result.missingEvidence) notify(`收藏数据已加载，但有 ${result.missingEvidence} 条历史证据缺失，已保留收藏关系并停止补造旧结论`, 'warn');
+      if(Number(result.value.schemaVersion || 0) < 3) void saveState();
       return true;
     }
   }catch(err){
@@ -880,10 +946,26 @@ function portfolioPosition(code){
   return portfolio.find(item => item.code === code);
 }
 
+function favoriteIndexes(){
+  const key = `${saveState.revision || 0}|${labels.length}`;
+  if(favoriteIndexes.cache?.key === key) return favoriteIndexes.cache;
+  const byCode = new Map(),namesByCode = new Map();
+  for(const label of labels){
+    for(const stock of label.stocks || []){
+      if(!byCode.has(stock.code)) byCode.set(stock.code,stock);
+      const names = namesByCode.get(stock.code) || [];
+      if(!names.includes(label.name)) names.push(label.name);
+      namesByCode.set(stock.code,names);
+    }
+  }
+  favoriteIndexes.cache = {key,byCode,namesByCode};
+  return favoriteIndexes.cache;
+}
+
 function portfolioStock(position){
   if(!position) return null;
   const known = stocks.find(stock => stock.code === position.code)
-    || labels.flatMap(label => label.stocks || []).find(stock => stock.code === position.code)
+    || favoriteIndexes().byCode.get(position.code)
     || position.stock || {};
   return {
     ...known,
@@ -1170,6 +1252,7 @@ function applyAnalysisClassification(code){
   } : stock;
   stocks = stocks.map(update);
   labels = labels.map(label => ({...label, stocks:label.stocks.map(update)}));
+  if(typeof favoriteIndexes !== 'undefined') favoriteIndexes.cache = null;
 
   if(currentViewSource !== 'generated') return;
   const leaders = new Set();
@@ -1220,7 +1303,7 @@ function cleanDisplayName(name){
 }
 
 function labelNamesForStock(code){
-  return labels.filter(l => l.stocks.some(s => s.code === code)).map(l => l.name);
+  return favoriteIndexes().namesByCode.get(code) || [];
 }
 
 function stockLabelHtml(s){
@@ -1985,7 +2068,7 @@ function renderLabels(){
     event.preventDefault();
     openLabelStockMenu(card.dataset.detailCode, event.clientX, event.clientY);
   });
-  if(label?.stocks.length) void ensureLabelScores(label.stocks);
+  if(label?.stocks.length) scheduleLabelScores(label);
 }
 
 function closeLabelStockMenu(){
@@ -2131,7 +2214,7 @@ function addOnlineStock(code){
 
 function findStockByCode(code){
   return stocks.find(x => x.code === code)
-    || labels.flatMap(l => l.stocks || []).find(x => x.code === code)
+    || favoriteIndexes().byCode.get(code)
     || portfolioStock(portfolioPosition(code))
     || (() => {
       const position = researchAccount?.positions?.find(item => item.code === code);
@@ -2517,7 +2600,33 @@ async function loadLatestDetailQuote(s){
   });
 }
 
-async function fetchStockAnalysis(s, force=false){
+function withAnalysisSlot(task, priority=0){
+  return new Promise((resolve,reject) => {
+    const queue = withAnalysisSlot.queue ||= [];
+    queue.push({task,priority:Number(priority) || 0,order:withAnalysisSlot.order = (withAnalysisSlot.order || 0) + 1,resolve,reject});
+    queue.sort((a,b)=>b.priority-a.priority || a.order-b.order);
+    withAnalysisSlot.pump ||= () => {
+      while((withAnalysisSlot.active || 0) < 3 && withAnalysisSlot.queue.length){
+        const job = withAnalysisSlot.queue.shift();
+        withAnalysisSlot.active = (withAnalysisSlot.active || 0) + 1;
+        let result;
+        try{ result = job.task(); }catch(error){ result = Promise.reject(error); }
+        let timer;
+        const timeout = new Promise((_,reject) => {
+          timer = setTimeout(()=>reject(new Error('个股分析请求超时，已释放后台队列槽位')),withAnalysisSlot.timeoutMs || 45000);
+        });
+        Promise.race([Promise.resolve(result),timeout]).then(job.resolve,job.reject).finally(() => {
+          clearTimeout(timer);
+          withAnalysisSlot.active--;
+          withAnalysisSlot.pump();
+        });
+      }
+    };
+    withAnalysisSlot.pump();
+  });
+}
+
+async function fetchStockAnalysis(s, force=false, priority=0){
   const cached = detailHistoryCache.get(s.code);
   const cacheTime = Date.parse(cached?.analyzedAt || '');
   if(!force && cached && analysisFreshness(s,cached).status === 'current'
@@ -2527,16 +2636,15 @@ async function fetchStockAnalysis(s, force=false){
   if(detailHistoryPending.has(pendingKey)){
     if(!force) return detailHistoryPending.get(pendingKey);
     await detailHistoryPending.get(pendingKey).catch(()=>{});
-    return fetchStockAnalysis(s,true);
+    return fetchStockAnalysis(s,true,priority);
   }
-  const pending = window.stockApi.fetchStockHistory({
+  const pending = withAnalysisSlot(() => window.stockApi.fetchStockHistory({
     code:s.code, name:s.name, industry:s.industry || s.actualIndustry || '', sector:s.sector || '',
     force, favoriteOutcomes:favoriteOutcomeRows()
-  })
+  }),priority)
     .then(result => {
       detailHistoryCache.set(s.code, result);
       applyAnalysisClassification(s.code);
-      saveState();
       return result;
     })
     .finally(() => detailHistoryPending.delete(pendingKey));
@@ -2548,10 +2656,30 @@ async function ensureLabelScores(labelStocks){
   const missing = (labelStocks || []).filter(stock => !detailHistoryCache.has(stock.code)
     && !detailHistoryPending.has(stock.code));
   if(!missing.length) return;
-  const results = await settleWithConcurrency(missing, 3, stock => fetchStockAnalysis(stock));
+  const results = await settleWithConcurrency(missing, 3, stock => fetchStockAnalysis(stock,false,20));
   const changed = results.some(result => result.status === 'fulfilled' && result.value);
   results.filter(result => result.status === 'rejected').forEach(result => addLog('error', `收藏评分计算失败：${result.reason?.message || result.reason}`));
-  if(changed) renderLabels();
+  if(changed){
+    void saveState();
+    renderLabels();
+  }
+}
+
+function scheduleLabelScores(label){
+  const missing = (label?.stocks || []).filter(stock => !detailHistoryCache.has(stock.code)
+    && !detailHistoryPending.has(stock.code)).map(stock=>stock.code);
+  if(!missing.length) return;
+  const key = `${label.name}|${missing.join(',')}`;
+  if(scheduleLabelScores.key === key) return;
+  clearTimeout(scheduleLabelScores.timer);
+  scheduleLabelScores.key = key;
+  scheduleLabelScores.timer = setTimeout(async() => {
+    try{ await ensureLabelScores(label.stocks); }
+    finally{
+      if(scheduleLabelScores.key === key) scheduleLabelScores.key = '';
+      scheduleLabelScores.timer = null;
+    }
+  },0);
 }
 
 async function refreshAnalysisScores(codes){
@@ -2564,14 +2692,14 @@ async function refreshAnalysisScores(codes){
       applyAnalysisClassification(stock.code);
       return cached;
     }
-    return fetchStockAnalysis(stock, Boolean(cached));
+    return fetchStockAnalysis(stock, Boolean(cached),10);
   });
   results.forEach((result, index) => {
     const stock = targets[index];
     if(result.status === 'fulfilled' && result.value && stock.code === activeDetailCode) renderHistoryAnalysis(stock, result.value);
     if(result.status === 'rejected') addLog('error', `刷新评分失败：${stock.name} ${result.reason?.message || result.reason}`);
   });
-  renderLabels();
+  return results;
 }
 
 async function refreshActiveFundFlow(codes){
@@ -2601,17 +2729,25 @@ function refreshSecondaryData(codes){
   if(!ordered.length) return;
   const generation = ++secondaryRefreshGeneration;
   Promise.resolve().then(async() => {
+    let changed = false;
     for(let offset=0; offset<ordered.length && generation === secondaryRefreshGeneration; offset+=10){
       const batch = ordered.slice(offset,offset+10);
-      await Promise.allSettled([
+      const results = await Promise.allSettled([
         refreshAnalysisScores(batch),
         offset === 0 ? refreshActiveFundFlow(batch) : Promise.resolve()
       ]);
-      if(generation !== secondaryRefreshGeneration) return;
-      saveState();
-      renderStocks();
+      changed ||= results[0].status === 'fulfilled';
+      if(generation !== secondaryRefreshGeneration){
+        if(changed) void saveState();
+        return;
+      }
+      const visibleCodes = new Set(labels.find(label=>label.name===activeLabel)?.stocks.map(stock=>stock.code) || []);
+      if(batch.some(code=>visibleCodes.has(code))) renderLabels();
       if(offset + 10 < ordered.length) await new Promise(resolve => setTimeout(resolve,200));
     }
+    if(changed) void saveState();
+    if(['generated','portfolio'].includes(currentViewSource)) renderStocks();
+    else renderLabels();
   }).catch(error => addLog('error',`后台分析刷新失败：${error?.message || error}`));
 }
 
@@ -2625,7 +2761,7 @@ async function loadStockHistory(s, force=false){
   }
   box.innerHTML = '<div class="note inline-note">正在分析近3个月行情...</div>';
   try{
-    const result = await fetchStockAnalysis(s, force);
+    const result = await fetchStockAnalysis(s, force, 100);
     renderHistoryAnalysis(s, result);
     renderLabels();
     (result?.errors || []).forEach(msg => addLog('error', msg));
@@ -3402,6 +3538,7 @@ function applyQuoteData(quotes){
       ? {...updated, favoriteBasePrice:Number(updated.price), favoriteAddedAt:updated.favoriteAddedAt || new Date().toISOString()}
       : updated;
   })}));
+  if(typeof favoriteIndexes !== 'undefined') favoriteIndexes.cache = null;
   portfolio = portfolio.map(position => {
     const q = map.get(position.code);
     if(!q || q.price == null) return position;
@@ -3420,7 +3557,8 @@ function applyQuoteData(quotes){
 
 async function refreshMarket(){
   if(isRefreshing) return;
-  const codes = [...new Set([...stocks, ...labels.flatMap(label => label.stocks || []), ...portfolio.filter(position => Number(position.quantity) > 0)].map(s => s.code))];
+  const codes = [...new Set([...stocks.map(stock=>stock.code),...favoriteIndexes().byCode.keys(),
+    ...portfolio.filter(position => Number(position.quantity) > 0).map(position=>position.code)])];
   if(!codes.length){
     notify('当前没有股票可刷新', 'warn');
     return;

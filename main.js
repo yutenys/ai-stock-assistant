@@ -11,6 +11,7 @@ const { TextDecoder } = require('util');
 const crypto = require('crypto');
 const {version:APPLICATION_VERSION} = require('./package.json');
 const {atomicWriteJson, readJsonWithBackup, ResearchJobStore, StockHistoryStore} = require('./lib/persistence');
+const {UserStateStore} = require('./lib/user-state-store');
 const {
   FundFlowHistoryStore,
   FundFlowRequestCoordinator,
@@ -53,6 +54,7 @@ const stockFundFlowCache = new Map();
 const stockFundFlowHistoryCache = new Map();
 const fundFlowRequestCoordinator = new FundFlowRequestCoordinator();
 let fundFlowHistoryStore = null;
+let userStateStore = null;
 const stockRiskCache = new Map();
 const marketNewsCache = new Map();
 const marketHistoryCache = new Map();
@@ -332,6 +334,11 @@ function dataRootPath() {
 function getFundFlowHistoryStore() {
   if (!fundFlowHistoryStore) fundFlowHistoryStore = new FundFlowHistoryStore(path.join(dataRootPath(), 'data', 'fund-flow-history'));
   return fundFlowHistoryStore;
+}
+
+function getUserStateStore() {
+  if (!userStateStore) userStateStore = new UserStateStore(path.join(dataRootPath(),'data'));
+  return userStateStore;
 }
 
 async function initializeFundFlowRecoveryManifest() {
@@ -9178,9 +9185,8 @@ function broadcastDailyReportProgress(progress) {
 }
 
 async function readUserStateValue() {
-  return (await readJsonWithBackup(path.join(dataRootPath(), 'data', 'user-state.json'), {
-    labels:[], removedFavoriteEvents:[], portfolio:[], simulatedTrades:[]
-  })).value || {labels:[], removedFavoriteEvents:[], portfolio:[], simulatedTrades:[]};
+  return (await getUserStateStore().load()).value
+    || {labels:[], removedFavoriteEvents:[], portfolio:[], simulatedTrades:[]};
 }
 
 function favoriteRowsFromState(state, closeByCode = new Map(), tradeDate = currentChinaDate()) {
@@ -9855,16 +9861,13 @@ ipcMain.handle('mark-research-account', async (_event, request = {}) => {
 });
 
 ipcMain.handle('load-user-state', async () => {
-  const file = path.join(dataRootPath(), 'data', 'user-state.json');
-  return readJsonWithBackup(file, null);
+  return getUserStateStore().load();
 });
 
 ipcMain.handle('save-user-state', async (_event, state) => {
-  const file = path.join(dataRootPath(), 'data', 'user-state.json');
   try {
-    const value = {schemaVersion:2, updatedAt:new Date().toISOString(), labels:[], portfolio:[], simulatedTrades:[], ...(state || {})};
-    await atomicWriteJson(file, value);
-    return {ok:true, file};
+    const value = {schemaVersion:3, updatedAt:new Date().toISOString(), labels:[], portfolio:[], simulatedTrades:[], ...(state || {})};
+    return await getUserStateStore().save(value);
   } catch (error) {
     appendLogLine({type:'error', action:'user_state_save_failed', message:'用户数据保存失败', stack:error.stack || String(error)});
     return {ok:false, error:error.message || String(error)};

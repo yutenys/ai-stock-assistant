@@ -5,6 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const {atomicWriteJson, readJsonWithBackup, ResearchJobStore, StockHistoryStore} = require('../lib/persistence');
+const {compactFavoriteStock,splitUserState,hydrateUserState,UserStateStore} = require('../lib/user-state-store');
 
 test('原子JSON保存保留上一版备份且可在主文件损坏后恢复', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stock-state-'));
@@ -132,4 +133,71 @@ test('default merge options inherit the basis and preserve field-level sources',
   assert.equal(invalid.source,result.source);
   assert.equal(invalid.adjustment,result.adjustment);
   assert.equal(invalid.fullFetchedAt,result.fullFetchedAt);
+});
+
+test('用户状态将重复收藏证据按内容哈希去重并可完整还原',()=>{
+  const snapshot={signal:'待突破',plan:{entryLow:10},capturedAt:'2026-11-05T10:00:00+08:00'};
+  const input={schemaVersion:2,labels:[
+    {name:'A',stocks:[{code:'600001',favoriteEntrySnapshot:snapshot}]},
+    {name:'B',stocks:[{code:'600001',favoriteEntrySnapshot:snapshot}]}
+  ]};
+  const split=splitUserState(input);
+  assert.equal(split.state.schemaVersion,3);
+  assert.equal(Object.keys(split.evidence).length,1);
+  assert.equal(split.state.labels[0].stocks[0].favoriteEntrySnapshot,undefined);
+  assert.equal(split.state.labels[0].stocks[0].favoriteEntrySnapshotRef,
+    split.state.labels[1].stocks[0].favoriteEntrySnapshotRef);
+  const hydrated=hydrateUserState(split.state,split.evidence);
+  assert.deepEqual(hydrated.state.labels[1].stocks[0].favoriteEntrySnapshot,snapshot);
+  assert.equal(hydrated.missingEvidence,0);
+});
+
+test('主进程再次剥离收藏中的瞬时大对象并保留显示与累计字段',()=>{
+  const compact=compactFavoriteStock({code:'600001',name:'甲',price:12,changePct:2,
+    favoriteBasePrice:10,favoriteAddedAt:'2026-11-01',pinned:true,
+    analysis:{rows:Array(1000).fill('large')},rotationProfiles:Array(100).fill({large:true})});
+  assert.deepEqual(compact,{code:'600001',name:'甲',price:12,changePct:2,
+    favoriteBasePrice:10,favoriteAddedAt:'2026-11-01',pinned:true});
+});
+
+test('用户状态存储在线程中迁移旧格式且缺失证据保持可诊断',async()=>{
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'user-state-store-'));
+  const store=new UserStateStore(root);
+  const state={schemaVersion:2,revision:7,labels:[{name:'A',stocks:[
+    {code:'600001',name:'甲',favoriteEntrySnapshot:{signal:'观察',capturedAt:'2026-11-05'}}
+  ]}]};
+  const saved=await store.save(state);
+  assert.equal(saved.schemaVersion,3);
+  assert.equal(saved.revision,7);
+  const raw=JSON.parse(fs.readFileSync(path.join(root,'user-state.json'),'utf8'));
+  assert.equal(raw.labels[0].stocks[0].favoriteEntrySnapshot,undefined);
+  const loaded=await store.load();
+  assert.equal(loaded.value.labels[0].stocks[0].favoriteEntrySnapshot.signal,'观察');
+  assert.equal(loaded.value.labels[0].stocks[0].analysis,undefined);
+  assert.equal(loaded.missingEvidence,0);
+  const unchanged=await store.save(loaded.value);
+  assert.equal(unchanged.evidenceChanged,false);
+  fs.writeFileSync(path.join(root,'user-favorite-evidence.json'),'{}','utf8');
+  fs.rmSync(path.join(root,'user-favorite-evidence.json.bak'),{force:true});
+  const partial=await store.load();
+  assert.equal(partial.missingEvidence,1);
+  assert.ok(partial.value.labels[0].stocks[0].favoriteEntrySnapshotRef);
+});
+
+test('三千条收藏关系压缩后不丢标签关系且去除瞬时分析数据',()=>{
+  const evidence={signal:'等待确认',plan:{entryLow:10,entryHigh:11},capturedAt:'2026-11-05'};
+  const labels=Array.from({length:60},(_,labelIndex)=>({name:`标签${labelIndex}`,stocks:Array.from({length:50},(_,stockIndex)=>({
+    code:String(600000 + labelIndex * 50 + stockIndex).padStart(6,'0'),name:`股票${stockIndex}`,price:12,
+    favoriteBasePrice:10,favoriteAddedAt:'2026-11-01',favoriteEntrySnapshot:evidence,
+    analysis:{text:'x'.repeat(2000)},rotationProfiles:Array(20).fill({members:'y'.repeat(100)})
+  }))}));
+  const input={schemaVersion:2,labels};
+  const originalBytes=Buffer.byteLength(JSON.stringify(input));
+  const split=splitUserState(input);
+  const compactBytes=Buffer.byteLength(JSON.stringify(split.state))+Buffer.byteLength(JSON.stringify(split.evidence));
+  const hydrated=hydrateUserState(split.state,split.evidence);
+  assert.equal(hydrated.state.labels.reduce((sum,label)=>sum+label.stocks.length,0),3000);
+  assert.equal(hydrated.state.labels[10].stocks[20].favoriteEntrySnapshot.signal,'等待确认');
+  assert.equal(hydrated.state.labels[10].stocks[20].analysis,undefined);
+  assert.ok(compactBytes < originalBytes * 0.2);
 });

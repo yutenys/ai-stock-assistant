@@ -9,6 +9,7 @@
     "audit:strategy": "node scripts/audit-strategy-window.cjs",
     "replay:experiments": "node scripts/replay-strategy-experiments.cjs",
     "test:ui": "electron tests/ui-smoke.js",
+    "measure:favorites": "node scripts/measure-favorites-state.cjs",
     "pack": "electron-builder --dir",
     "dist": "npm version patch --no-git-tag-version && electron-builder --win portable"
   },
