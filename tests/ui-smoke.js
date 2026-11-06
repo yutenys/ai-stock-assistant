@@ -277,6 +277,7 @@ app.whenReady().then(async () => {
       }))
     ],
     momentumRecommendations:[{code:'603151',name:'邦基科技',industry:'饲料',price:18.13,changePct:10.01,signal:'强势追踪',recommendationTier:'强势追踪',newsLabel:'消息中性',signalScore:89,verdict:'等待回踩',entryAssessment:{allowed:false,status:'强势追踪，不追高',summary:'等待首次缩量回踩。'},reason:'强势追踪：猪肉概念主力资金净流入15.55亿，不追高。',momentumDecision:{passed:true,score:89,profile:{name:'猪肉概念'},entryAssessment:{allowed:false,status:'强势追踪，不追高',summary:'等待首次缩量回踩。'}},factorAnalysis:{score:76,available:5,total:7,sectorProfile:{name:'猪肉概念',score:91,label:'资金升温'}}}],
+    shortReboundCandidates:[{code:'600172',name:'黄河旋风',industry:'非金属材料',price:11.53,changePct:3.88,signal:'短线超跌首修复',recommendationTier:'短线修复影子',newsLabel:'消息中性',signalScore:72,verdict:'仅观察，不构成买入许可',entryPermission:'shadow-only',reason:'超跌首修复：低点稳定，等待量价确认。',shortRebound:{route:'R1',type:'超跌首修复',state:'condition-pending',detectionScore:72,executionScore:58,resistance:11.8,invalidation:10.1,firstDetectedAt:'2026-11-04T10:15:00+08:00',firstDetectedChangePct:2.1,evidence:['近3日低点停止下移'],missingEvidence:['量比需处于1.5-4.0倍']}}],
     sectorCapital:{direct:true,source:'东方财富概念板块主力资金',fetchedAt:'2026-08-12T13:30:00.000Z',cached:true,stale:true},
     recommendationCoverage: { scanned: 5230, prefiltered: 428, analyzed: 60, fullMarketHistoryCovered:5200, fullMarketCandidates:700, industries: 42, directoryAvailable: true, consolidationCandidates:5, directSectorCapital:120, rotationCandidates:32, momentumCandidates:18, momentumQualified:1, riskChecked: 16, riskRejected: 2, riskUnknown: 1, riskUnverifiedIncluded: 1, qualified: 13, signals: { bottomWaiting: 3, rebounded: 18, breakout: 12 } },
     newsContext: { signal: '偏积极', summary: '政策与行业消息偏积极，仍需结合盘面确认。', items: [{ title: '中药行业最新政策消息', link: 'https://example.com/market-news', publishedAt: '2026-08-12 11:00:00', source: '测试资讯' }] },
@@ -473,6 +474,7 @@ app.whenReady().then(async () => {
     const stablePanel = document.getElementById('marketStablePanel');
     const watchPanel = document.getElementById('marketWatchPanel');
     const momentumPanel = document.getElementById('marketMomentumPanel');
+    const shortReboundPanel = document.getElementById('marketShortReboundPanel');
     const initialTrack = !stablePanel.classList.contains('hidden') && momentumPanel.classList.contains('hidden');
     document.getElementById('marketMomentumTab').click();
     const momentumTrack = stablePanel.classList.contains('hidden') && !momentumPanel.classList.contains('hidden')
@@ -488,6 +490,10 @@ app.whenReady().then(async () => {
     document.getElementById('saveMarketRecommendations').click();
     const momentumSavedCodes = (JSON.parse(localStorage.getItem('ai-stock-assistant-state-v1') || '{}').labels || [])
       .find(label => label.name === '强势追踪收藏')?.stocks?.map(stock => stock.code) || [];
+    document.getElementById('marketShortReboundTab').click();
+    const shortReboundTrack = stablePanel.classList.contains('hidden') && !shortReboundPanel.classList.contains('hidden')
+      && document.getElementById('marketShortReboundTab').getAttribute('aria-selected') === 'true';
+    const shortReboundText = shortReboundPanel.innerText;
     document.getElementById('marketWatchTab').click();
     const watchRestored = stablePanel.classList.contains('hidden') && !watchPanel.classList.contains('hidden')
       && momentumPanel.classList.contains('hidden');
@@ -524,7 +530,7 @@ app.whenReady().then(async () => {
     document.querySelector('[data-market-recommendation="600200"]').click();
     const breakoutDetailTags = [...document.querySelectorAll('#detailPanel .detail-tags .badge')].map(node => node.textContent.trim());
     document.querySelector('[data-market-recommendation="603567"]').click();
-    return { initialTrack, momentumTrack, momentumModal, momentumSavedCodes, watchRestored, choiceCount:stockChoices.length, firstChoiceText, labelsAboveStocks, recommendationTitle, groupNames, groupOrders, hasIndividualIndustryTag, firstPriceText, marketChanges, choiceChanges, firstHeadLayout, allHeadsFit, mainChangesWithinCards, longNameFullyVisible, coloredCount, initialAll, afterClear, savedCount:label?.stocks?.length || 0, savedScore:savedStock?.score, savedSignalScore:savedStock?.signalScore, savedBreakoutTags:stockTagValues(savedBreakout), breakoutDetailTags, closed:document.getElementById('marketLabelPanel').classList.contains('hidden') };
+    return { initialTrack, momentumTrack, shortReboundTrack, shortReboundText, momentumModal, momentumSavedCodes, watchRestored, choiceCount:stockChoices.length, firstChoiceText, labelsAboveStocks, recommendationTitle, groupNames, groupOrders, hasIndividualIndustryTag, firstPriceText, marketChanges, choiceChanges, firstHeadLayout, allHeadsFit, mainChangesWithinCards, longNameFullyVisible, coloredCount, initialAll, afterClear, savedCount:label?.stocks?.length || 0, savedScore:savedStock?.score, savedSignalScore:savedStock?.signalScore, savedBreakoutTags:stockTagValues(savedBreakout), breakoutDetailTags, closed:document.getElementById('marketLabelPanel').classList.contains('hidden') };
   })()`);
   await win.webContents.executeJavaScript(`
     window.scrollTo(0, document.body.scrollHeight);
@@ -1118,7 +1124,8 @@ app.whenReady().then(async () => {
     && state.marketText.includes('资金截至2026-08-12')
     && state.marketText.includes('有效成分2只，上涨2只，小样本')
     && state.marketBatchLabelState.initialAll && state.marketBatchLabelState.afterClear
-    && state.marketBatchLabelState.initialTrack && state.marketBatchLabelState.momentumTrack && state.marketBatchLabelState.watchRestored
+    && state.marketBatchLabelState.initialTrack && state.marketBatchLabelState.momentumTrack && state.marketBatchLabelState.shortReboundTrack && state.marketBatchLabelState.watchRestored
+    && /黄河旋风[\s\S]*短线超跌首修复[\s\S]*待触发/.test(state.marketBatchLabelState.shortReboundText)
     && state.marketBatchLabelState.momentumModal.count === 1
     && JSON.stringify(state.marketBatchLabelState.momentumModal.codes) === JSON.stringify(['603151'])
     && JSON.stringify(state.marketBatchLabelState.momentumSavedCodes) === JSON.stringify(['603151'])
@@ -1152,7 +1159,7 @@ app.whenReady().then(async () => {
     && JSON.stringify(state.marketBatchLabelState.savedBreakoutTags) === JSON.stringify(['待突破','消息中性'])
     && JSON.stringify(state.marketBatchLabelState.breakoutDetailTags) === JSON.stringify(['待突破','消息中性'])
     && state.marketBatchLabelState.closed
-    && state.scoreConsistencyState.recommendationCount === 11
+    && state.scoreConsistencyState.recommendationCount === 12
     && state.scoreConsistencyState.cardText.includes('推荐评分 84')
     && state.scoreConsistencyState.cardText.includes('消息确认\n短线\n¥11.08')
     && !state.scoreConsistencyState.cardText.includes('\n中药\n')

@@ -50,6 +50,7 @@
             <button id="marketStableTab" class="market-recommendation-tab active" role="tab" aria-selected="true" aria-controls="marketStablePanel">严格推荐 <span id="marketStableCount">0</span></button>
             <button id="marketWatchTab" class="market-recommendation-tab" role="tab" aria-selected="false" aria-controls="marketWatchPanel">观察候选 <span id="marketWatchCount">0</span></button>
             <button id="marketMomentumTab" class="market-recommendation-tab" role="tab" aria-selected="false" aria-controls="marketMomentumPanel">强势追踪 <span id="marketMomentumCount">0</span></button>
+            <button id="marketShortReboundTab" class="market-recommendation-tab" role="tab" aria-selected="false" aria-controls="marketShortReboundPanel">短线修复 <span id="marketShortReboundCount">0</span></button>
           </div>
           <div id="marketStablePanel" role="tabpanel" aria-labelledby="marketStableTab">
             <div class="market-section-title"><h3>稳健轮动推荐</h3><button id="addMarketRecommendations" class="small">查看更多</button></div>
@@ -62,6 +63,10 @@
           <div id="marketMomentumPanel" class="hidden" role="tabpanel" aria-labelledby="marketMomentumTab">
             <div class="market-section-title"><h3>强势追踪推荐</h3><button id="addMarketMomentumRecommendations" class="small">查看更多</button></div>
             <div id="marketMomentumCoverage" class="market-coverage"></div><div id="marketMomentumRecommendations"></div>
+          </div>
+          <div id="marketShortReboundPanel" class="hidden" role="tabpanel" aria-labelledby="marketShortReboundTab">
+            <div class="market-section-title"><h3>短线修复影子观察</h3><button id="addMarketShortReboundRecommendations" class="small">查看更多</button></div>
+            <div id="marketShortReboundCoverage" class="market-coverage"></div><div id="marketShortReboundRecommendations"></div>
           </div>
         </section>
         <section class="market-section full-market-research">

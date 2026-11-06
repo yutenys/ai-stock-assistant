@@ -56,6 +56,30 @@ test('全市场因子与历史待筛候选不冒充已发布推荐', () => {
   assert.equal(review.counts.episodes,1);
 });
 
+test('短线修复只形成独立发布后观察且不污染正式AB统计', () => {
+  const first=batch('r-first','2026-09-10');
+  const second=batch('r-second','2026-09-11');
+  for (const row of [first,second]) row.shortReboundCandidates=[{
+    code:'600002',name:'影子样本',price:20,entryPermission:'shadow-only',
+    shortRebound:{route:'R1',type:'超跌首修复',state:row === first ? 'observation' : 'condition-pending',
+      detectionScore:72,executionScore:55,firstDetectedAt:'2026-09-10T10:00:00+08:00'}
+  }];
+  const histories=new Map([['600002',{source:'已核验日线',bars:[
+    {date:'2026-09-11',close:21,isFinal:true},
+    {date:'2026-09-14',close:19,isFinal:true}
+  ]}]]);
+  const review=evaluatePublishedEpisodes([first,second],histories,{asOfDate:'2026-09-14',horizons:[1,3]});
+  assert.equal(review.counts.publishedSignals,2);
+  assert.equal(review.counts.episodes,1);
+  assert.equal(review.shortReboundShadow.shadowOnly,true);
+  assert.equal(review.shortReboundShadow.counts.publishedSignals,2);
+  assert.equal(review.shortReboundShadow.counts.episodes,1);
+  assert.equal(review.shortReboundShadow.episodes[0].refreshCount,2);
+  assert.ok(Math.abs(review.shortReboundShadow.episodes[0].observations[1].returnPct - 5) < .000001);
+  assert.equal(review.shortReboundShadow.horizonSummaries[1].count,1);
+  assert.equal('execution' in review.shortReboundShadow.episodes[0],false);
+});
+
 test('连续日期同股跨模型版本必须拆成独立episode', () => {
   const first=batch('old','2026-09-10');
   const second={...batch('new','2026-09-11'),modelVersion:'test-v2'};

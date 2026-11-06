@@ -3189,6 +3189,27 @@ test('大盘推荐候选覆盖扩大到120只并保持行业分散', () => {
   assert.ok(candidates.some(item => item.code.startsWith('3')));
 });
 
+test('短线修复影子通道预留最多40席且不缩减总精筛预算', () => {
+  const rows=(prefix,count)=>Array.from({length:count},(_,index)=>({code:`${prefix}${String(index).padStart(5,'0')}`.slice(-6),industry:`行业${index%30}`}));
+  const short=rows('8',60);
+  const result=selectMarketRecommendationCandidates({breakoutScreened:rows('6',180),consolidationScreened:rows('5',180),
+    reboundScreened:rows('3',200),shortReboundScreened:short},160);
+  assert.equal(result.length,160);
+  assert.equal(result.filter(item=>short.some(row=>row.code===item.code)).length,40);
+});
+
+test('短线修复账本独立保存且强制清除正式许可和触发', () => {
+  const entry=buildRecommendationLedgerEntry({tradeDate:'2026-11-06',recommendations:[],momentumRecommendations:[],
+    shortReboundCandidates:[{code:'600001',name:'测试修复',price:10,shortRebound:{type:'超跌首修复',state:'verified-trigger'},
+      entryAssessment:{allowed:true},strategyDecision:{entryPermission:'allowed'}}]});
+  assert.equal(entry.recommendations.length,0);
+  assert.equal(entry.momentumRecommendations.length,0);
+  assert.equal(entry.shortReboundCandidates.length,1);
+  assert.equal(entry.shortReboundCandidates[0].entryPermission,'shadow-only');
+  assert.equal(entry.shortReboundCandidates[0].triggeredAt,'');
+  assert.equal(entry.shortReboundCandidates[0].triggerEvent,null);
+});
+
 test('板块轮动和强势候选优先进入历史精筛且仍保持去重', () => {
   const rotation = [{code:'000876',industry:'饲料',rotationProfiles:[{name:'猪肉概念'}]}];
   const momentum = [{code:'002714',industry:'养殖业',rotationProfiles:[{name:'生猪养殖'}]}];

@@ -33,6 +33,7 @@ let marketOverviewTimer = null;
 let latestMarketRecommendations = [];
 let latestMarketWatchRecommendations = [];
 let latestMarketMomentumRecommendations = [];
+let latestMarketShortReboundCandidates = [];
 let activeMarketRecommendationTrack = 'stable';
 let marketLabelRecommendations = [];
 let marketSaveSnapshot = null;
@@ -217,6 +218,7 @@ function compactFavoriteStock(stock={}){
     'mainInflow','mainOutflow','fundFlowDate','fundFlowObservedAt','fundFlowSource','fundFlowStatus','tradeDate',
     'quoteObservedAt','source','fetchedAt','stale','technicalScore','score','signalScore','relevanceScore','canslim',
     'holdingProfile','holdingPeriod','marketSignal','newsLabel','recommendationModelVersion','signalId','planId','analysisId',
+    'shortRebound','entryPermission','strategyDecision',
     'favoriteEntrySnapshotRef'];
   const compact = {};
   for(const field of fields) if(stock[field] !== undefined) compact[field] = stock[field];
@@ -423,15 +425,17 @@ function recommendationCardHtml(item, selectable=false){
   const industry = recommendationIndustry(item);
   const sectorLabel = item.factorAnalysis?.sectorProfile?.label || '板块待确认';
   const changeClass = Number.isFinite(item.changePct) ? pctClass(item.changePct) : 'neutral';
-  const scoreLabel = ['观察候选','环境观察'].includes(item.recommendationTier) ? '观察评分' : '推荐评分';
+  const scoreLabel = ['观察候选','环境观察','短线修复影子'].includes(item.recommendationTier) ? '观察评分' : '推荐评分';
   const verdictLabel = item.signal === '强势追踪' || item.recommendationTier === '环境观察' ? item.entryAssessment?.status : item.verdict;
   const confidence = item.dataConfidence ? `数据可信度 ${item.dataConfidence.label} ${item.dataConfidence.available}/${item.dataConfidence.total}` : '数据可信度待评估';
   const unifiedScore = item.scoreCard?.recommendation ?? item.signalScore ?? item.score;
   const momentumBadge = item.momentumGroup ? `<span class="market-signal ${item.momentumGroup === '回踩待触发' ? 'b-blue' : 'b-yellow'}">${escapeHtml(item.momentumGroup)}</span>` : '';
+  const shortState = {'observation':'观察','condition-pending':'待触发','verified-trigger':'影子触发','overheated':'过热禁追','invalid':'失效'}[item.shortRebound?.state];
+  const shortBadge = shortState ? `<span class="market-signal ${['invalid','overheated'].includes(item.shortRebound.state) ? 'b-red' : 'b-amber'}">${escapeHtml(shortState)}</span>` : '';
   const intradayBadge = item.intradayStructure?.state === 'retest-confirmed'
     ? `<span class="market-signal ${item.intradayPlanState?.currentPermission === 'allowed' ? 'b-blue' : 'b-yellow'}">${item.intradayPlanState?.currentPermission === 'allowed' ? '60分影子触发' : '60分回踩待确认'}</span>` : '';
   const themeEvidence = (item.themeRegimes || []).slice(0,2).map(row => `${row.name}：${row.state}`).join('；');
-  const content = `<span class="market-stock-content"><b class="market-stock-head"><span class="market-stock-name">${escapeHtml(item.name)}</span><span class="code">${escapeHtml(item.code)}</span><span class="market-signal ${badgeClass(item.signal)}">${escapeHtml(item.signal || '待突破')}</span>${momentumBadge}${intradayBadge}<span class="market-signal ${badgeClass(item.newsLabel)}">${escapeHtml(item.newsLabel || '消息中性')}</span><span class="market-signal b-blue">${escapeHtml(item.holdingPeriod || '周期待确认')}</span><span class="market-current-price">${yuan(item.price)}</span><span class="market-current-change ${changeClass}">${formatPct(item.changePct)}</span></b>
+  const content = `<span class="market-stock-content"><b class="market-stock-head"><span class="market-stock-name">${escapeHtml(item.name)}</span><span class="code">${escapeHtml(item.code)}</span><span class="market-signal ${badgeClass(item.signal)}">${escapeHtml(item.signal || '待突破')}</span>${momentumBadge}${shortBadge}${intradayBadge}<span class="market-signal ${badgeClass(item.newsLabel)}">${escapeHtml(item.newsLabel || '消息中性')}</span><span class="market-signal b-blue">${escapeHtml(item.holdingPeriod || '周期待确认')}</span><span class="market-current-price">${yuan(item.price)}</span><span class="market-current-change ${changeClass}">${formatPct(item.changePct)}</span></b>
     <span>${escapeHtml(sectorLabel)} · ${escapeHtml(verdictLabel || '等待确认')} · ${scoreLabel} ${escapeHtml(unifiedScore)} · ${escapeHtml(confidence)} · ${escapeHtml(recommendationCanslimText(item))} · ${escapeHtml(recommendationFactorText(item))} · MA30 ${yuan(item.ma30)} · 突破价 ${yuan(item.breakoutPrice)}</span>
     ${themeEvidence ? `<small>题材双轨影子观察：${escapeHtml(themeEvidence)}；不改变当前入场许可</small>` : ''}
     ${item.executionTiming?.summary ? `<small>${escapeHtml(item.executionTiming.summary)}</small>` : ''}
@@ -494,10 +498,12 @@ function renderMarketOverview(result){
     ${limits.observationReason ? `<div class="market-stocks"><small>${escapeHtml(limits.observationReason)}</small></div>` : ''}`;
   const recommendations = result.recommendations || [];
   const momentumRecommendations = result.momentumRecommendations || [];
+  const shortReboundCandidates = result.shortReboundCandidates || [];
   const recommendationPools = marketRecommendationPools(recommendations, momentumRecommendations);
   latestMarketRecommendations = recommendationPools.strict;
   latestMarketWatchRecommendations = recommendationPools.watch;
   latestMarketMomentumRecommendations = recommendationPools.momentum;
+  latestMarketShortReboundCandidates = shortReboundCandidates;
   const coverage = result.recommendationCoverage || {};
   const experiment = coverage.strategyExperiment || {};
   const strategyNames = {
@@ -606,13 +612,24 @@ function renderMarketOverview(result){
   $('addMarketMomentumRecommendations').textContent = `查看更多（${momentumRecommendations.length}）`;
   $('addMarketMomentumRecommendations').disabled = !momentumRecommendations.length;
   $('marketMomentumCount').textContent = momentumRecommendations.length;
+  const shortFunnel = coverage.shortReboundFunnel;
+  const shortFunnelText = shortFunnel ? ` 全市场可见 ${shortFunnel.scanned} 只，轻筛 ${shortFunnel.prefiltered} 只，进入在线预算 ${shortFunnel.queued} 只，完成历史分析 ${shortFunnel.analyzed} 只，命中 ${shortFunnel.matched} 只。` : '';
+  $('marketShortReboundCoverage').textContent = shortReboundCandidates.length
+    ? `R1超跌首修复、R2强趋势回踩修复、R3题材共振首启动共 ${shortReboundCandidates.length} 只；仅作影子观察，不改变买入许可或正式推荐统计。${shortFunnelText}`
+    : `本轮未识别到满足证据要求的短线修复候选。${shortFunnelText}`;
+  $('marketShortReboundRecommendations').innerHTML = shortReboundCandidates.length
+    ? groupedRecommendationHtml(recommendationPreview(shortReboundCandidates, 10))
+    : '<div class="market-row"><span>当前没有短线修复影子候选</span></div>';
+  $('addMarketShortReboundRecommendations').textContent = `查看更多（${shortReboundCandidates.length}）`;
+  $('addMarketShortReboundRecommendations').disabled = !shortReboundCandidates.length;
+  $('marketShortReboundCount').textContent = shortReboundCandidates.length;
   setMarketRecommendationTrack(activeMarketRecommendationTrack);
   const marketNews = result.newsContext?.items || [];
   const decisionNews = result.newsContext?.decisionItems || [];
   const newsReason = result.components?.news?.reason;
   $('marketNews').innerHTML = `<div class="market-stocks">${escapeHtml(newsReason || result.newsContext?.summary || '消息面暂不可用')}</div>${decisionNews.length ? `<div class="market-coverage">影响本轮判断：${escapeHtml(decisionNews.map(item => `${item.title}（${item.weightedScore > 0 ? '+' : ''}${item.weightedScore}）`).join('；'))}</div>` : ''}${marketNews.slice(0, 5).map(item => `<a class="market-news-row" href="#" data-market-news-link="${escapeHtml(safeHttpUrl(item.link))}">${escapeHtml(item.title)}<span>${escapeHtml(item.source || '')} · ${escapeHtml(item.publishedAt || '')}</span></a>`).join('')}`;
   document.querySelectorAll('[data-market-recommendation]').forEach(button => button.onclick = () => {
-    const item = [...recommendations, ...momentumRecommendations].find(candidate => candidate.code === button.dataset.marketRecommendation);
+    const item = [...recommendations, ...momentumRecommendations, ...shortReboundCandidates].find(candidate => candidate.code === button.dataset.marketRecommendation);
     if(!item) return;
     const stock = normalizedMarketRecommendation(item);
     stocks = [stock];
@@ -790,7 +807,8 @@ function fullMarketResearchPriorityCodes(){
     ...portfolio.map(position => position.code),
     ...latestMarketRecommendations.map(stock => stock.code),
     ...latestMarketWatchRecommendations.map(stock => stock.code),
-    ...latestMarketMomentumRecommendations.map(stock => stock.code)
+    ...latestMarketMomentumRecommendations.map(stock => stock.code),
+    ...(typeof latestMarketShortReboundCandidates === 'undefined' ? [] : latestMarketShortReboundCandidates.map(stock => stock.code))
   ].map(String).filter(code => /^\d{6}$/.test(code)))];
 }
 
@@ -820,8 +838,8 @@ async function cancelFullMarketResearch(){
 }
 
 function setMarketRecommendationTrack(track){
-  activeMarketRecommendationTrack = ['stable','watch','momentum'].includes(track) ? track : 'stable';
-  for(const name of ['stable','watch','momentum']){
+  activeMarketRecommendationTrack = ['stable','watch','momentum','shortRebound'].includes(track) ? track : 'stable';
+  for(const name of ['stable','watch','momentum','shortRebound']){
     const active = activeMarketRecommendationTrack === name;
     $(`market${name[0].toUpperCase()}${name.slice(1)}Panel`).classList.toggle('hidden', !active);
     $(`market${name[0].toUpperCase()}${name.slice(1)}Tab`).classList.toggle('active', active);
@@ -876,8 +894,8 @@ function normalizedMarketRecommendation(item){
 }
 
 function openMarketLabelPanel(track = activeMarketRecommendationTrack){
-  const labelsByTrack = {stable:'严格推荐', watch:'观察候选', momentum:'强势追踪'};
-  const rowsByTrack = {stable:latestMarketRecommendations, watch:latestMarketWatchRecommendations, momentum:latestMarketMomentumRecommendations};
+  const labelsByTrack = {stable:'严格推荐', watch:'观察候选', momentum:'强势追踪', shortRebound:'短线修复影子观察'};
+  const rowsByTrack = {stable:latestMarketRecommendations, watch:latestMarketWatchRecommendations, momentum:latestMarketMomentumRecommendations, shortRebound:latestMarketShortReboundCandidates};
   marketLabelRecommendations = rowsByTrack[track] || [];
   if(!marketLabelRecommendations.length){ notify(`${labelsByTrack[track] || '当前方案'}没有可添加的股票`, 'warn'); return; }
   marketSaveSnapshot = createMarketSaveSnapshot(track, marketLabelRecommendations, latestMarketOverview?.snapshotId || marketLabelRecommendations[0]?.analysisId);
@@ -2390,6 +2408,9 @@ function renderHistoryAnalysis(s, result){
   const researchHtml = researchRows.length ? `<p><b>研究观察（不授予买入许可）：</b>${researchMatched.length
     ? escapeHtml(researchMatched.map(row => `${row.id}${row.ruleVariant ? `/${row.ruleVariant}` : ''}`).join('、'))
     : '暂无证据完整的影子信号'}。<br><small>C类唯一最高标、分时回封及G类20日涨停池等缺少可核验证据时保持待核验，不进入A/B正式推荐。</small></p>` : '';
+  const shortRebound = s.shortRebound || result?.shortRebound;
+  const shortStateName = {observation:'修复观察','condition-pending':'条件待触发','verified-trigger':'已核验影子触发',overheated:'过热不追',invalid:'结构失效'}[shortRebound?.state] || shortRebound?.state;
+  const shortReboundHtml = shortRebound ? `<p><b>短线修复影子观察：</b>${escapeHtml(shortRebound.type || '--')} · ${escapeHtml(shortStateName || '待核验')} · 检测评分 ${escapeHtml(shortRebound.detectionScore ?? shortRebound.score ?? '--')} · 可执行评分 ${escapeHtml(shortRebound.executionScore ?? '--')}。<br><b>已满足：</b>${escapeHtml((shortRebound.evidence || []).join('；') || '暂无完整证据')}。<br><b>待补/限制：</b>${escapeHtml((shortRebound.missingEvidence || []).join('；') || '无')}。<br><b>阻力 / 失效：</b>${yuan(shortRebound.resistance)} / ${yuan(shortRebound.invalidation)}；首次发现 ${escapeHtml(shortRebound.firstDetectedAt || shortRebound.observedAt || '--')}，当时涨幅 ${formatPct(shortRebound.firstDetectedChangePct ?? shortRebound.detectedChangePct)}，当前涨幅 ${formatPct(s.changePct)}。当前许可固定为影子观察，不进入正式买入许可。</p>` : '';
   const conclusion = a.combinedConclusion || a.summary;
   const displayedVerdict = a.verdict;
   const recommendationSnapshotHtml = hasRecommendationScore
@@ -2459,6 +2480,7 @@ function renderHistoryAnalysis(s, result){
     ${scoreCardHtml}
     ${strategyHtml}
     ${researchHtml}
+    ${shortReboundHtml}
     ${holdingProfileHtml}
     <div class="analysis-grid">
       ${entryAssessmentHtml}
@@ -3805,9 +3827,11 @@ $('saveStockLabels').onclick = saveStockLabels;
 $('marketStableTab').onclick = () => setMarketRecommendationTrack('stable');
 $('marketWatchTab').onclick = () => setMarketRecommendationTrack('watch');
 $('marketMomentumTab').onclick = () => setMarketRecommendationTrack('momentum');
+$('marketShortReboundTab').onclick = () => setMarketRecommendationTrack('shortRebound');
 $('addMarketRecommendations').onclick = () => openMarketLabelPanel('stable');
 $('addMarketWatchRecommendations').onclick = () => openMarketLabelPanel('watch');
 $('addMarketMomentumRecommendations').onclick = () => openMarketLabelPanel('momentum');
+$('addMarketShortReboundRecommendations').onclick = () => openMarketLabelPanel('shortRebound');
 $('closeMarketLabelPanel').onclick = closeMarketLabelPanel;
 $('toggleMarketStocks').onclick = () => {
   const choices = [...document.querySelectorAll('[data-market-stock-choice]')];
