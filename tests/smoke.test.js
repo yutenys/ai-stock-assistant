@@ -959,6 +959,9 @@ test('长周期统计保留时间顺序，不将后来的低点算作先前涨�
   assert.equal(result.longestUp,1);
   assert.equal(result.longestDown,1);
   assert.equal(result.returns[250],null);
+  assert.equal(result.drawdowns[1],-75);
+  assert.equal(result.runups[1],-75);
+  assert.equal(result.drawdowns[20],null);
   assert.equal(analyzePathMetrics([]).available,false);
 });
 
@@ -1743,13 +1746,17 @@ test('负向资金扩大与不可比成员不能被写成资金未回撤',()=>{
 });
 
 test('收藏快照透传且历史时间点不再重复嵌入板块成员',()=>{
-  const snapshot={modelVersion:'v26',sourceType:'recommendation',planId:'plan-one',favoriteEventId:'event-one'};
+  const snapshot={modelVersion:'v26',sourceType:'recommendation',planId:'plan-one',favoriteEventId:'event-one',
+    benchmarkIndices:[{code:'000001',price:100}],industryBenchmark:{code:'BK001',price:200}};
   const rows=favoriteRowsFromState({labels:[{id:'l1',name:'观察',stocks:[{code:'600001',name:'测试',
     favoriteBasePrice:10,favoriteAddedAt:'2026-10-09T10:00:00+08:00',favoriteEntrySnapshot:snapshot}]}]},
-    new Map([['600001',{price:11,changePct:1}]]),'2026-10-09');
+    new Map([['600001',{price:11,changePct:1}]]),'2026-10-09',
+    {indices:[{code:'000001',price:105}],sectors:[{code:'BK001',price:220}]});
   assert.equal(rows[0].favoriteEntrySnapshot,snapshot);
   assert.equal(rows[0].modelVersion,'v26');
   assert.equal(rows[0].favoriteEventId,'event-one');
+  assert.equal(rows[0].marketReturnPct,5);
+  assert.equal(rows[0].industryReturnPct,10);
   const rich={snapshotId:'s1',tradeDate:'2026-10-09',breadth:{up:2,down:1},
     sectors:[{name:'农业',memberCodes:Array.from({length:1000},(_,i)=>String(i).padStart(6,'0'))}],
     limits:{upCount:1,downCount:0}};
@@ -2929,7 +2936,7 @@ test('推荐账本记录完整候选和三周期快照', () => {
   });
   assert.equal(entry.schemaVersion, 3);
   assert.match(entry.implementationVersion,/^(?:app-|git-)/);
-  assert.equal(entry.dataContractVersion,'2026-10-08-evidence-v2');
+  assert.equal(entry.dataContractVersion,'2026-11-08-evidence-v3');
   assert.equal(entry.planContractVersion,'entry-plan-v2');
   assert.equal(entry.inputCutoffAt, '2026-09-11T08:00:00.000Z');
   assert.equal(entry.publishedAt, '2026-09-11T08:00:06.000Z');

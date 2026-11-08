@@ -465,8 +465,9 @@ function renderMarketOverview(result){
   }
   $('marketAnalysis').textContent = result.analysis || '市场分析暂不可用。';
   $('marketUpdated').textContent = result.fetchedAt
-    ? `${result.sessionPhase?.label || result.observationPhase?.label || '时点待确认'} · ${new Date(result.fetchedAt).toLocaleTimeString('zh-CN', {hour12:false})} · 下次自动刷新约${Math.round(marketRefreshIntervalMs(result.sessionPhase)/60000)}分钟`
+    ? `${result.sessionPhase?.label || result.observationPhase?.label || '时点待确认'} · ${new Date(result.fetchedAt).toLocaleTimeString('zh-CN', {hour12:false})} · 下次自动刷新约${Math.round(marketRefreshIntervalMs(result.sessionPhase)/60000)}分钟${result.dataRoot ? ' · 数据目录已确认' : ''}`
     : '等待更新';
+  $('marketUpdated').title = result.dataRoot ? `当前数据根：${result.dataRoot}` : '';
   $('marketIndices').innerHTML = (result.indices || []).map(index => `<div class="market-index">
     <div><b>${escapeHtml(index.name)}</b><span> ${escapeHtml(index.code)}</span></div>
     <div class="${pctClass(index.changePct)}"><b>${formatNumber(index.price)}</b><span> ${formatPct(index.changePct)}</span></div>
@@ -505,6 +506,7 @@ function renderMarketOverview(result){
   latestMarketMomentumRecommendations = recommendationPools.momentum;
   latestMarketShortReboundCandidates = shortReboundCandidates;
   const coverage = result.recommendationCoverage || {};
+  const matrix = coverage.dataCoverageMatrix || {};
   const experiment = coverage.strategyExperiment || {};
   const strategyNames = {
     'trend-breakout':'趋势突破','consolidation-breakout':'整理突破','first-pullback':'首次回踩','rebound':'反弹',
@@ -548,8 +550,11 @@ function renderMarketOverview(result){
   if(signals.other) signalSummary.push(`其他 ${signals.other}`);
   const fullMarketCoverage = coverage.fullMarketHistoryCovered
     ? `；${coverage.fullMarketHistoryDate || '历史'}全量历史 ${coverage.fullMarketHistoryCovered} 只、历史候选 ${coverage.fullMarketCandidates || 0} 只（本轮可重新核验 ${coverage.fullMarketPending || 0} 只）` : '';
+  const matrixText = matrix.quotes
+    ? `；字段覆盖：行情 ${matrix.quotes.usable}/${matrix.quotes.expected || matrix.quotes.received}，历史 ${matrix.history?.usable || 0}/${matrix.history?.received || 0}，财务 ${matrix.financial?.usable || 0}/${matrix.financial?.received || 0}，逐日资金 ${matrix.fundFlow?.usable || 0}/${matrix.fundFlow?.received || 0}，板块多日资金 ${matrix.sectors?.usable || 0}/${matrix.sectors?.received || 0}；正式推荐账本${matrix.recommendations?.status === 'available' ? `可用（${matrix.recommendations.batches}个账本文件）` : '缺失'}`
+    : '';
   $('marketRecommendationCoverage').textContent = coverage.scanned
-    ? `全市场扫描 ${coverage.scanned} 只，初筛 ${coverage.prefiltered || 0} 只，本轮在线精筛 ${coverage.analyzed || 0} 只${fullMarketCoverage}，覆盖 ${coverage.industries || 0} 个已确认行业${unresolvedIndustryCoverage}${accumulationCoverage}${riskCoverage}${outcomeCoverage}；${tierSummary}实际展示 ${recommendations.length} 只（${signalSummary.join('，')}）${fallbackNote}`
+    ? `全市场扫描 ${coverage.scanned} 只，初筛 ${coverage.prefiltered || 0} 只，本轮在线精筛 ${coverage.analyzed || 0} 只${fullMarketCoverage}，覆盖 ${coverage.industries || 0} 个已确认行业${unresolvedIndustryCoverage}${accumulationCoverage}${riskCoverage}${outcomeCoverage}${matrixText}；${tierSummary}实际展示 ${recommendations.length} 只（${signalSummary.join('，')}）${fallbackNote}`
     : '等待全市场扫描';
   const gateLabels = {'no-chase':'不宜追高','context-risk':'环境或公司风险','recent-capital-outflow':'阶段资金转弱',
     'technical-score':'技术评分不足','signal-not-confirmed':'形态尚未确认','signal-score':'综合评分不足',

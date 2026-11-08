@@ -145,8 +145,10 @@ function within(directory,file) {
 
 async function runAudit(options) {
   validateOptions(options);
-  const root = await fs.promises.realpath(path.resolve(options.root));
-  const output = await canonicalDirectory(path.resolve(options.output || path.join(root,'cache','strategy-audits')));
+  const requestedRoot = path.resolve(options.root);
+  const root = await fs.promises.realpath(requestedRoot);
+  const requestedOutput = path.resolve(options.output || path.join(requestedRoot,'cache','strategy-audits'));
+  const output = await canonicalDirectory(requestedOutput);
   const business = await canonicalDirectory(path.join(root,'data'));
   if (within(business,output) || output === root || output === path.join(root,'cache'))
     throw new Error('Audit output must not be a business directory');
@@ -328,7 +330,10 @@ async function runAudit(options) {
             'Files freeze sequentially, not as a cross-file database transaction; hashes describe exactly the bytes parsed.']}}};
     const evidenceFile = path.join(runDirectory,'evidence.json');
     await fs.promises.writeFile(evidenceFile,JSON.stringify(evidence,null,2)+'\n',{flag:'wx',mode:0o600});
-    return {runId,evidenceFile,evidence};
+    // Keep the public path under the caller-provided root. On Windows realpath()
+    // can expand an 8.3 temp path, which makes a valid audit appear to have
+    // escaped its requested root even though both paths point to the same file.
+    return {runId,evidenceFile:path.join(requestedOutput,runId,'evidence.json'),evidence};
   } finally {
     // Raw ledgers are temporary; no user-state byte copy is persisted.
     await fs.promises.rm(snapshotDirectory,{recursive:true,force:true});

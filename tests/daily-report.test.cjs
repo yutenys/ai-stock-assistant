@@ -10,10 +10,21 @@ const {
   selectPublishedBatch,
   selectPublishedBatchStatus,
   classifyRecommendationRole,
+  favoriteSummary,
   buildDailyReport,
   renderDailyReportHtml,
   reconstructLegacyPortfolio
 } = require('../lib/daily-report');
+
+test('收藏评价使用冻结时点的大盘和行业基准计算同期超额',()=>{
+  const summary=favoriteSummary([{code:'600001',label:'观察',referencePrice:10,currentPrice:12,
+    marketReturnPct:10,industryReturnPct:25}]);
+  assert.equal(summary.averageReturnPct,20);
+  assert.equal(summary.averageMarketExcessReturnPct,10);
+  assert.equal(summary.averageIndustryExcessReturnPct,-5);
+  assert.equal(summary.marketBenchmarkCount,1);
+  assert.match(summary.caveats[0],/大盘超额10%/);
+});
 
 test('历史报告只使用截止报告日的模拟成交重建持仓',()=>{
   const trades=[
