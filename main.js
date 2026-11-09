@@ -74,7 +74,7 @@ let marketDirectorySavedAt = 0;
 const CONTROLLED_VOLUME_MIN = 1.5;
 const CONTROLLED_VOLUME_MAX = 4;
 const SECTOR_CAPITAL_FALLBACK_MAX_AGE_MS = 72 * 60 * 60 * 1000;
-const RECOMMENDATION_MODEL_VERSION = '2026-11-08-multifactor-evidence-v28';
+const RECOMMENDATION_MODEL_VERSION = '2026-11-09-rebound-evidence-v29';
 const STRATEGY_DATA_CONTRACT_VERSION = '2026-11-08-evidence-v3';
 const IMPLEMENTATION_VERSION = process.env.STOCK_ASSISTANT_BUILD_SHA
   ? `git-${String(process.env.STOCK_ASSISTANT_BUILD_SHA).slice(0,12)}` : `app-${APPLICATION_VERSION}`;

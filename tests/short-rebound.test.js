@@ -37,12 +37,24 @@ test('R3要求板块扩散资金和个股相对强度共同确认', () => {
   const history=bars({drift:.02,volume:100});
   history.at(-1).close += .8;
   history.at(-1).high = history.at(-1).close + .18;
-  const result=evaluateShortRebound({bars:history,quote:{changePct:3,rotationProfiles:[{
-    name:'AI应用',upRatio:.72,mainNetInflow:2e8,averageChangePct:.5,rotationScore:82
+  const result=evaluateShortRebound({bars:history,quote:{changePct:3,tradeDate:'2026-11-09',rotationProfiles:[{
+    name:'AI应用',upRatio:.72,mainNetInflow:2e8,averageChangePct:.5,rotationScore:82,capitalTradeDate:'2026-11-09'
   }]},observationPhase:{phase:'closed'}});
   assert.equal(result.matched,true);
   assert.equal(result.route,'R3');
   assert.ok(result.evidence.some(value=>value.includes('板块')));
+});
+
+test('R3不能用评分替代资金，旧资金和弱于板块均不通过', () => {
+  const history=bars({drift:.02});
+  history.at(-1).close+=.8;
+  history.at(-1).high=history.at(-1).close+.18;
+  for(const extra of [{mainNetInflow:null},{capitalTradeDate:'2026-11-06'},{capitalEstimated:true},{averageChangePct:4}]) {
+    const result=evaluateShortRebound({bars:history,quote:{changePct:3,tradeDate:'2026-11-09',rotationProfiles:[{
+      name:'测试',upRatio:.8,rotationScore:90,mainNetInflow:1e8,capitalTradeDate:'2026-11-09',averageChangePct:1,...extra
+    }]}});
+    assert.notEqual(result.route,'R3');
+  }
 });
 
 test('爆量或大涨只标记过热不生成可执行结论', () => {
