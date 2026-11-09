@@ -667,13 +667,17 @@ test('短线修复影子候选单列且不计入正式推荐表现', () => {
   const report=buildDailyReport({tradeDate:'2026-11-06',stable:[],momentum:[],shortReboundCandidates:[{
     code:'600001',name:'测试修复',industry:'电子',shortRebound:{type:'超跌首修复',state:'condition-pending',score:72,
       resistance:10.5,invalidation:9.4,summary:'低点稳定，等待量价确认。'}
-  }],publishedOutcomes:{horizons:[1],counts:{publishedBatches:0,publishedSignals:0,episodes:0},
+  }],shortReboundWatchCandidates:[{code:'600002',name:'观察修复',industry:'电子',
+    shortRebound:{type:'强趋势回踩修复',state:'condition-pending'},
+    shortReboundSelection:{reasons:['收益风险比不足2']} }],publishedOutcomes:{horizons:[1],counts:{publishedBatches:0,publishedSignals:0,episodes:0},
     shortReboundShadow:{counts:{publishedSignals:2,episodes:1},note:'仅作发布后观察',
       horizonSummaries:{1:{count:1,meanReturnPct:2.5,medianReturnPct:2.5,immature:0,missing:0}}}}});
   assert.equal(report.recommendations.all.length,0);
   assert.equal(report.shortReboundCandidates.length,1);
+  assert.equal(report.shortReboundWatchCandidates.length,1);
   const html=renderDailyReportHtml(report);
-  assert.match(html,/短线修复影子观察/);
+  assert.match(html,/短线修复精选影子/);
+  assert.match(html,/收益风险比不足2/);
   assert.match(html,/不纳入正式推荐收益/);
   assert.match(html,/短线修复发布后观察/);
   assert.match(html,/class="up">\+2\.50%/);

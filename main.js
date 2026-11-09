@@ -14,6 +14,7 @@ const {atomicWriteJson, readJsonWithBackup, ResearchJobStore, StockHistoryStore}
 const {UserStateStore} = require('./lib/user-state-store');
 const {selectHistorySource} = require('./lib/history-source-selection');
 const {evaluateShortRebound, mergeShortReboundLifecycle} = require('./lib/short-rebound');
+const {selectShortReboundCandidates} = require('./lib/short-rebound-selection');
 const {filterPointInTimeRows,analyzePricePath,assessRequestedRange,buildCoverageMatrix,markDuplicateSectorCapital} = require('./lib/market-factor-evidence');
 const {
   FundFlowHistoryStore,
@@ -74,7 +75,7 @@ let marketDirectorySavedAt = 0;
 const CONTROLLED_VOLUME_MIN = 1.5;
 const CONTROLLED_VOLUME_MAX = 4;
 const SECTOR_CAPITAL_FALLBACK_MAX_AGE_MS = 72 * 60 * 60 * 1000;
-const RECOMMENDATION_MODEL_VERSION = '2026-11-09-rebound-evidence-v29';
+const RECOMMENDATION_MODEL_VERSION = '2026-11-09-rebound-selective-v30';
 const STRATEGY_DATA_CONTRACT_VERSION = '2026-11-08-evidence-v3';
 const IMPLEMENTATION_VERSION = process.env.STOCK_ASSISTANT_BUILD_SHA
   ? `git-${String(process.env.STOCK_ASSISTANT_BUILD_SHA).slice(0,12)}` : `app-${APPLICATION_VERSION}`;
@@ -2979,7 +2980,8 @@ function buildRecommendationLedgerEntry(result) {
     recommendations:[...(result?.recommendations || []),...(result?.planTracking || []).filter(row=>row.track === 'A')].map(item => compact(item, 'A')),
     momentumRecommendations:[...(result?.momentumRecommendations || []),...(result?.planTracking || []).filter(row=>row.track === 'B')].map(item => compact(item, 'B')),
     shortReboundCandidates:(result?.shortReboundCandidates || []).map(item => ({...compact(item, 'R'),
-      shortRebound:item.shortRebound,shadowOnly:true,entryPermission:'shadow-only',triggeredAt:'',
+      shortRebound:item.shortRebound,shortReboundSelection:item.shortReboundSelection,
+      shadowOnly:true,entryPermission:'shadow-only',triggeredAt:'',
       triggerEvent:null,researchEntryEligible:false,strategyDecision:item.strategyDecision
         ? {...item.strategyDecision,entryPermission:'shadow-only',actionStatus:'shadow-only'} : null})),
     rejectedCandidates:result?.recommendationCoverage?.rejectedCandidates || []
@@ -4476,6 +4478,8 @@ function restoreCachedMarketRecommendations(result, cachedOverview, marketQuotes
   if (!(result.shortReboundCandidates || []).length && reuse && cachedModelCurrent) {
     result.shortReboundCandidates = mergeShortReboundLifecycle(cachedOverview.shortReboundCandidates || [],
       cachedOverview.shortReboundCandidates || []);
+    result.shortReboundWatchCandidates = cachedOverview.shortReboundWatchCandidates || [];
+    result.shortReboundHistory = cachedOverview.shortReboundHistory || [];
   }
   const signals = result.recommendations.reduce((counts, item) => {
     counts[recommendationSignalFamily(item.signal)] += 1;
@@ -5434,23 +5438,25 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
     item.momentumDecision?.passed && item.newsLabel !== '消息谨慎'
     && item.riskProfile?.status !== 'risk')));
   let momentumRecommendations = momentumResolution.items;
-  const approvedShortRebound = riskApprovedRecommendations.filter(item => item.shortRebound?.matched
-    && !['invalid','overheated'].includes(item.shortRebound.state))
-    .map(item => [item.code,item]);
-  let shortReboundCandidates = [...new Map([
-    ...approvedShortRebound,
-    ...recommendations.filter(item => item.shortRebound?.matched && ['invalid','overheated'].includes(item.shortRebound.state))
-      .map(item => [item.code,{...item,riskProfile:{status:'not-attempted',reason:'结构已失效或过热，不执行公司风险核验'}}])
-  ]).values()].sort((a,b) => Number(b.shortRebound.score) - Number(a.shortRebound.score)).slice(0, 40)
+  const approvedShortRebound = new Map(riskApprovedRecommendations.filter(item => item.shortRebound?.matched)
+    .map(item => [item.code,item]));
+  let shortReboundPool = recommendations.filter(item => item.shortRebound?.matched).map(item => {
+    const approved = approvedShortRebound.get(item.code);
+    return approved || {...item,riskProfile:trackingRisk.get(item.code) || item.riskProfile || {
+      status:['invalid','overheated'].includes(item.shortRebound?.state) ? 'not-attempted' : 'unknown',
+      reason:'公司风险未通过完整核验'
+    }};
+  }).sort((a,b) => Number(b.shortRebound.score) - Number(a.shortRebound.score)).slice(0, 40)
     .map(item => {
       const timing = item.executionTiming || executionWindow(item.shortRebound.observedAt || Date.now());
       const shortPlan = {setupType:item.shortRebound.route,confirmationPrice:item.shortRebound.resistance,
         invalidationPrice:item.shortRebound.invalidation,earliestBuyDate:timing.buyDate,
-        earliestSellDate:timing.sellDate,entryExpiryDate:timing.sellDate ? nextTradingDay(timing.sellDate) : null,
+        earliestSellDate:timing.sellDate,entryExpiryDate:nextTradingDay(item.shortRebound.tradeDate || recommendationTradeDate),
         trigger:`完整收盘站上${item.shortRebound.resistance}元且量比处于1.5-4.0倍`,
         invalidation:`收盘跌破${item.shortRebound.invalidation}元或修复结构不再成立`,
         enabled:false,researchEntryEligible:false,shadowOnly:true};
       return {...item, signal:`短线${item.shortRebound.type}`, recommendationTier:'短线修复影子',
+        recommendationModelVersion:RECOMMENDATION_MODEL_VERSION,
         shortRebound:{...item.shortRebound,tradePlan:shortPlan},executionTiming:timing,
         signalScore:item.shortRebound.detectionScore ?? item.shortRebound.score,
         score:item.shortRebound.detectionScore ?? item.shortRebound.score,
@@ -5460,8 +5466,22 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
         })[item.shortRebound.state] || '影子观察',
           summary:item.shortRebound.summary}};
     });
-  shortReboundCandidates = mergeShortReboundLifecycle(shortReboundCandidates,
-    marketOverviewCache?.value?.shortReboundCandidates || []).slice(0, 40);
+  const previousShortRebound = [
+    ...(marketOverviewCache?.value?.shortReboundCandidates || []),
+    ...(marketOverviewCache?.value?.shortReboundWatchCandidates || []),
+    ...(marketOverviewCache?.value?.shortReboundHistory || [])
+  ];
+  shortReboundPool = mergeShortReboundLifecycle(shortReboundPool, previousShortRebound).slice(0, 40);
+  const shortReboundSelection = selectShortReboundCandidates(shortReboundPool, {
+    tradeDate:recommendationTradeDate,
+    marketRegime:marketAssessmentContext.marketRegime,
+    observedAt:new Date(observedAt).toISOString(),
+    previousState:readDiskCache('short-rebound-publication', 14 * 86400000)
+  });
+  await writeDiskCache('short-rebound-publication', shortReboundSelection.publicationState);
+  const shortReboundCandidates = shortReboundSelection.selected;
+  const shortReboundWatchCandidates = shortReboundSelection.watch.slice(0, 20);
+  const shortReboundHistory = shortReboundSelection.history.slice(0, 20);
   const riskScoreRejected = stableRiskApprovedRecommendations.length
     - strictRiskApprovedRecommendations.length - watchRiskApprovedRecommendations.length;
   riskUnverifiedIncluded = finalRiskApprovedRecommendations.filter(item => item.riskUnverified).length;
@@ -5554,6 +5574,8 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
     recommendations: groupedRecommendations,
     momentumRecommendations,
     shortReboundCandidates,
+    shortReboundWatchCandidates,
+    shortReboundHistory,
     planTrackingCandidates:recommendations.filter(item=>plannedCodes.has(item.code))
       .map(item=>({...item,riskProfile:trackingRisk.get(item.code) || {status:'unknown'}})),
     backgroundCandidates:backgroundWatch.map(item => ({code:item.code,name:item.name,industry:item.industry,signal:item.signal,
@@ -5610,17 +5632,18 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
       shortReboundReserved:shortReboundScreened.length,
       shortReboundMatched:analyzed.filter(item => item.shortRebound?.matched).length,
       shortReboundQualified:shortReboundCandidates.length,
+      shortReboundSelection:shortReboundSelection.summary,
       shortReboundFunnel:{
         scanned:scored.length,prefiltered:shortReboundScreened.length,
         queued:new Set(candidates.filter(item => shortReboundScreened.some(row => row.code === item.code)).map(item => item.code)).size,
         analyzed:analyzed.filter(item => shortReboundScreened.some(row => row.code === item.code)).length,
         matched:analyzed.filter(item => item.shortRebound?.matched).length,
-        states:shortReboundCandidates.reduce((counts,item)=>{const state=item.shortRebound?.state || 'unknown';counts[state]=(counts[state]||0)+1;return counts;},{}),
+        states:shortReboundPool.reduce((counts,item)=>{const state=item.shortRebound?.state || 'unknown';counts[state]=(counts[state]||0)+1;return counts;},{}),
         reasons:{
           notScanned:Math.max(0,scored.length-shortReboundScreened.length),
           queuedBudget:shortReboundScreened.filter(row=>!candidates.some(item=>item.code === row.code)).length,
           earlyNoEntry:analyzed.filter(item=>!item.shortRebound?.matched).length,
-          untradable:shortReboundCandidates.filter(item=>['invalid','overheated'].includes(item.shortRebound?.state)).length
+          untradable:shortReboundHistory.length
         }
       },
       shortReboundMarketWindow:{
@@ -5860,6 +5883,8 @@ async function fetchMarketOverview(force = false, favoriteOutcomes = [], onProgr
       result.recommendationsComputed = true;
       result.momentumRecommendations = recommendationsResult.value.momentumRecommendations;
       result.shortReboundCandidates = recommendationsResult.value.shortReboundCandidates;
+      result.shortReboundWatchCandidates = recommendationsResult.value.shortReboundWatchCandidates;
+      result.shortReboundHistory = recommendationsResult.value.shortReboundHistory;
       result.recommendationCoverage = recommendationsResult.value.coverage;
       result.recommendationCoverage.marketRegimeSignature = marketRegimeSignature;
       if (result.recommendationCoverage.fundFlowErrors?.length) {
@@ -5900,6 +5925,8 @@ async function fetchMarketOverview(force = false, favoriteOutcomes = [], onProgr
   result.recommendations ||= [];
   result.momentumRecommendations ||= [];
   result.shortReboundCandidates ||= [];
+  result.shortReboundWatchCandidates ||= [];
+  result.shortReboundHistory ||= [];
   const restoredRecommendations = restoreCachedMarketRecommendations(result, previousOverview, snapshotResult.value?.quotes || []);
   const themesByCode = new Map();
   for (const sector of result.sectors) {
@@ -5918,6 +5945,8 @@ async function fetchMarketOverview(force = false, favoriteOutcomes = [], onProgr
   result.recommendations = result.recommendations.map(withThemeEvidence);
   result.momentumRecommendations = result.momentumRecommendations.map(withThemeEvidence);
   result.shortReboundCandidates = result.shortReboundCandidates.map(withThemeEvidence);
+  result.shortReboundWatchCandidates = result.shortReboundWatchCandidates.map(withThemeEvidence);
+  result.shortReboundHistory = result.shortReboundHistory.map(withThemeEvidence);
   if (restoredRecommendations) result.warnings.push(`技术形态候选本轮未生成，已回退最近一次成功推荐（${result.recommendations.length}只）`);
   result.recommendationCoverage ||= { scanned: snapshotResult.value?.quotes?.length || 0, prefiltered: 0, analyzed: 0, industries: 0, directoryAvailable: false };
   result.newsContext ||= summarizeNews([]);
@@ -5948,6 +5977,8 @@ async function fetchMarketOverview(force = false, favoriteOutcomes = [], onProgr
         .map(attachRecommendationMetadata);
       fallback.momentumRecommendations = [];
       fallback.shortReboundCandidates = [];
+      fallback.shortReboundWatchCandidates = [];
+      fallback.shortReboundHistory = [];
       if (fallback.recommendationCoverage?.modelVersion !== RECOMMENDATION_MODEL_VERSION) {
         fallback.momentumRecommendations = [];
         fallback.recommendationCoverage = {
@@ -9898,7 +9929,14 @@ async function buildDailyReportInput(tradeDate, {force = false, manual = false} 
       shadowOnly:true,promotionAllowed:false},
     shortReboundCandidates:(overview?.shortReboundCandidates || []).map(item => ({code:item.code,name:item.name,
       industry:item.industry,price:item.price,changePct:item.changePct,shortRebound:item.shortRebound,
-      entryPermission:'shadow-only',recommendationTier:'短线修复影子'})),
+      shortReboundSelection:item.shortReboundSelection,
+      entryPermission:'shadow-only',recommendationTier:'短线修复精选影子'})),
+    shortReboundWatchCandidates:(overview?.shortReboundWatchCandidates || []).map(item => ({code:item.code,name:item.name,
+      industry:item.industry,price:item.price,changePct:item.changePct,shortRebound:item.shortRebound,
+      shortReboundSelection:item.shortReboundSelection,entryPermission:'shadow-only',recommendationTier:'短线修复观察'})),
+    shortReboundHistory:(overview?.shortReboundHistory || []).map(item => ({code:item.code,name:item.name,
+      industry:item.industry,price:item.price,changePct:item.changePct,shortRebound:item.shortRebound,
+      shortReboundSelection:item.shortReboundSelection,entryPermission:'shadow-only',recommendationTier:'短线修复历史'})),
     sectors:compactReportSectors(overview?.sectors || savedMarket?.sectors || []),
     stable,
     momentum,

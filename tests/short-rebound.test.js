@@ -11,8 +11,17 @@ function bars({start=20, drift=.04, pullback=0, volume=100}={}) {
   });
 }
 
+function r2Bars(volume=90) {
+  const history=bars({drift:.12,volume:100});
+  const closes=[28.8,27.85,27.6,27.4,27.3,27.35,27.5,27.7,27.9,28];
+  closes.forEach((close,index)=>Object.assign(history[70+index],{
+    open:close-.05,high:close+.18,low:close-.18,close,volume:index === 9 ? volume : 80
+  }));
+  return history;
+}
+
 test('R2识别缩量回踩修复且保持影子权限', () => {
-  const history=bars({drift:.12,pullback:.7,volume:90});
+  const history=r2Bars();
   const result=evaluateShortRebound({bars:history,quote:{changePct:1},observationPhase:{phase:'closed'}});
   assert.equal(result.matched,true);
   assert.equal(result.route,'R2');
@@ -21,6 +30,15 @@ test('R2识别缩量回踩修复且保持影子权限', () => {
   assert.ok(result.missingEvidence.some(value=>value.includes('历史分钟资金未取得')));
   assert.ok(Number.isFinite(result.detectionScore) && Number.isFinite(result.executionScore));
   assert.notEqual(result.detectionScore,result.executionScore);
+});
+
+test('R2四项证据缺一不可', () => {
+  const history=r2Bars();
+  history.at(-1).close = history.at(-2).close - 1;
+  history.at(-1).high = history.at(-1).close + .18;
+  history.at(-1).low = history.at(-1).close - .18;
+  const result=evaluateShortRebound({bars:history,quote:{changePct:-2},observationPhase:{phase:'closed'}});
+  assert.notEqual(result.route,'R2');
 });
 
 test('R1识别深回撤后低点企稳和短线修复', () => {
@@ -57,8 +75,16 @@ test('R3不能用评分替代资金，旧资金和弱于板块均不通过', () 
   }
 });
 
+test('R3不把已经持续拉升的股票重复标记为首启动', () => {
+  const history=bars({drift:.18});
+  const result=evaluateShortRebound({bars:history,quote:{changePct:2,tradeDate:'2026-11-09',rotationProfiles:[{
+    name:'测试',upRatio:.8,mainNetInflow:1e8,capitalTradeDate:'2026-11-09',averageChangePct:.5
+  }]},observationPhase:{phase:'closed'}});
+  assert.notEqual(result.route,'R3');
+});
+
 test('爆量或大涨只标记过热不生成可执行结论', () => {
-  const history=bars({drift:.12,pullback:.7,volume:500});
+  const history=r2Bars(500);
   const result=evaluateShortRebound({bars:history,quote:{changePct:9},observationPhase:{phase:'closed'}});
   assert.equal(result.matched,true);
   assert.equal(result.state,'overheated');
@@ -73,7 +99,7 @@ test('跌势中继不冒充超跌首修复', () => {
 });
 
 test('涨停附近即使结构匹配也只能标记过热禁追', () => {
-  const history=bars({drift:.12,pullback:.7,volume:100});
+  const history=r2Bars(100);
   const result=evaluateShortRebound({bars:history,quote:{changePct:9.8,upperLimit:history.at(-1).close},observationPhase:{phase:'closed'}});
   assert.equal(result.matched,true);
   assert.equal(result.state,'overheated');

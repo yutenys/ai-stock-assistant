@@ -5,7 +5,7 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "test": "node --test tests/smoke.test.js tests/renderer-logic.test.js tests/strategy-replay.test.js tests/strategy-platform.test.js tests/persistence.test.js tests/fund-flow-history.test.js tests/research-account.test.js tests/trade-time.test.js tests/daily-report.test.cjs tests/recommendation-outcomes.test.js tests/entry-plans.test.js tests/strategy-audit.test.js tests/strategy-experiments.test.js tests/market-evidence.test.js tests/intraday-structure.test.js tests/theme-entry.test.js tests/theme-regime.test.js tests/theme-shadow-experiments.test.js tests/history-source-selection.test.js tests/short-rebound.test.js tests/data-coverage-audit.test.js tests/market-factor-evidence.test.js",
+    "test": "node --test tests/smoke.test.js tests/renderer-logic.test.js tests/strategy-replay.test.js tests/strategy-platform.test.js tests/persistence.test.js tests/fund-flow-history.test.js tests/research-account.test.js tests/trade-time.test.js tests/daily-report.test.cjs tests/recommendation-outcomes.test.js tests/entry-plans.test.js tests/strategy-audit.test.js tests/strategy-experiments.test.js tests/market-evidence.test.js tests/intraday-structure.test.js tests/theme-entry.test.js tests/theme-regime.test.js tests/theme-shadow-experiments.test.js tests/history-source-selection.test.js tests/short-rebound.test.js tests/short-rebound-selection.test.js tests/data-coverage-audit.test.js tests/market-factor-evidence.test.js",
     "audit:strategy": "node scripts/audit-strategy-window.cjs",
     "replay:experiments": "node scripts/replay-strategy-experiments.cjs",
     "test:ui": "electron tests/ui-smoke.js",

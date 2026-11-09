@@ -218,7 +218,7 @@ function compactFavoriteStock(stock={}){
     'mainInflow','mainOutflow','fundFlowDate','fundFlowObservedAt','fundFlowSource','fundFlowStatus','tradeDate',
     'quoteObservedAt','source','fetchedAt','stale','technicalScore','score','signalScore','relevanceScore','canslim',
     'holdingProfile','holdingPeriod','marketSignal','newsLabel','recommendationModelVersion','signalId','planId','analysisId',
-    'shortRebound','entryPermission','strategyDecision',
+    'shortRebound','shortReboundSelection','recommendationTier','entryPermission','strategyDecision',
     'favoriteEntrySnapshotRef'];
   const compact = {};
   for(const field of fields) if(stock[field] !== undefined) compact[field] = stock[field];
@@ -249,7 +249,10 @@ function labelStockSnapshot(stock, existingStock=null){
         industryBenchmark:industryBenchmark
           ? {code:industryBenchmark.code,name:industryBenchmark.name,price:Number(industryBenchmark.price)} : null,
         modelVersion:stock.recommendationModelVersion || '',
-        sourceType:stock.recommendationContext?.sourceType || (stock.recommendationModelVersion ? 'recommendation' : 'manual'),
+        sourceType:stock.shortReboundSelection?.tier === 'selected' ? 'short-rebound-selected'
+          : stock.recommendationContext?.sourceType || (stock.recommendationModelVersion ? 'recommendation' : 'manual'),
+        firstPublishedAt:stock.shortReboundSelection?.firstPublishedAt || '',
+        planVersion:stock.shortRebound?.tradePlan?.planVersion || '',
         signalId:stock.signalId || '',
         planId:stock.planId || stock.planState?.planId || '',
         planRevision:stock.planRevision || stock.planState?.revision || null,
@@ -425,7 +428,8 @@ function recommendationCardHtml(item, selectable=false){
   const industry = recommendationIndustry(item);
   const sectorLabel = item.factorAnalysis?.sectorProfile?.label || '板块待确认';
   const changeClass = Number.isFinite(item.changePct) ? pctClass(item.changePct) : 'neutral';
-  const scoreLabel = ['观察候选','环境观察','短线修复影子'].includes(item.recommendationTier) ? '观察评分' : '推荐评分';
+  const scoreLabel = ['观察候选','环境观察'].includes(item.recommendationTier)
+    || String(item.recommendationTier || '').startsWith('短线修复') ? '观察评分' : '推荐评分';
   const verdictLabel = item.signal === '强势追踪' || item.recommendationTier === '环境观察' ? item.entryAssessment?.status : item.verdict;
   const confidence = item.dataConfidence ? `数据可信度 ${item.dataConfidence.label} ${item.dataConfidence.available}/${item.dataConfidence.total}` : '数据可信度待评估';
   const unifiedScore = item.scoreCard?.recommendation ?? item.signalScore ?? item.score;
@@ -500,6 +504,8 @@ function renderMarketOverview(result){
   const recommendations = result.recommendations || [];
   const momentumRecommendations = result.momentumRecommendations || [];
   const shortReboundCandidates = result.shortReboundCandidates || [];
+  const shortReboundWatchCandidates = result.shortReboundWatchCandidates || [];
+  const shortReboundHistory = result.shortReboundHistory || [];
   const recommendationPools = marketRecommendationPools(recommendations, momentumRecommendations);
   latestMarketRecommendations = recommendationPools.strict;
   latestMarketWatchRecommendations = recommendationPools.watch;
@@ -620,21 +626,30 @@ function renderMarketOverview(result){
   const shortFunnel = coverage.shortReboundFunnel;
   const shortFunnelText = shortFunnel ? ` 全市场可见 ${shortFunnel.scanned} 只，轻筛 ${shortFunnel.prefiltered} 只，进入在线预算 ${shortFunnel.queued} 只，完成历史分析 ${shortFunnel.analyzed} 只，命中 ${shortFunnel.matched} 只。` : '';
   $('marketShortReboundCoverage').textContent = shortReboundCandidates.length
-    ? `R1超跌首修复、R2强趋势回踩修复、R3题材共振首启动共 ${shortReboundCandidates.length} 只；仅作影子观察，不改变买入许可或正式推荐统计。${shortFunnelText}`
-    : `本轮未识别到满足证据要求的短线修复候选。${shortFunnelText}`;
+    ? `精选 ${shortReboundCandidates.length} 只，观察 ${shortReboundWatchCandidates.length} 只；同主题最多1只、同时最多3只、每日新增最多5只。前瞻验收需40个交易日及100个成熟可执行样本，当前保持影子验证。${shortFunnelText}`
+    : `本轮没有通过行情、真实资金、风险和收益风险比全部门槛的精选候选；观察 ${shortReboundWatchCandidates.length} 只。允许空结果；前瞻验收需40个交易日及100个成熟可执行样本。${shortFunnelText}`;
   $('marketShortReboundRecommendations').innerHTML = shortReboundCandidates.length
     ? groupedRecommendationHtml(recommendationPreview(shortReboundCandidates, 10))
     : '<div class="market-row"><span>当前没有短线修复影子候选</span></div>';
   $('addMarketShortReboundRecommendations').textContent = `查看更多（${shortReboundCandidates.length}）`;
   $('addMarketShortReboundRecommendations').disabled = !shortReboundCandidates.length;
   $('marketShortReboundCount').textContent = shortReboundCandidates.length;
+  $('marketShortReboundWatchCount').textContent = shortReboundWatchCandidates.length;
+  $('marketShortReboundHistoryCount').textContent = shortReboundHistory.length;
+  $('marketShortReboundWatchRecommendations').innerHTML = shortReboundWatchCandidates.length
+    ? groupedRecommendationHtml(recommendationPreview(shortReboundWatchCandidates, 10))
+    : '<div class="market-row"><span>当前没有观察候选</span></div>';
+  $('marketShortReboundHistory').innerHTML = shortReboundHistory.length
+    ? groupedRecommendationHtml(recommendationPreview(shortReboundHistory, 10))
+    : '<div class="market-row"><span>本轮没有失效或过热候选</span></div>';
   setMarketRecommendationTrack(activeMarketRecommendationTrack);
   const marketNews = result.newsContext?.items || [];
   const decisionNews = result.newsContext?.decisionItems || [];
   const newsReason = result.components?.news?.reason;
   $('marketNews').innerHTML = `<div class="market-stocks">${escapeHtml(newsReason || result.newsContext?.summary || '消息面暂不可用')}</div>${decisionNews.length ? `<div class="market-coverage">影响本轮判断：${escapeHtml(decisionNews.map(item => `${item.title}（${item.weightedScore > 0 ? '+' : ''}${item.weightedScore}）`).join('；'))}</div>` : ''}${marketNews.slice(0, 5).map(item => `<a class="market-news-row" href="#" data-market-news-link="${escapeHtml(safeHttpUrl(item.link))}">${escapeHtml(item.title)}<span>${escapeHtml(item.source || '')} · ${escapeHtml(item.publishedAt || '')}</span></a>`).join('')}`;
   document.querySelectorAll('[data-market-recommendation]').forEach(button => button.onclick = () => {
-    const item = [...recommendations, ...momentumRecommendations, ...shortReboundCandidates].find(candidate => candidate.code === button.dataset.marketRecommendation);
+    const item = [...recommendations, ...momentumRecommendations, ...shortReboundCandidates,
+      ...shortReboundWatchCandidates, ...shortReboundHistory].find(candidate => candidate.code === button.dataset.marketRecommendation);
     if(!item) return;
     const stock = normalizedMarketRecommendation(item);
     stocks = [stock];
