@@ -200,6 +200,20 @@ test('盘后首发不计当日平盘，旧仓缺价只披露已核验部分', ()
   assert.equal(report.portfolio.legacy.accountEquity,null);
 });
 
+test('历史模拟账户披露最大赢家贡献和剔除最大赢家后的盈亏',()=>{
+  const report=buildDailyReport({tradeDate:'2026-10-09',closingQuotes:[
+    {code:'600001',price:15,changePct:5,tradeDate:'2026-10-09',isFinal:true},
+    {code:'600002',price:8,changePct:-2,tradeDate:'2026-10-09',isFinal:true}],
+  portfolio:{legacy:{positions:[
+    {code:'600001',name:'甲',quantity:100,costPrice:10},
+    {code:'600002',name:'乙',quantity:100,costPrice:10}]}}});
+  assert.equal(report.portfolio.legacy.coveredUnrealizedPnl,300);
+  assert.equal(report.portfolio.legacy.bestContributor.code,'600001');
+  assert.equal(report.portfolio.legacy.bestContributor.pnl,500);
+  assert.equal(report.portfolio.legacy.pnlExBest,-200);
+  assert.equal(report.portfolio.legacy.topPositiveContributionPct,100);
+});
+
 test('报告分开展示已发布推荐观察表现和可模拟成交计数', () => {
   const publishedOutcomes={dataStatus:'retrospective-local-history',horizons:[1],counts:{
     publishedSignals:2,episodes:1,execution:{executable:0,unfilled:1,unverified:0}

@@ -75,7 +75,7 @@ let marketDirectorySavedAt = 0;
 const CONTROLLED_VOLUME_MIN = 1.5;
 const CONTROLLED_VOLUME_MAX = 4;
 const SECTOR_CAPITAL_FALLBACK_MAX_AGE_MS = 72 * 60 * 60 * 1000;
-const RECOMMENDATION_MODEL_VERSION = '2026-11-09-rebound-selective-v30';
+const RECOMMENDATION_MODEL_VERSION = '2026-11-10-evidence-repair-v31';
 const STRATEGY_DATA_CONTRACT_VERSION = '2026-11-08-evidence-v3';
 const IMPLEMENTATION_VERSION = process.env.STOCK_ASSISTANT_BUILD_SHA
   ? `git-${String(process.env.STOCK_ASSISTANT_BUILD_SHA).slice(0,12)}` : `app-${APPLICATION_VERSION}`;
@@ -2263,6 +2263,8 @@ function summarizeNews(news, sinceDate = '', options = {}) {
     ['亏损', 1.2], ['下滑', 1], ['风险', .6]
   ];
   const seen = new Set();
+  const newsKey = item => String(item?.title || '').normalize('NFKC').toLowerCase()
+    .replace(/[\s，。；：、“”‘’（）()\[\]【】!?！？·—_-]+/g,'').slice(0,80);
   const scoreItem = item => {
     const text = `${item.title || ''} ${item.summary || ''}`;
     const timestamp = newsTimestamp(item.publishedAt);
@@ -2314,7 +2316,7 @@ function summarizeNews(news, sinceDate = '', options = {}) {
     const timestamp = newsTimestamp(item?.publishedAt);
     if (timestamp > now || since && timestamp < since) return false;
     if (options.cutoffAt && (!timestamp || newsTimestamp(item.firstSeenAt || options.fetchedAt) > now)) return false;
-    const titleKey = `title:${String(item?.title || '').replace(/\s+/g, '')}`;
+    const titleKey = `title:${newsKey(item)}`;
     const linkKey = item?.link ? `link:${item.link}` : '';
     if (!item?.title || seen.has(titleKey) || linkKey && seen.has(linkKey)) return false;
     seen.add(titleKey);
@@ -2335,10 +2337,17 @@ function summarizeNews(news, sinceDate = '', options = {}) {
       newsLifecycleLoadedKeys.add(lifecycleKey);
     }
     const incoming = normalized.map(({eventId:ignoredId, firstSeenAt:ignoredFirstSeen, ...item}) => item);
+    const lifecycleSeen = new Set();
     normalized = mergeEventLifecycle(newsLifecycleCache.get(lifecycleKey) || [], incoming, fetchedAt)
       .filter(item => options.scope !== 'market' || isMarketWideNews(item))
       .filter(item => !options.cutoffAt || newsTimestamp(item.publishedAt) > 0 && newsTimestamp(item.publishedAt) <= now
         && newsTimestamp(item.firstSeenAt) > 0 && newsTimestamp(item.firstSeenAt) <= now)
+      .filter(item => {
+        const key = newsKey(item);
+        if (!key || lifecycleSeen.has(key)) return false;
+        lifecycleSeen.add(key);
+        return true;
+      })
       .slice(0, 50).map(scoreItem);
     if (!options.cutoffAt) {
       newsLifecycleCache.set(lifecycleKey, normalized);
@@ -5409,7 +5418,9 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
   const riskApprovedRecommendations = [];
   const trackingRisk = new Map();
   riskResults.forEach((result, index) => {
-    trackingRisk.set(qualityRecommendations[index].code,result.status === 'fulfilled' ? result.value : {status:'unknown'});
+    trackingRisk.set(qualityRecommendations[index].code,result.status === 'fulfilled' ? result.value : {
+      status:'unknown',reasonCode:'request-failed',summary:`公司风险接口失败：${result.reason?.message || result.reason || '未知错误'}`
+    });
     if (result.status === 'rejected') {
       riskUnknown++;
       const decision = evaluateRecommendationRisk(qualityRecommendations[index], null);
@@ -5446,7 +5457,7 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
       status:['invalid','overheated'].includes(item.shortRebound?.state) ? 'not-attempted' : 'unknown',
       reason:'公司风险未通过完整核验'
     }};
-  }).sort((a,b) => Number(b.shortRebound.score) - Number(a.shortRebound.score)).slice(0, 40)
+  }).sort((a,b) => Number(b.shortRebound.score) - Number(a.shortRebound.score))
     .map(item => {
       const timing = item.executionTiming || executionWindow(item.shortRebound.observedAt || Date.now());
       const shortPlan = {setupType:item.shortRebound.route,confirmationPrice:item.shortRebound.resistance,
@@ -5471,7 +5482,7 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
     ...(marketOverviewCache?.value?.shortReboundWatchCandidates || []),
     ...(marketOverviewCache?.value?.shortReboundHistory || [])
   ];
-  shortReboundPool = mergeShortReboundLifecycle(shortReboundPool, previousShortRebound).slice(0, 40);
+  shortReboundPool = mergeShortReboundLifecycle(shortReboundPool, previousShortRebound);
   const shortReboundSelection = selectShortReboundCandidates(shortReboundPool, {
     tradeDate:recommendationTradeDate,
     marketRegime:marketAssessmentContext.marketRegime,
@@ -5480,8 +5491,8 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
   });
   await writeDiskCache('short-rebound-publication', shortReboundSelection.publicationState);
   const shortReboundCandidates = shortReboundSelection.selected;
-  const shortReboundWatchCandidates = shortReboundSelection.watch.slice(0, 20);
-  const shortReboundHistory = shortReboundSelection.history.slice(0, 20);
+  const shortReboundWatchCandidates = shortReboundSelection.watch;
+  const shortReboundHistory = shortReboundSelection.history;
   const riskScoreRejected = stableRiskApprovedRecommendations.length
     - strictRiskApprovedRecommendations.length - watchRiskApprovedRecommendations.length;
   riskUnverifiedIncluded = finalRiskApprovedRecommendations.filter(item => item.riskUnverified).length;
@@ -5639,6 +5650,7 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
         analyzed:analyzed.filter(item => shortReboundScreened.some(row => row.code === item.code)).length,
         matched:analyzed.filter(item => item.shortRebound?.matched).length,
         states:shortReboundPool.reduce((counts,item)=>{const state=item.shortRebound?.state || 'unknown';counts[state]=(counts[state]||0)+1;return counts;},{}),
+        selection:shortReboundSelection.summary.funnel,
         reasons:{
           notScanned:Math.max(0,scored.length-shortReboundScreened.length),
           queuedBudget:shortReboundScreened.filter(row=>!candidates.some(item=>item.code === row.code)).length,

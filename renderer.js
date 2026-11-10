@@ -624,7 +624,11 @@ function renderMarketOverview(result){
   $('addMarketMomentumRecommendations').disabled = !momentumRecommendations.length;
   $('marketMomentumCount').textContent = momentumRecommendations.length;
   const shortFunnel = coverage.shortReboundFunnel;
-  const shortFunnelText = shortFunnel ? ` 全市场可见 ${shortFunnel.scanned} 只，轻筛 ${shortFunnel.prefiltered} 只，进入在线预算 ${shortFunnel.queued} 只，完成历史分析 ${shortFunnel.analyzed} 只，命中 ${shortFunnel.matched} 只。` : '';
+  const selectionFunnel = shortFunnel?.selection;
+  const selectionText = selectionFunnel
+    ? ` 精选评估 ${selectionFunnel.total} 只：仅证据待补 ${selectionFunnel.dataPending} 只，仅机会不合格 ${selectionFunnel.opportunityRejected} 只，证据与机会同时不足 ${selectionFunnel.mixed || 0} 只，失效/过热 ${selectionFunnel.invalid} 只。`
+    : '';
+  const shortFunnelText = shortFunnel ? ` 全市场可见 ${shortFunnel.scanned} 只，轻筛 ${shortFunnel.prefiltered} 只，进入在线预算 ${shortFunnel.queued} 只，完成历史分析 ${shortFunnel.analyzed} 只，命中 ${shortFunnel.matched} 只。${selectionText}` : '';
   $('marketShortReboundCoverage').textContent = shortReboundCandidates.length
     ? `精选 ${shortReboundCandidates.length} 只，观察 ${shortReboundWatchCandidates.length} 只；同主题最多1只、同时最多3只、每日新增最多5只。前瞻验收需40个交易日及100个成熟可执行样本，当前保持影子验证。${shortFunnelText}`
     : `本轮没有通过行情、真实资金、风险和收益风险比全部门槛的精选候选；观察 ${shortReboundWatchCandidates.length} 只。允许空结果；前瞻验收需40个交易日及100个成熟可执行样本。${shortFunnelText}`;
@@ -3528,11 +3532,22 @@ function quoteResultType(result){
   return result.cached || result.failed ? 'warn' : 'success';
 }
 
+function quoteSupersedesAnalysis(analysis, quote){
+  if(!analysis || !quote) return false;
+  if(quote.tradeDate && analysis.tradeDate && quote.tradeDate !== analysis.tradeDate) return true;
+  const quoteAt = Date.parse(quote.quoteObservedAt || quote.fetchedAt || '');
+  const analyzedAt = Date.parse(analysis.analyzedAt || '');
+  return Number.isFinite(quoteAt) && (!Number.isFinite(analyzedAt) || quoteAt > analyzedAt)
+    && Number(quote.price) > 0 && Number(analysis.latestPrice) > 0
+    && Math.abs(Number(quote.price)-Number(analysis.latestPrice)) > .0001;
+}
+
 function applyQuoteData(quotes){
   const map = new Map(quotes.map(q => [q.code, q]));
   const mergeStockQuote = (s) => {
     const q = map.get(s.code);
     if(!q || q.price == null) return s;
+    const analysisExpired = quoteSupersedesAnalysis(s.analysis,q);
     const merged = {
       ...s,
       name: q.name || s.name,
@@ -3567,6 +3582,9 @@ function applyQuoteData(quotes){
       source: q.source || s.source,
       fetchedAt: q.fetchedAt || s.fetchedAt,
       stale: Boolean(q.stale),
+      analysis:analysisExpired ? undefined : s.analysis,
+      investmentAnalysis:analysisExpired ? undefined : s.investmentAnalysis,
+      analysisStaleReason:analysisExpired ? '行情已更新，旧分析已停用，请打开详情重新分析' : '',
       news: q.stale
         ? `实时接口未返回数据，当前显示缓存行情（${q.fetchedAt ? new Date(q.fetchedAt).toLocaleString('zh-CN', {hour12:false}) : '时间未知'}）。`
         : `实际行情已刷新：${formatPct(q.changePct)}，成交额${money(q.amount)}，主力净流入${metricValue(q.mainNetInflow, money)}。`

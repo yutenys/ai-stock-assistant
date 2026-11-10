@@ -67,6 +67,14 @@ test('收藏持久化去除大型瞬时分析字段但保留跨标签独立基�
   assert.equal(saved.pinned,true);
 });
 
+test('新行情到达后旧分析不能继续作为实时结论',()=>{
+  const context=harness(['quoteSupersedesAnalysis']);
+  assert.equal(context.quoteSupersedesAnalysis({tradeDate:'2026-11-09',analyzedAt:'2026-11-09T07:00:00Z',latestPrice:10},
+    {tradeDate:'2026-11-10',quoteObservedAt:'2026-11-10T07:00:00Z',price:11}),true);
+  assert.equal(context.quoteSupersedesAnalysis({tradeDate:'2026-11-10',analyzedAt:'2026-11-10T07:05:00Z',latestPrice:11},
+    {tradeDate:'2026-11-10',quoteObservedAt:'2026-11-10T07:00:00Z',price:11}),false);
+});
+
 test('环境观察卡片使用观察评分并展示当前环境限制',()=>{
   const context=harness(['recommendationCardHtml'],{recommendationIndustry:()=>'',pctClass:()=>'',badgeClass:()=>'',
     yuan:String,formatPct:String,escapeHtml:String,recommendationCanslimText:()=>'',recommendationFactorText:()=>''});

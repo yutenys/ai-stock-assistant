@@ -10,7 +10,8 @@ function candidate(code, overrides = {}) {
   return {
     code, name:`股票${code}`, price:10, tradeDate,
     riskProfile:{status:'clear'}, newsLabel:'消息中性',
-    rotationProfiles:[{name:theme,mainNetInflow:2e8,capitalTradeDate:tradeDate,capitalEstimated:false,capitalStale:false,upRatio:.7}],
+    rotationProfiles:[{name:theme,mainNetInflow:2e8,capitalTradeDate:tradeDate,capitalEstimated:false,capitalStale:false,
+      upRatio:.7,participation:{coverage:.8,exTop3UpRatio:.65}}],
     fundFlowPeriod:{available:true,complete:true,estimated:false,mainNetInflow:3e8,positiveDays:7,
       current:{mainNetInflow:2e7,tradeDate,estimated:false}},
     shortRebound:{matched:true,state:'condition-pending',route:'R2',score:80,executionScore:70,
@@ -27,7 +28,7 @@ test('精选最多三只且同一真实主题最多一只', () => {
   assert.equal(result.selected.filter(row=>row.shortReboundSelection.theme === '半导体').length,1);
   assert.equal(result.selected[0].shortRebound.tradePlan.shadowOnly,true);
   assert.ok(result.selected[0].shortRebound.tradePlan.rewardRisk >= 2);
-  assert.equal(result.selected[0].shortRebound.tradePlan.planVersion,'short-rebound-selective-v30');
+  assert.equal(result.selected[0].shortRebound.tradePlan.planVersion,'short-rebound-selective-v31');
   assert.equal(result.selected[0].shortReboundSelection.firstPublishedAt,'2026-11-09T07:10:00.000Z');
   assert.ok(result.watch.length >= 2);
 });
@@ -39,6 +40,53 @@ test('同源真实多窗口汇总可替代逐日完整性但不编造流入天�
   const result=selectShortReboundCandidates([row],{tradeDate,marketRegime:{allowNewEntry:true}});
   assert.equal(result.selected.length,1);
   assert.equal(result.selected[0].fundFlowPeriod.positiveDays,null);
+});
+
+test('滚动资金总额不能掩盖最近非重叠窗口流出', () => {
+  const row=candidate('1',{fundFlowPeriod:{available:true,complete:false,aggregateOnly:true,estimated:false,
+    source:'东方财富批量主力资金（真实多日累计）',
+    current:{mainNetInflow:8e7,mainNet3:5e7,mainNet5:9e7,mainNet10:2e8,tradeDate,estimated:false,
+      source:'东方财富批量主力资金'}}});
+  const result=selectShortReboundCandidates([row],{tradeDate,marketRegime:{allowNewEntry:true}});
+  assert.equal(result.selected.length,0);
+  assert.ok(result.watch[0].shortReboundSelection.reasons.includes('阶段个股资金未形成非重叠窗口持续流入证据'));
+  assert.equal(result.watch[0].shortReboundSelection.fundWindows.latest,8e7);
+  assert.equal(result.watch[0].shortReboundSelection.fundWindows.prior2,-3e7);
+});
+
+test('止损损失按入场价计算且R2使用回踩确认文案', () => {
+  const row=candidate('1',{shortRebound:{...candidate('1').shortRebound,invalidation:9.72},analysis:{resistanceLevels:[10.8]}});
+  const result=selectShortReboundCandidates([row],{tradeDate,marketRegime:{allowNewEntry:true}});
+  assert.equal(result.selected.length,1);
+  assert.equal(result.selected[0].shortReboundSelection.pressureLossPct,3);
+  assert.match(result.selected[0].shortRebound.tradePlan.trigger,/回踩支撑/);
+  assert.doesNotMatch(result.selected[0].shortRebound.tradePlan.trigger,/1\.5-4\.0/);
+});
+
+test('风险未知原因和完整漏斗必须保留', () => {
+  const row=candidate('1',{riskProfile:{status:'unknown',reasonCode:'request-failed',summary:'接口超时'}});
+  const result=selectShortReboundCandidates([row],{tradeDate,marketRegime:{allowNewEntry:true}});
+  assert.equal(result.selected.length,0);
+  assert.equal(result.summary.funnel.total,1);
+  assert.equal(result.summary.funnel.dataPending,1);
+  assert.equal(result.summary.funnel.opportunityRejected,0);
+  assert.equal(result.watch[0].shortReboundSelection.riskEvidence.reasonCode,'request-failed');
+});
+
+test('跨交易日保留首次发布记录但重置当日新增预算', () => {
+  const first=selectShortReboundCandidates([candidate('1')],{tradeDate,marketRegime:{allowNewEntry:true},
+    observedAt:'2026-11-09T07:10:00.000Z'});
+  const nextDate='2026-11-10';
+  const nextCandidate={...candidate('2'),tradeDate:nextDate,
+    rotationProfiles:[{...candidate('2').rotationProfiles[0],capitalTradeDate:nextDate}],
+    fundFlowPeriod:{...candidate('2').fundFlowPeriod,current:{...candidate('2').fundFlowPeriod.current,tradeDate:nextDate}},
+    shortRebound:{...candidate('2').shortRebound,tradeDate:nextDate}};
+  const second=selectShortReboundCandidates([nextCandidate],{tradeDate:nextDate,marketRegime:{allowNewEntry:true},
+    observedAt:'2026-11-10T07:10:00.000Z',previousState:first.publicationState});
+  assert.equal(second.selected.length,1);
+  assert.equal(second.publicationState.published.length,2);
+  assert.equal(second.publicationState.dailyPublishedCodes.length,1);
+  assert.equal(second.summary.publishedToday,1);
 });
 
 test('证据缺失或收益风险比不足只进入观察层', () => {
