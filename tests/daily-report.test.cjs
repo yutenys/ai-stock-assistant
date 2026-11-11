@@ -362,6 +362,31 @@ test('all favorite labels survive; code risk and missing original plans remain e
   assert.doesNotMatch(html,/排除重点关注/);
 });
 
+test('report renders favorite recommendation cohort matrix before simulated account', () => {
+  const favoriteBatchPerformance={schemaVersion:1,asOfDate:'2026-11-11',horizonOrder:[1,3,5],
+    counts:{rawFavorites:3,dedupedEpisodes:2,invalid:0},
+    horizons:{1:{count:2,observed:2,missing:0,immature:0,incomparable:0,averageReturnPct:1,medianReturnPct:1},
+      3:{count:2,observed:1,missing:0,immature:1,incomparable:0,averageReturnPct:-2,medianReturnPct:-2},
+      5:{count:2,observed:0,missing:0,immature:2,incomparable:0,averageReturnPct:null,medianReturnPct:null}},
+    cohorts:[{key:'one',date:'2026-11-10',phase:'盘中',modelVersion:'v1',attribution:'recommendation',
+      label:'1110-盘中积极',count:2,current:{observed:2,averageReturnPct:1.5,medianReturnPct:1.5},
+      horizons:{1:{observed:2,missing:0,immature:0,incomparable:0,averageReturnPct:1,medianReturnPct:1},
+        3:{observed:1,missing:0,immature:1,incomparable:0,averageReturnPct:-2,medianReturnPct:-2},
+        5:{observed:0,missing:0,immature:2,incomparable:0,averageReturnPct:null,medianReturnPct:null}}}],
+    episodes:[{episodeId:'one',code:'600001',name:'样本',labels:['1110-盘中积极'],baseDate:'2026-11-10',
+      phase:'盘中',referencePrice:10,current:{date:'2026-11-11',close:10.1,returnPct:1,todayChangePct:.5},
+      observations:{1:{status:'observed',date:'2026-11-11',close:10.1,returnPct:1}}}],
+    caveats:['收藏后价格表现不是实际成交收益']};
+  const report=buildDailyReport({tradeDate:'2026-11-11',favoriteBatchPerformance});
+  assert.equal(report.favoriteBatchPerformance.counts.dedupedEpisodes,2);
+  const html=renderDailyReportHtml(report);
+  assert.match(html,/每日收藏推荐批次表现/);
+  assert.match(html,/1110-盘中积极/);
+  assert.match(html,/D\+3/);
+  assert.match(html,/未成熟 1/);
+  assert.ok(html.indexOf('每日收藏推荐批次表现') < html.indexOf('历史手工模拟'));
+});
+
 test('trigger observation starts at recorded trigger price, not publication price', () => {
   const report = buildDailyReport({tradeDate:'2026-10-08',stable:[
     {code:'600001',price:10,entryPermission:'allowed',triggeredAt:'2026-10-08T10:00:00+08:00',
@@ -695,4 +720,14 @@ test('短线修复影子候选单列且不计入正式推荐表现', () => {
   assert.match(html,/不纳入正式推荐收益/);
   assert.match(html,/短线修复发布后观察/);
   assert.match(html,/class="up">\+2\.50%/);
+});
+
+test('报告单列F题材首板研究且明确影子权限', () => {
+  const report=buildDailyReport({tradeDate:'2026-11-11',market:{themeFirstBoard:{status:'data-pending',groups:[{
+    themeId:'通信技术',status:'data-pending',verifiedCount:2,eligibleAt:null,reasons:['真实首封时间缺失']
+  }]}},stable:[],momentum:[],closingQuotes:[]});
+  const html=renderDailyReportHtml(report);
+  assert.match(html,/F题材首板研究/);
+  assert.match(html,/仅作影子观察，不授予买入权限/);
+  assert.match(html,/真实首封时间缺失/);
 });

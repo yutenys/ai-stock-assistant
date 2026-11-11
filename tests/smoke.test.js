@@ -2904,6 +2904,19 @@ test('三周期评估将板块强势且量能受控的候选标记为短线', ()
   assert.equal(result.profiles.every(item => item.days && Number.isFinite(item.score)), true);
 });
 
+test('中长线资格不能由高技术分和不完整财务归一化分替代', () => {
+  const common={technicalScore:88,price:12,analysis:{score:88,ma20:11,ma30:10,ma60:9,latestPrice:12},
+    qualityScore:90,canslim:{score:92,available:4,total:7},entryAssessment:{status:'观察'},
+    financialAnalysis:{score:90,available:2,current:{available:true},annual:{available:false},quality:{available:true},
+      quarterCount:5,annualCount:1,pointInTime:{unknownAvailability:0}}};
+  const incomplete=assessRecommendationHorizons(common);
+  assert.equal(incomplete.profiles.find(row=>row.label==='中长线').qualified,false);
+  assert.match(incomplete.profiles.find(row=>row.label==='中长线').basis,/不足/);
+  const complete=assessRecommendationHorizons({...common,financialAnalysis:{...common.financialAnalysis,
+    available:3,annual:{available:true},quarterCount:8,annualCount:3}});
+  assert.equal(complete.profiles.find(row=>row.label==='中长线').qualified,true);
+});
+
 test('正式推荐排除行业无法确认的股票并保留淘汰原因', () => {
   const result = filterResolvedRecommendations([
     {code:'600001',industry:'行业待确认'},

@@ -73,6 +73,10 @@ test('新行情到达后旧分析不能继续作为实时结论',()=>{
     {tradeDate:'2026-11-10',quoteObservedAt:'2026-11-10T07:00:00Z',price:11}),true);
   assert.equal(context.quoteSupersedesAnalysis({tradeDate:'2026-11-10',analyzedAt:'2026-11-10T07:05:00Z',latestPrice:11},
     {tradeDate:'2026-11-10',quoteObservedAt:'2026-11-10T07:00:00Z',price:11}),false);
+  assert.equal(context.quoteSupersedesAnalysis({tradeDate:'2026-11-10',analyzedAt:'2026-11-10T07:00:00Z',latestPrice:11},
+    {tradeDate:'2026-11-10',quoteObservedAt:'2026-11-10T07:05:00Z',price:11,mainNetInflow:2e7}),true);
+  assert.equal(context.quoteSupersedesAnalysis({tradeDate:'2026-11-10',analyzedAt:'2026-11-10T07:00:00Z'},
+    {tradeDate:'2026-11-10',quoteObservedAt:'2026-11-10T07:05:00Z',price:11}),true);
 });
 
 test('环境观察卡片使用观察评分并展示当前环境限制',()=>{

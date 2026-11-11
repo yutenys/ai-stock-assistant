@@ -32,6 +32,13 @@ test('R2识别缩量回踩修复且保持影子权限', () => {
   assert.notEqual(result.detectionScore,result.executionScore);
 });
 
+test('交易阶段未知时不能冒充收盘确认', () => {
+  const result=evaluateShortRebound({bars:r2Bars(150),quote:{changePct:1},observationPhase:{}});
+  assert.equal(result.matched,true);
+  assert.notEqual(result.state,'verified-trigger');
+  assert.ok(result.missingEvidence.includes('等待收盘确认'));
+});
+
 test('R2四项证据缺一不可', () => {
   const history=r2Bars();
   history.at(-1).close = history.at(-2).close - 1;

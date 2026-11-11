@@ -275,9 +275,11 @@ function recordRemovedFavorite(label, stocks){
     const favoriteEventId = source.favoriteEventId || globalThis.crypto?.randomUUID?.()
       || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     if(removedFavoriteEvents.some(row => row.favoriteEventId === favoriteEventId)) continue;
-    removedFavoriteEvents.push({favoriteEventId,code:stock.code,labelId:label.id || label.name,
+    removedFavoriteEvents.push({favoriteEventId,code:stock.code,name:stock.name || '',label:label.name || '',labelId:label.id || label.name,
       sourceType:source.sourceType || 'unknown',modelVersion:source.modelVersion || 'unknown',
-      signalId:source.signalId || '',planId:source.planId || '',addedAt:stock.favoriteAddedAt || '',removedAt});
+      signalId:source.signalId || '',planId:source.planId || stock.planId || '',addedAt:stock.favoriteAddedAt || '',
+      referencePrice:Number(stock.favoriteBasePrice) || null,referenceAdjustment:source.adjustment || source.quote?.adjustment || '',
+      favoriteEntrySnapshotRef:stock.favoriteEntrySnapshotRef || '',removedAt});
   }
 }
 
@@ -3537,9 +3539,7 @@ function quoteSupersedesAnalysis(analysis, quote){
   if(quote.tradeDate && analysis.tradeDate && quote.tradeDate !== analysis.tradeDate) return true;
   const quoteAt = Date.parse(quote.quoteObservedAt || quote.fetchedAt || '');
   const analyzedAt = Date.parse(analysis.analyzedAt || '');
-  return Number.isFinite(quoteAt) && (!Number.isFinite(analyzedAt) || quoteAt > analyzedAt)
-    && Number(quote.price) > 0 && Number(analysis.latestPrice) > 0
-    && Math.abs(Number(quote.price)-Number(analysis.latestPrice)) > .0001;
+  return Number.isFinite(quoteAt) && (!Number.isFinite(analyzedAt) || quoteAt > analyzedAt);
 }
 
 function applyQuoteData(quotes){

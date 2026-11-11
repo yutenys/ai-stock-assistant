@@ -55,7 +55,7 @@ test('滚动资金总额不能掩盖最近非重叠窗口流出', () => {
 });
 
 test('止损损失按入场价计算且R2使用回踩确认文案', () => {
-  const row=candidate('1',{shortRebound:{...candidate('1').shortRebound,invalidation:9.72},analysis:{resistanceLevels:[10.8]}});
+  const row=candidate('1',{shortRebound:{...candidate('1').shortRebound,resistance:10.8,invalidation:9.72},analysis:{resistanceLevels:[10.8]}});
   const result=selectShortReboundCandidates([row],{tradeDate,marketRegime:{allowNewEntry:true}});
   assert.equal(result.selected.length,1);
   assert.equal(result.selected[0].shortReboundSelection.pressureLossPct,3);
@@ -89,6 +89,21 @@ test('跨交易日保留首次发布记录但重置当日新增预算', () => {
   assert.equal(second.summary.publishedToday,1);
 });
 
+test('发布预算使用上海日期且过期episode不阻止新episode', () => {
+  const previousState={published:[{code:'000001',theme:'半导体',route:'R2',
+    firstPublishedAt:'2026-11-08T16:10:00.000Z',expiresOn:'2026-11-10',status:'active'}]};
+  const current={...candidate('1'),tradeDate:'2026-11-11',
+    rotationProfiles:[{...candidate('1').rotationProfiles[0],capitalTradeDate:'2026-11-11'}],
+    fundFlowPeriod:{...candidate('1').fundFlowPeriod,current:{...candidate('1').fundFlowPeriod.current,tradeDate:'2026-11-11'}},
+    shortRebound:{...candidate('1').shortRebound,tradeDate:'2026-11-11'}};
+  const result=selectShortReboundCandidates([current],{
+    tradeDate:'2026-11-11',observedAt:'2026-11-11T01:35:00.000Z',marketRegime:{allowNewEntry:true},previousState});
+  assert.equal(result.publicationState.published[0].status,'expired');
+  assert.equal(result.publicationState.published.length,2);
+  assert.equal(result.publicationState.published[1].firstPublishedAt,'2026-11-11T01:35:00.000Z');
+  assert.equal(result.summary.publishedToday,1);
+});
+
 test('证据缺失或收益风险比不足只进入观察层', () => {
   const missingFund = candidate('1',{fundFlowPeriod:{available:false}});
   const poorReward = candidate('2',{shortRebound:{...candidate('2').shortRebound,invalidation:9.7},analysis:{resistanceLevels:[10.1]}});
@@ -96,6 +111,15 @@ test('证据缺失或收益风险比不足只进入观察层', () => {
   assert.equal(result.selected.length,0);
   assert.deepEqual(result.watch.map(row=>row.code).sort(),['000001','000002']);
   assert.ok(result.watch.every(row=>row.shortReboundSelection.reasons.length));
+});
+
+test('筛选层直接使用短线结构计算出的真实阻力', () => {
+  const row=candidate('1',{analysis:{resistanceLevels:[]},targetPrice:null,
+    shortRebound:{...candidate('1').shortRebound,resistance:10.8,invalidation:9.72}});
+  const result=selectShortReboundCandidates([row],{tradeDate,marketRegime:{allowNewEntry:true}});
+  assert.equal(result.selected.length,1);
+  assert.equal(result.selected[0].shortReboundSelection.resistance,10.8);
+  assert.equal(result.selected[0].shortRebound.tradePlan.targetPrice,10.8);
 });
 
 test('同日刷新不重置五只新增预算且失效不返还名额', () => {
