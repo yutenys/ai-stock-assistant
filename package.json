@@ -1,14 +1,20 @@
 {
   "name": "ai-stock-assistant",
-  "version": "0.1.0",
-  "description": "A股AI产业链观察助手 Electron 桌面版",
+  "version": "0.1.9",
+  "description": "股票观察助手 Electron 桌面版",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "test": "node --test tests/smoke.test.js",
+    "test": "node --test tests/smoke.test.js tests/renderer-logic.test.js tests/strategy-replay.test.js tests/strategy-platform.test.js tests/persistence.test.js tests/fund-flow-history.test.js tests/research-account.test.js tests/trade-time.test.js tests/daily-report.test.cjs tests/recommendation-outcomes.test.js tests/entry-plans.test.js tests/strategy-audit.test.js tests/strategy-experiments.test.js tests/market-evidence.test.js tests/intraday-structure.test.js tests/theme-entry.test.js tests/theme-regime.test.js tests/theme-shadow-experiments.test.js tests/theme-first-board.test.js tests/history-source-selection.test.js tests/short-rebound.test.js tests/short-rebound-selection.test.js tests/data-coverage-audit.test.js tests/market-factor-evidence.test.js tests/favorite-batch-performance.test.js",
+    "audit:strategy": "node scripts/audit-strategy-window.cjs",
+    "replay:experiments": "node scripts/replay-strategy-experiments.cjs",
     "test:ui": "electron tests/ui-smoke.js",
+    "test:data-recovery": "node --test tests/history-source-selection.test.js",
+    "audit:data-coverage": "node scripts/resolve-data-coverage.cjs",
+    "collect:minute-funds": "node scripts/collect-minute-funds.cjs",
+    "measure:favorites": "node scripts/measure-favorites-state.cjs",
     "pack": "electron-builder --dir",
-    "dist": "electron-builder --win portable"
+    "dist": "npm version patch --no-git-tag-version && electron-builder --win portable"
   },
   "author": "",
   "license": "MIT",
@@ -18,12 +24,26 @@
   },
   "build": {
     "appId": "com.local.ai.stock.assistant",
-    "productName": "AI股票观察助手",
-    "directories": { "output": "release" },
-    "files": ["main.js", "preload.js", "index.html", "renderer.js", "styles.css"],
+    "productName": "股票观察助手",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "index.html",
+      "renderer.js",
+      "styles.css",
+      "lib/**/*"
+    ],
     "win": {
-      "target": ["portable"],
+      "target": [
+        "portable"
+      ],
       "signAndEditExecutable": false
     }
+  },
+  "dependencies": {
+    "stream-json": "^3.6.0"
   }
 }
