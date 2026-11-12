@@ -104,6 +104,18 @@ test('发布预算使用上海日期且过期episode不阻止新episode', () => 
   assert.equal(result.summary.publishedToday,1);
 });
 
+test('旧发布记录缺状态也会过期且硬失效写入终态', () => {
+  const legacy={published:[{code:'000001',theme:'半导体',route:'R2',
+    firstPublishedAt:'2026-11-08T01:35:00.000Z',expiresOn:'2026-11-10'}]};
+  const expired=selectShortReboundCandidates([],{
+    tradeDate:'2026-11-11',marketRegime:{allowNewEntry:true},previousState:legacy});
+  assert.equal(expired.publicationState.published[0].status,'expired');
+  const active={published:[{...legacy.published[0],firstPublishedAt:'2026-11-09T01:35:00.000Z',expiresOn:'2026-11-16'}]};
+  const invalid=selectShortReboundCandidates([candidate('1',{shortRebound:{...candidate('1').shortRebound,matched:false,state:'invalid'}})],{
+    tradeDate,marketRegime:{allowNewEntry:true},previousState:active});
+  assert.equal(invalid.publicationState.published[0].status,'invalidated');
+});
+
 test('证据缺失或收益风险比不足只进入观察层', () => {
   const missingFund = candidate('1',{fundFlowPeriod:{available:false}});
   const poorReward = candidate('2',{shortRebound:{...candidate('2').shortRebound,invalidation:9.7},analysis:{resistanceLevels:[10.1]}});

@@ -108,3 +108,11 @@ test('只有链接和时间的可追溯消息不冒充已核实催化', () => {
     evidenceStatus:'traceable'}],'2026-10-09T10:00:00+08:00');
   assert.equal(evidence.get('concept:BK1').length,0);
 });
+
+test('成交额覆盖不足时不按涨幅退化计算去前三广度', () => {
+  const rows=quotes().map((row,index)=>index<2 ? row : (({amount,...rest})=>rest)(row));
+  const value=buildThemeRegimes({sectors:[sector()],quotes:rows,tradeDate:day,cutoffAt:later})[0];
+  assert.equal(value.breadth.status,'unknown');
+  assert.equal(value.breadth.amountCoverage,.5);
+  assert.equal(value.breadth.exTop3UpRatio,null);
+});

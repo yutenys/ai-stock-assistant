@@ -258,6 +258,7 @@ function labelStockSnapshot(stock, existingStock=null){
         planRevision:stock.planRevision || stock.planState?.revision || null,
         plan:stock.planState?.tradePlan || stock.tradePlan || null,
         context:stock.recommendationContext ? JSON.parse(JSON.stringify(stock.recommendationContext)) : null,
+        adjustment:'none',
         capturedAt:new Date().toISOString()
       },
     pinned:Boolean(existingStock?.pinned),

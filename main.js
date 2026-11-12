@@ -1751,9 +1751,12 @@ function sectorQuoteStats(memberCodes, marketQuotes) {
   const regularStocks = stocks.filter(item => !abnormalListing(item));
   const changes = regularStocks.map(item => finiteNumber(item.changePct)).filter(value => value !== null);
   const rawChanges = stocks.map(item => finiteNumber(item.changePct)).filter(value => value !== null);
-  const leaders = [...regularStocks].sort((a, b) => Number(b.changePct || 0) - Number(a.changePct || 0) || Number(b.amount || 0) - Number(a.amount || 0));
+  const amountRanked = regularStocks.filter(item=>finiteNumber(item.amount) !== null)
+    .sort((a, b) => Number(b.amount) - Number(a.amount) || Number(b.changePct || 0) - Number(a.changePct || 0));
+  const leaders = amountRanked;
   const amount = regularStocks.reduce((sum, item) => sum + Math.max(0, Number(item.amount) || 0), 0);
-  const exTop3 = leaders.slice(3);
+  const amountCoverage=regularStocks.length ? amountRanked.length/regularStocks.length : 0;
+  const exTop3 = amountCoverage >= .6 ? leaders.slice(3) : [];
   const sortedChanges = [...changes].sort((a,b)=>a-b);
   const quoteTimes = regularStocks.map(row => Date.parse(row.quoteObservedAt || ''));
   const quoteObservedAt = quoteTimes.length && quoteTimes.every(Number.isFinite)
@@ -1775,6 +1778,7 @@ function sectorQuoteStats(memberCodes, marketQuotes) {
     medianChangePct:sortedChanges.length ? sortedChanges.length % 2 ? sortedChanges[middle] : (sortedChanges[middle-1]+sortedChanges[middle])/2 : null,
     exTop3UpRatio:exTop3.length ? exTop3.filter(row=>row.changePct > 0).length/exTop3.length : null,
     exTop3Count:exTop3.length,
+    amountCoverage,
     ma20AboveRatio:structure.length ? structure.filter(row=>row.price >= row.ma20).length/structure.length : null,
     ma30AboveRatio:structure.length ? structure.filter(row=>row.price >= row.ma30).length/structure.length : null,
     structureCoverage:regularStocks.length ? structure.length/regularStocks.length : 0,
@@ -2602,7 +2606,8 @@ function assessRecommendationHorizons(item) {
   const financialSeriesComplete=Boolean(item?.financialAnalysis?.current?.available
     && item?.financialAnalysis?.annual?.available && item?.financialAnalysis?.quality?.available
     && Number(item?.financialAnalysis?.quarterCount) >= 8 && Number(item?.financialAnalysis?.annualCount) >= 3
-    && Number(item?.financialAnalysis?.pointInTime?.unknownAvailability || 0) === 0);
+    && item?.financialAnalysis?.pointInTime
+    && Number(item.financialAnalysis.pointInTime.unknownAvailability) === 0);
   const volumeRatio = finiteNumber(item?.analysis?.volumeRatio ?? item?.volumeRatio);
   const shortScore = clampRecommendationScore(technical * .5 + sector * .2 + capital * .2 + news * .1
     - (isExplosiveVolume(volumeRatio) ? 20 : 0));
@@ -5498,7 +5503,6 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
     observedAt:new Date(observedAt).toISOString(),
     previousState:readDiskCache('short-rebound-publication', 14 * 86400000)
   });
-  await writeDiskCache('short-rebound-publication', shortReboundSelection.publicationState);
   const shortReboundCandidates = shortReboundSelection.selected;
   const shortReboundWatchCandidates = shortReboundSelection.watch;
   const shortReboundHistory = shortReboundSelection.history;
@@ -5513,15 +5517,30 @@ async function buildMarketRecommendations(marketQuotes, force = false, outcomePr
       businessRelation:{verified:Boolean(profile.businessRelation && profile.businessRelationEvidence),
         source:profile.businessRelationEvidence?.url || profile.businessRelationEvidence?.source || ''}};
   }),{tradeDate:recommendationTradeDate,cutoffAt:new Date(observedAt).toISOString(),recentEpisodes:previousFirstBoard,
-    historyCoverageComplete:firstBoardState.historyCoverageComplete === true,
-    maxActive:Math.max(0,3-shortReboundCandidates.length),
+    historyCoverage:firstBoardState.historyCoverage || null,
+    maxActive:Math.max(0,3-shortReboundSelection.publicationState.published.filter(item=>item.status === 'active').length),
     maxNewPerDay:Math.max(0,5-shortReboundSelection.summary.publishedToday)});
   if (themeFirstBoard.groups.some(group=>group.status === 'observed')) {
     const episodes=[...previousFirstBoard,...themeFirstBoard.groups.filter(group=>group.status === 'observed')
-      .map(group=>({themeId:group.themeId,tradeDate:recommendationTradeDate,status:'observed',eligibleAt:group.eligibleAt}))];
-    await writeDiskCache('theme-first-board-publication',{historyCoverageComplete:firstBoardState.historyCoverageComplete === true,
-      episodes:[...new Map(episodes.map(item=>[`${item.tradeDate}:${item.themeId}`,item])).values()]});
+      .map(group=>({themeId:group.themeId,subtype:group.subtype,tradeDate:recommendationTradeDate,
+        status:'observed',eligibleAt:group.eligibleAt}))];
+    await writeDiskCache('theme-first-board-publication',{historyCoverage:firstBoardState.historyCoverage || null,
+      episodes:[...new Map(episodes.map(item=>[`${item.tradeDate}:${item.themeId}:${item.subtype || ''}`,item])).values()]});
   }
+  const sharedPublished=shortReboundSelection.publicationState.published;
+  const sharedCodes=new Set(sharedPublished.filter(item=>item.status === 'active').map(item=>String(item.code)));
+  for (const item of themeFirstBoard.candidates) {
+    const code=String(item.code || '');
+    if (sharedCodes.has(code)) continue;
+    sharedPublished.push({code,theme:item.themeId || '',route:'F',subtype:item.subtype || '',
+      firstPublishedAt:item.eligibleAt || new Date(observedAt).toISOString(),expiresOn:nextTradingDay(recommendationTradeDate),
+      status:'active',planVersion:'theme-first-board-shadow-v2'});
+    sharedCodes.add(code);
+  }
+  shortReboundSelection.publicationState.activeCodes=[...sharedCodes];
+  shortReboundSelection.publicationState.dailyPublishedCodes=[...new Set(sharedPublished
+    .filter(item=>chinaClockParts(item.firstPublishedAt).date === recommendationTradeDate).map(item=>String(item.code)))];
+  await writeDiskCache('short-rebound-publication', shortReboundSelection.publicationState);
   const riskScoreRejected = stableRiskApprovedRecommendations.length
     - strictRiskApprovedRecommendations.length - watchRiskApprovedRecommendations.length;
   riskUnverifiedIncluded = finalRiskApprovedRecommendations.filter(item => item.riskUnverified).length;

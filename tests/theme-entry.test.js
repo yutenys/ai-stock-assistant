@@ -11,7 +11,7 @@ const members = codes.map(code => ({code,themeId:'cross-sector',parentThemeIds:[
 const frozenLeaders = codes.slice(0, 3).map((code, i) => ({code,median20Amount:3e8-i*1e7,
   stableTradingDays:20,frozenAt:'2026-10-08T16:00:00+08:00'}));
 const snapshots = codes.map((code, i) => ({code,source:'quotes',quoteObservedAt:at('10:30:00'),
-  tradeDate:day,price:11,vwap:10,changePct:10-i,indexChangePct:1,hardRisk:false}));
+  tradeDate:day,price:11,vwap:10,changePct:10-i,amount:(10-i)*1e8,indexChangePct:1,hardRisk:false}));
 function themeClock(time, extra = {}) {
   return {themeId:'cross-sector',parentThemeIds:['parent'],memberCodes:codes,capitalSource:'funds',
     capitalObservedAt:at(time),capitalFetchedAt:at(time),capitalTradeDate:day,
@@ -124,6 +124,14 @@ test('weak ex-top-three breadth and thin quote coverage block price confirmation
   assert.equal(weak.priceConfirmation.status,'divergent');
   const thin = evaluate({snapshots:snapshots.slice(0, 6)});
   assert.equal(thin.priceConfirmation.status,'unknown');
+});
+
+test('去前三按成交额而不是涨幅排除', () => {
+  const rows=snapshots.map((row,index)=>({...row,amount:index<3 ? 1e7 : (10-index)*1e8,
+    changePct:index<3 ? 9-index : index===3 ? -1 : 1}));
+  const value=evaluate({snapshots:rows});
+  assert.equal(value.priceConfirmation.exTop3Count,7);
+  assert.equal(value.priceConfirmation.exTop3UpRatio,1);
 });
 
 test('second of four themes is outside top thirty percent of capital intensity', () => {

@@ -387,6 +387,12 @@ test('report renders favorite recommendation cohort matrix before simulated acco
   assert.ok(html.indexOf('每日收藏推荐批次表现') < html.indexOf('历史手工模拟'));
 });
 
+test('报告将对账不一致单列为事实冲突', () => {
+  const html=renderDailyReportHtml({tradeDate:'2026-11-11',dataQuality:{warnings:['成交额对账不一致']}});
+  assert.match(html,/事实冲突卡/);
+  assert.match(html,/成交额对账不一致/);
+});
+
 test('trigger observation starts at recorded trigger price, not publication price', () => {
   const report = buildDailyReport({tradeDate:'2026-10-08',stable:[
     {code:'600001',price:10,entryPermission:'allowed',triggeredAt:'2026-10-08T10:00:00+08:00',
